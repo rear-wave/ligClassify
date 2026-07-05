@@ -1,0 +1,6 @@
+train_data/
+checkpoints_v2/
+__pycache__/
+*.pyc
+.DS_Store
+nul
