@@ -10,7 +10,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from data.lig_parser import LigFormatError, read_lig_timestamp, validate_lig_file
+import numpy as np
+
+from data.lig_parser import (
+    LigFormatError,
+    read_lig_timestamp,
+    read_lig_timestamps,
+    validate_lig_file,
+)
 
 
 _DISTANCE_RE = re.compile(r"(?<!\d)(\d{1,4})[-_](\d{1,4})km", re.IGNORECASE)
@@ -28,6 +35,25 @@ class ManifestEntry:
     @property
     def acquisition_date(self):
         return self.timestamp.date()
+
+
+@dataclass(frozen=True)
+class PieceManifestEntry:
+    """One independently splittable waveform piece and its labels."""
+
+    filepath: str
+    piece_index: int
+    type_idx: int
+    dist_bin: int
+    timestamp: datetime
+
+    @property
+    def identity(self):
+        """Return a stable piece identity independent of path casing."""
+        return (
+            os.path.normcase(os.path.abspath(self.filepath)),
+            self.piece_index,
+        )
 
 
 def parse_distance_bin(path: str) -> int:
@@ -125,6 +151,125 @@ def build_manifest(data_dir: str, type_names) -> tuple[list[ManifestEntry], dict
 
     entries.sort(key=lambda item: (item.type_idx, item.timestamp, item.filepath))
     return entries, diagnostics
+
+
+def build_piece_manifest(file_entries):
+    """Expand validated files into timestamped, lazily readable pieces."""
+    pieces = []
+    for file_entry in file_entries:
+        timestamps = read_lig_timestamps(file_entry.filepath)
+        if len(timestamps) != file_entry.n_pieces:
+            raise LigFormatError(
+                f"piece count changed: {file_entry.filepath}: "
+                f"manifest={file_entry.n_pieces}, timestamps={len(timestamps)}"
+            )
+        pieces.extend(
+            PieceManifestEntry(
+                filepath=file_entry.filepath,
+                piece_index=piece_index,
+                type_idx=file_entry.type_idx,
+                dist_bin=file_entry.dist_bin,
+                timestamp=timestamp,
+            )
+            for piece_index, timestamp in enumerate(timestamps)
+        )
+    return pieces
+
+
+def _constrained_split_counts(size, val_fraction, test_fraction):
+    """Round split counts while reserving at least one piece per split."""
+    fractions = np.asarray(
+        [1.0 - val_fraction - test_fraction, val_fraction, test_fraction],
+        dtype=np.float64,
+    )
+    if size < 3:
+        raise ValueError(f"at least 3 pieces are required, got {size}")
+    if np.any(fractions <= 0) or not np.isclose(fractions.sum(), 1.0):
+        raise ValueError("train, validation, and test fractions must be positive")
+
+    raw = fractions * size
+    counts = np.maximum(1, np.floor(raw).astype(np.int64))
+    while int(counts.sum()) > size:
+        candidates = np.flatnonzero(counts > 1)
+        index = int(candidates[np.argmax((counts - raw)[candidates])])
+        counts[index] -= 1
+    while int(counts.sum()) < size:
+        index = int(np.argmax(raw - counts))
+        counts[index] += 1
+    return tuple(int(value) for value in counts)
+
+
+def piece_time_split_manifest(entries, val_fraction=0.15, test_fraction=0.15):
+    """Split pieces chronologically inside every type/distance group."""
+    groups = defaultdict(list)
+    for entry in entries:
+        groups[(entry.type_idx, entry.dist_bin)].append(entry)
+
+    splits = {"train": [], "val": [], "test": []}
+    for (type_idx, dist_bin), group in sorted(groups.items()):
+        ordered = sorted(
+            group,
+            key=lambda item: (
+                item.timestamp,
+                os.path.normcase(item.filepath),
+                item.piece_index,
+            ),
+        )
+        try:
+            train_count, val_count, _ = _constrained_split_counts(
+                len(ordered),
+                val_fraction,
+                test_fraction,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"type={type_idx} bin={dist_bin} has {len(ordered)} pieces: {exc}"
+            ) from exc
+        val_end = train_count + val_count
+        splits["train"].extend(ordered[:train_count])
+        splits["val"].extend(ordered[train_count:val_end])
+        splits["test"].extend(ordered[val_end:])
+    return splits
+
+
+def validate_piece_split_isolation(splits):
+    """Reject a piece identity assigned to more than one split."""
+    owners = {}
+    for split_name, entries in splits.items():
+        for entry in entries:
+            previous = owners.setdefault(entry.identity, split_name)
+            if previous != split_name:
+                raise ValueError(
+                    f"piece identity appears in {previous} and {split_name}: "
+                    f"{entry.identity}"
+                )
+
+
+def validate_piece_split_coverage(splits, type_names, min_eval_pieces=500):
+    """Require validation and test coverage for every available distance bin."""
+    source = splits["train"] + splits["val"] + splits["test"]
+    failures = []
+    for type_idx, type_name in enumerate(type_names):
+        source_bins = {
+            entry.dist_bin for entry in source if entry.type_idx == type_idx
+        }
+        for split_name in ("val", "test"):
+            selected = [
+                entry
+                for entry in splits[split_name]
+                if entry.type_idx == type_idx
+            ]
+            selected_bins = {entry.dist_bin for entry in selected}
+            missing = sorted(source_bins - selected_bins)
+            if missing:
+                failures.append(f"{type_name} {split_name}: missing bins {missing}")
+            if len(selected) < min_eval_pieces:
+                failures.append(
+                    f"{type_name} {split_name}: pieces={len(selected)} "
+                    f"below required {min_eval_pieces}"
+                )
+    if failures:
+        raise ValueError("Invalid piece split coverage: " + "; ".join(failures))
 
 
 def _stable_file_order(entries, seed):

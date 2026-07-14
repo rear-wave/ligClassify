@@ -249,3 +249,116 @@ def test_four_class_coverage_validates_zero_index_ncg():
             min_bins=4,
             min_pieces=1,
         )
+
+
+def make_piece(module, filepath, piece_index, type_idx, dist_bin, second):
+    return module.PieceManifestEntry(
+        filepath=filepath,
+        piece_index=piece_index,
+        type_idx=type_idx,
+        dist_bin=dist_bin,
+        timestamp=datetime(2020, 1, 1, 0, 0, second),
+    )
+
+
+def test_build_piece_manifest_keeps_individual_timestamps(tmp_path):
+    module = training_manifest_module()
+    path = write_lig(
+        tmp_path / "NCG" / "0-100km" / "sample.lig",
+        pieces=3,
+        piece_timestamps=[
+            (20, 1, 1, 0, 0, 2),
+            (20, 1, 1, 0, 0, 0),
+            (20, 1, 1, 0, 0, 1),
+        ],
+    )
+    files, _ = module.build_manifest(str(tmp_path), ["NCG"])
+
+    pieces = module.build_piece_manifest(files)
+
+    assert [(item.filepath, item.piece_index) for item in pieces] == [
+        (str(path), 0),
+        (str(path), 1),
+        (str(path), 2),
+    ]
+    assert [item.timestamp.second for item in pieces] == [2, 0, 1]
+
+
+def test_piece_time_split_is_chronological_per_type_and_bin():
+    module = training_manifest_module()
+    entries = [
+        make_piece(module, "shared.lig", index, 0, 5, second)
+        for index, second in enumerate([9, 0, 8, 1, 7, 2, 6, 3, 5, 4])
+    ]
+
+    splits = module.piece_time_split_manifest(entries, 0.15, 0.15)
+
+    assert [item.timestamp.second for item in splits["train"]] == list(range(7))
+    assert [item.timestamp.second for item in splits["val"]] == [7, 8]
+    assert [item.timestamp.second for item in splits["test"]] == [9]
+    identities = [
+        {item.identity for item in splits[name]}
+        for name in ("train", "val", "test")
+    ]
+    assert identities[0].isdisjoint(identities[1])
+    assert identities[0].isdisjoint(identities[2])
+    assert identities[1].isdisjoint(identities[2])
+    assert {item.filepath for item in splits["train"]} & {
+        item.filepath for item in splits["test"]
+    } == {"shared.lig"}
+
+
+def test_piece_time_split_gives_three_piece_group_to_all_splits():
+    module = training_manifest_module()
+    entries = [make_piece(module, "a.lig", index, 0, 0, index) for index in range(3)]
+
+    splits = module.piece_time_split_manifest(entries, 0.15, 0.15)
+
+    assert [len(splits[name]) for name in ("train", "val", "test")] == [1, 1, 1]
+
+
+def test_piece_time_split_rejects_group_smaller_than_three():
+    module = training_manifest_module()
+    entries = [make_piece(module, "a.lig", index, 0, 0, index) for index in range(2)]
+
+    with pytest.raises(ValueError, match=r"type=0.*bin=0.*2 pieces"):
+        module.piece_time_split_manifest(entries, 0.15, 0.15)
+
+
+def test_piece_split_isolation_rejects_duplicate_identity():
+    module = training_manifest_module()
+    duplicate = make_piece(module, "same.lig", 0, 0, 0, 0)
+    splits = {"train": [duplicate], "val": [], "test": [duplicate]}
+
+    with pytest.raises(ValueError, match=r"train and test"):
+        module.validate_piece_split_isolation(splits)
+
+
+def test_piece_split_coverage_requires_every_source_bin():
+    module = training_manifest_module()
+    entries = [
+        make_piece(
+            module,
+            f"bin-{dist_bin}.lig",
+            piece_index,
+            0,
+            dist_bin,
+            piece_index,
+        )
+        for dist_bin in range(30)
+        for piece_index in range(20)
+    ]
+    splits = module.piece_time_split_manifest(entries, 0.15, 0.15)
+
+    module.validate_piece_split_isolation(splits)
+    module.validate_piece_split_coverage(splits, ["NCG"], min_eval_pieces=1)
+    assert {item.dist_bin for item in splits["val"]} == set(range(30))
+    assert {item.dist_bin for item in splits["test"]} == set(range(30))
+
+    splits["test"] = [item for item in splits["test"] if item.dist_bin != 29]
+    with pytest.raises(ValueError, match=r"NCG test: missing bins \[29\]"):
+        module.validate_piece_split_coverage(
+            splits,
+            ["NCG"],
+            min_eval_pieces=1,
+        )
