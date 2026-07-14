@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import train
-from data.training_manifest import ManifestEntry
+from data.training_manifest import ManifestEntry, PieceManifestEntry
 from distance_ordinal import ordinal_distance_loss
 from models import create_mtl_model
 from tests.test_training_manifest import write_lig
@@ -23,26 +23,43 @@ def test_multitask_dataset_has_no_ic_sampling_parameter():
 
 
 def test_multitask_dataset_is_lazy_for_four_class_entries(tmp_path):
-    ncg_path = write_lig(tmp_path / "NCG" / "100-200km" / "ncg.lig", pieces=2)
-    nnbe_path = write_lig(tmp_path / "NNBE" / "200-300km" / "nnbe.lig", pieces=3)
+    ncg_path = write_lig(
+        tmp_path / "NCG" / "100-200km" / "ncg.lig",
+        pieces=3,
+        piece_timestamps=[
+            (20, 1, 1, 0, 0, 0),
+            (20, 1, 2, 0, 0, 0),
+            (20, 1, 3, 0, 0, 0),
+        ],
+    )
     entries = [
-        ManifestEntry(str(ncg_path), 0, 1, datetime(2020, 1, 1), 2),
-        ManifestEntry(str(nnbe_path), 1, 2, datetime(2020, 1, 2), 3),
+        PieceManifestEntry(str(ncg_path), 0, 0, 1, datetime(2020, 1, 1)),
+        PieceManifestEntry(str(ncg_path), 2, 0, 1, datetime(2020, 1, 3)),
     ]
+    shared_index = train.LigFileIndex([str(ncg_path)], validate=False)
 
-    dataset = train.MultiTaskDataset(entries, split="train", seed=11)
+    dataset = train.MultiTaskDataset(
+        entries,
+        split="test",
+        lig_index=shared_index,
+    )
 
     assert not hasattr(dataset, "data")
-    assert len(dataset) == 5
-    assert np.bincount(dataset.type_labels).tolist() == [2, 3]
+    assert len(dataset) == 2
+    assert dataset.global_indices.tolist() == [0, 2]
+    assert dataset.type_labels.tolist() == [0, 0]
+    assert dataset.dist_labels.tolist() == [1, 1]
     assert len(dataset.file_ids) == len(dataset)
     assert len(dataset.date_ids) == len(dataset)
-    assert set(dataset.date_ids.tolist()) == {20200101, 20200102}
-    assert len(set(dataset.file_ids.tolist())) == 2
-    waveform, type_label, dist_label = dataset[0]
+    assert dataset.date_ids.tolist() == [20200101, 20200103]
+    assert dataset.file_ids.tolist() == [0, 0]
+    waveform, type_label, dist_label = dataset[1]
     assert tuple(waveform.shape) == (1, 8000)
     assert type_label.ndim == 0
     assert dist_label.ndim == 0
+    dataset.close()
+    assert shared_index.read_piece(0).shape == (8000,)
+    shared_index.close()
 
 
 def test_distance_routing_separates_oracle_from_end_to_end_results():

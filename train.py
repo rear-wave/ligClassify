@@ -98,41 +98,49 @@ class MultiTaskDataset(Dataset):
         self,
         entries,
         split="train",
-        seed=42,
+        lig_index=None,
         normalize_mode="minmax",
     ):
         self.split = split
         self.normalize_mode = normalize_mode
-        entry_by_path = {
-            os.path.normcase(os.path.abspath(item.filepath)): item for item in entries
+        paths = sorted({entry.filepath for entry in entries})
+        self._owns_lig_index = lig_index is None
+        self.lig = lig_index or LigFileIndex(paths, validate=False)
+        path_to_file = {
+            os.path.normcase(os.path.abspath(path)): index
+            for index, path in enumerate(self.lig.filepaths)
         }
-        self.lig = LigFileIndex([item.filepath for item in entries], validate=False)
-        accepted_entries = [
-            entry_by_path[os.path.normcase(os.path.abspath(path))]
-            for path in self.lig.filepaths
-        ]
 
-        global_parts = []
-        type_parts = []
-        dist_parts = []
-        file_parts = []
-        date_parts = []
-        for file_idx, entry in enumerate(accepted_entries):
-            start = int(self.lig._cumsum[file_idx])
-            end = int(self.lig._cumsum[file_idx + 1])
-            count = end - start
-            global_parts.append(np.arange(start, end, dtype=np.int64))
-            type_parts.append(np.full(count, entry.type_idx, dtype=np.int8))
-            dist_parts.append(np.full(count, entry.dist_bin, dtype=np.int8))
-            file_parts.append(np.full(count, file_idx, dtype=np.int32))
-            date_id = int(entry.acquisition_date.strftime("%Y%m%d"))
-            date_parts.append(np.full(count, date_id, dtype=np.int32))
+        global_indices = []
+        type_labels = []
+        dist_labels = []
+        file_ids = []
+        date_ids = []
+        for entry in entries:
+            key = os.path.normcase(os.path.abspath(entry.filepath))
+            if key not in path_to_file:
+                raise ValueError(
+                    f"piece references an unindexed file: {entry.filepath}"
+                )
+            file_id = path_to_file[key]
+            piece_count = self.lig.num_pieces_per_file[file_id]
+            if not 0 <= entry.piece_index < piece_count:
+                raise IndexError(
+                    f"piece_index={entry.piece_index} outside {entry.filepath}"
+                )
+            global_indices.append(
+                int(self.lig._cumsum[file_id]) + entry.piece_index
+            )
+            type_labels.append(entry.type_idx)
+            dist_labels.append(entry.dist_bin)
+            file_ids.append(file_id)
+            date_ids.append(int(entry.timestamp.strftime("%Y%m%d")))
 
-        self.global_indices = np.concatenate(global_parts)
-        self.type_labels = np.concatenate(type_parts)
-        self.dist_labels = np.concatenate(dist_parts)
-        self.file_ids = np.concatenate(file_parts)
-        self.date_ids = np.concatenate(date_parts)
+        self.global_indices = np.asarray(global_indices, dtype=np.int64)
+        self.type_labels = np.asarray(type_labels, dtype=np.int8)
+        self.dist_labels = np.asarray(dist_labels, dtype=np.int8)
+        self.file_ids = np.asarray(file_ids, dtype=np.int32)
+        self.date_ids = np.asarray(date_ids, dtype=np.int32)
         n_dist = int(np.count_nonzero(self.dist_labels >= 0))
         logger.info(
             "  %s lazy view: %d pieces (%d with distance)",
@@ -167,7 +175,7 @@ class MultiTaskDataset(Dataset):
         return self._items_from_positions([int(index) for index in indices])
 
     def close(self):
-        if hasattr(self, "lig"):
+        if getattr(self, "_owns_lig_index", False) and hasattr(self, "lig"):
             self.lig.close()
 
     def __del__(self):
