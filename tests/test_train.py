@@ -208,8 +208,8 @@ def test_output_paths_use_classifier_checkpoint_names(tmp_path):
 def test_release_gate_reports_each_failed_threshold():
     metrics = {
         "type_f1": 0.84,
-        "dist_macro_w2": 0.74,
-        "per_type_w2": [0.80, 0.69, 0.90, 0.88],
+        "dist_equal_bin_macro_w2": 0.74,
+        "per_type_equal_bin_w2": [0.80, 0.69, 0.90, 0.88],
     }
 
     passed, reasons = train.evaluate_release_gate(metrics)
@@ -222,8 +222,8 @@ def test_release_gate_reports_each_failed_threshold():
         "type_f1": 0.9,
         "type_precision": [0.85] * 4,
         "type_recall": [0.70] * 4,
-        "dist_macro_w2": 0.8,
-        "per_type_w2": [0.7] * 4,
+        "dist_equal_bin_macro_w2": 0.8,
+        "per_type_equal_bin_w2": [0.7] * 4,
     }
     assert train.evaluate_release_gate(good) == (True, [])
 
@@ -233,8 +233,8 @@ def test_release_gate_enforces_four_class_precision_and_recall():
         "type_f1": 0.90,
         "type_precision": [0.90, 0.84, 0.91, 0.88],
         "type_recall": [0.80, 0.82, 0.69, 0.75],
-        "dist_macro_w2": 0.80,
-        "per_type_w2": [0.80] * 4,
+        "dist_equal_bin_macro_w2": 0.80,
+        "per_type_equal_bin_w2": [0.80] * 4,
     }
 
     passed, reasons = train.evaluate_release_gate(metrics)
@@ -249,20 +249,38 @@ def test_four_class_selection_prefers_type_quality_before_distance():
         "type_f1": 0.91,
         "type_min_recall": 0.80,
         "type_min_precision": 0.86,
-        "dist_macro_w2": 0.70,
-        "dist_macro_mae_km": 150.0,
+        "dist_equal_bin_macro_w2": 0.70,
+        "dist_equal_bin_macro_mae_km": 150.0,
     }
     better_distance = {
         "type_f1": 0.89,
         "type_min_recall": 0.80,
         "type_min_precision": 0.86,
-        "dist_macro_w2": 0.95,
-        "dist_macro_mae_km": 80.0,
+        "dist_equal_bin_macro_w2": 0.95,
+        "dist_equal_bin_macro_mae_km": 80.0,
     }
 
     assert train.make_four_class_selection_key(
         better_type
     ) > train.make_four_class_selection_key(better_distance)
+
+
+def test_release_gate_uses_equal_bin_metrics_instead_of_raw_piece_metrics():
+    metrics = {
+        "type_f1": 0.90,
+        "type_precision": [0.90] * 4,
+        "type_recall": [0.80] * 4,
+        "dist_macro_w2": 0.99,
+        "per_type_w2": [0.99] * 4,
+        "dist_equal_bin_macro_w2": 0.74,
+        "per_type_equal_bin_w2": [0.80, 0.69, 0.90, 0.88],
+    }
+
+    passed, reasons = train.evaluate_release_gate(metrics)
+
+    assert passed is False
+    assert any("macro_w2" in reason for reason in reasons)
+    assert any("type_w2[1]" in reason for reason in reasons)
 
 
 def test_four_class_schema_metadata_is_explicit():
@@ -559,6 +577,9 @@ def test_evaluate_reports_macro_worst_and_end_to_end_w2():
 
     assert metrics["dist_macro_w2"] == pytest.approx(0.75)
     assert metrics["dist_min_type_w2"] == pytest.approx(0.0)
+    assert metrics["dist_equal_bin_macro_w2"] == pytest.approx(0.75)
+    assert metrics["dist_equal_bin_min_type_w2"] == pytest.approx(0.0)
+    assert metrics["per_type_equal_bin_w2"] == [1.0, 1.0, 1.0, 0.0]
     assert metrics["e2e_dist_w2"] == pytest.approx(0.75)
     assert metrics["e2e_dist_coverage"] == pytest.approx(1.0)
     assert metrics["type_precision"] == [1.0, 1.0, 1.0, 1.0]
@@ -589,6 +610,28 @@ def test_fit_distance_calibration_returns_four_temperatures_and_threshold():
     assert calibration["confidence_threshold"] <= 1.0
     assert calibration["validation_coverage"] == pytest.approx(1.0)
     assert calibration["validation_w2"] == pytest.approx(1.0)
+
+
+def test_collect_distance_outputs_routes_zero_based_type_labels():
+    class FixedModel:
+        def eval(self):
+            return self
+
+        def __call__(self, x):
+            return (
+                torch.zeros((4, 4)),
+                [torch.zeros((4, 30)) for _ in range(4)],
+            )
+
+    loader = [(
+        torch.zeros((4, 1, 32)),
+        torch.tensor([0, 1, 2, 3]),
+        torch.tensor([4, 5, 6, 7]),
+    )]
+
+    _, targets = train.collect_distance_outputs(FixedModel(), loader, "cpu")
+
+    assert [values.tolist() for values in targets] == [[4], [5], [6], [7]]
 
 
 def test_group_bootstrap_is_reproducible_and_returns_metric_intervals():

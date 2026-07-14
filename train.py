@@ -1,7 +1,4 @@
-"""
-ligClassify — Multi-task training: type (5-class) + per-class distance (30-bin).
-IC samples have dist_label = -1 and are excluded from distance loss.
-"""
+"""Four-class lightning-type and routed 30-bin distance training."""
 
 import argparse
 import hashlib
@@ -33,6 +30,7 @@ from data.training_manifest import (
     validate_piece_split_coverage,
     validate_piece_split_isolation,
 )
+from distance_metrics import summarize_equal_bin_distance_predictions
 from distance_ordinal import (
     decode_distance_logits,
     fit_temperature_grid,
@@ -48,7 +46,7 @@ logger = logging.getLogger(__name__)
 RESEARCH_TYPE_NAMES = ["NCG", "NNBE", "PCG", "PNBE"]
 TYPE_NAMES = list(RESEARCH_TYPE_NAMES)
 DIST_NAMES = list(RESEARCH_TYPE_NAMES)
-# IC=0 is not in DIST_NAMES → dist_head index = type_idx - 1
+# Four research types use the same zero-based type and distance-head index.
 DIST_BIN_STARTS = [i * 100 for i in range(30)]       # 0, 100, ..., 2900
 
 
@@ -67,8 +65,8 @@ def make_four_class_selection_key(metrics):
         float(metrics["type_f1"]),
         float(metrics["type_min_recall"]),
         float(metrics["type_min_precision"]),
-        float(metrics["dist_macro_w2"]),
-        -float(metrics["dist_macro_mae_km"]),
+        float(metrics["dist_equal_bin_macro_w2"]),
+        -float(metrics["dist_equal_bin_macro_mae_km"]),
     )
 
 
@@ -556,7 +554,7 @@ def collect_distance_outputs(model, loader, device):
         distance_labels = distance_labels.to(device)
         _, distance_logits = model(x)
         for head in range(4):
-            mask = (type_labels == head + 1) & (distance_labels >= 0)
+            mask = (type_labels == head) & (distance_labels >= 0)
             if mask.any():
                 logits_by_head[head].append(distance_logits[head][mask].cpu())
                 targets_by_head[head].append(distance_labels[mask].cpu())
@@ -654,6 +652,7 @@ def evaluate(model, loader, type_crit, dist_crit, dev,
     total_dist_ok, total_dist_n, total_mae_bin, total_mae_km = 0, 0, 0, 0
     total_w1, total_w2, total_w1n, total_w2n = 0, 0, 0, 0
     per_type_w2, per_type_mae = [], []
+    per_type_equal_bin_w2, per_type_equal_bin_mae = [], []
 
     for hi, name in enumerate(DIST_NAMES):
         preds = np.array(dist_data[hi]["preds"])
@@ -665,6 +664,8 @@ def evaluate(model, loader, type_crit, dist_crit, dev,
             metrics[f"{key}_w1"], metrics[f"{key}_w2"] = 0.0, 0.0
             per_type_w2.append(0.0)
             per_type_mae.append(0.0)
+            per_type_equal_bin_w2.append(0.0)
+            per_type_equal_bin_mae.append(0.0)
             continue
 
         ok = (preds == trues).sum()
@@ -680,6 +681,12 @@ def evaluate(model, loader, type_crit, dist_crit, dev,
         metrics[f"{key}_w2"] = float(w2)
         per_type_w2.append(float(w2))
         per_type_mae.append(float(mae_km))
+
+        equal_bin = summarize_equal_bin_distance_predictions(preds, trues)
+        for metric_name in ("acc", "mae_km", "w1", "w2", "bin_count"):
+            metrics[f"{key}_equal_bin_{metric_name}"] = equal_bin[metric_name]
+        per_type_equal_bin_w2.append(equal_bin["w2"])
+        per_type_equal_bin_mae.append(equal_bin["mae_km"])
 
         total_dist_ok += ok; total_dist_n += n
         total_mae_bin += mae_bin * n; total_mae_km += mae_km * n
@@ -699,6 +706,16 @@ def evaluate(model, loader, type_crit, dist_crit, dev,
     metrics["dist_macro_w2"] = float(np.mean(per_type_w2))
     metrics["dist_min_type_w2"] = float(np.min(per_type_w2))
     metrics["dist_macro_mae_km"] = float(np.mean(per_type_mae))
+    metrics["per_type_equal_bin_w2"] = per_type_equal_bin_w2
+    metrics["dist_equal_bin_macro_w2"] = float(
+        np.mean(per_type_equal_bin_w2)
+    )
+    metrics["dist_equal_bin_min_type_w2"] = float(
+        np.min(per_type_equal_bin_w2)
+    )
+    metrics["dist_equal_bin_macro_mae_km"] = float(
+        np.mean(per_type_equal_bin_mae)
+    )
 
     e2e_preds = np.asarray(end_to_end_preds, dtype=np.int64)
     e2e_trues = np.asarray(end_to_end_trues, dtype=np.int64)
@@ -790,8 +807,11 @@ def evaluate_release_gate(
     """Return whether locked test metrics are safe to deploy."""
     reasons = []
     type_f1 = float(metrics.get("type_f1", 0.0))
-    macro_w2 = float(metrics.get("dist_macro_w2", 0.0))
-    per_type = [float(value) for value in metrics.get("per_type_w2", [])]
+    macro_w2 = float(metrics.get("dist_equal_bin_macro_w2", 0.0))
+    per_type = [
+        float(value)
+        for value in metrics.get("per_type_equal_bin_w2", [])
+    ]
     type_precision = [
         float(value) for value in metrics.get("type_precision", [])
     ]
@@ -821,7 +841,9 @@ def evaluate_release_gate(
                     f"{min_type_recall:.2f}"
                 )
     if len(per_type) != 4:
-        reasons.append(f"per_type_w2 has {len(per_type)} values; expected 4")
+        reasons.append(
+            f"per_type_equal_bin_w2 has {len(per_type)} values; expected 4"
+        )
     else:
         for index, value in enumerate(per_type):
             if value < min_type_w2:
@@ -1313,7 +1335,8 @@ def main():
             f"T_loss={train_type_loss:.4f} D_loss={train_dist_loss:.4f} T_acc={train_type_acc:.4f} | "
             f"VT_acc={val['type_acc']:.4f} VT_f1={val['type_f1']:.4f} | "
             f"VD_acc={val.get('dist_acc',0):.4f} VD_mae={val.get('dist_mae_km',0):.0f}km "
-            f"VD_w1={val.get('dist_w1',0):.4f} | "
+            f"VD_w1={val.get('dist_w1',0):.4f} "
+            f"VD_bin_w2={val.get('dist_equal_bin_macro_w2',0):.4f} | "
             f"E2E_D_acc={val.get('e2e_dist_acc',0):.4f} "
             f"Joint={val.get('joint_acc',0):.4f}")
 
@@ -1452,7 +1475,9 @@ def main():
                 f"mae_km={test.get('dist_mae_km',0):.0f}km "
                 f"w1={test.get('dist_w1',0):.4f} w2={test.get('dist_w2',0):.4f} "
                 f"macro_w2={test.get('dist_macro_w2',0):.4f} "
-                f"min_w2={test.get('dist_min_type_w2',0):.4f}")
+                f"min_w2={test.get('dist_min_type_w2',0):.4f} "
+                f"equal_bin_w2={test.get('dist_equal_bin_macro_w2',0):.4f} "
+                f"equal_bin_min={test.get('dist_equal_bin_min_type_w2',0):.4f}")
     logger.info(
         f"  End-to-end distance: acc={test.get('e2e_dist_acc',0):.4f} "
         f"coverage={test.get('e2e_dist_coverage',0):.4f} "
@@ -1466,7 +1491,9 @@ def main():
             logger.info(f"  {name}: acc={test.get(k+'_acc',0):.4f} "
                         f"mae_bin={test.get(k+'_mae_bin',0):.2f} "
                         f"mae_km={test.get(k+'_mae_km',0):.0f}km "
-                        f"w1={test.get(k+'_w1',0):.4f} w2={test.get(k+'_w2',0):.4f}")
+                        f"w1={test.get(k+'_w1',0):.4f} w2={test.get(k+'_w2',0):.4f} "
+                        f"equal_bin_mae={test.get(k+'_equal_bin_mae_km',0):.0f}km "
+                        f"equal_bin_w2={test.get(k+'_equal_bin_w2',0):.4f}")
 
     report = {"evaluated_split": evaluated_split, **test}
     if args.skip_test:
