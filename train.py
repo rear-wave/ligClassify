@@ -28,8 +28,10 @@ from data.distance_sampling import BalancedTypeSampler, HierarchicalDistanceSamp
 from data.preprocessing import preprocess_batch
 from data.training_manifest import (
     build_manifest,
-    coverage_temporal_split_manifest,
-    validate_split_coverage,
+    build_piece_manifest,
+    piece_time_split_manifest,
+    validate_piece_split_coverage,
+    validate_piece_split_isolation,
 )
 from distance_ordinal import (
     decode_distance_logits,
@@ -460,22 +462,33 @@ def group_bootstrap_distance_metrics(
 
 
 def compute_split_hash(entries, split_name):
-    """Return a stable identity for a chronological manifest split."""
-    rows = []
-    for entry in entries:
-        rows.append("|".join([
+    """Return a stable hash of selected piece identities and labels."""
+    rows = [
+        "|".join([
             split_name,
             os.path.normcase(os.path.abspath(entry.filepath)),
+            str(entry.piece_index),
             str(entry.type_idx),
             str(entry.dist_bin),
             entry.timestamp.isoformat(),
-            str(entry.n_pieces),
-        ]))
+        ])
+        for entry in entries
+    ]
     digest = hashlib.sha256()
     for row in sorted(rows):
         digest.update(row.encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def count_cross_split_files(splits):
+    """Count source files contributing pieces to more than one split."""
+    memberships = {}
+    for split_name, entries in splits.items():
+        for entry in entries:
+            path = os.path.normcase(os.path.abspath(entry.filepath))
+            memberships.setdefault(path, set()).add(split_name)
+    return sum(len(names) > 1 for names in memberships.values())
 
 
 def fit_distance_calibration(logits_by_head, targets_by_head, target_w2=0.8):
@@ -774,7 +787,7 @@ def evaluate_release_gate(
     min_type_w2=0.70,
     min_macro_w2=0.75,
 ):
-    """Return whether locked temporal-test metrics are safe to deploy."""
+    """Return whether locked test metrics are safe to deploy."""
     reasons = []
     type_f1 = float(metrics.get("type_f1", 0.0))
     macro_w2 = float(metrics.get("dist_macro_w2", 0.0))
@@ -959,9 +972,9 @@ def build_arg_parser():
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val_fraction", type=float, default=0.15,
-                   help="Fraction of pre-test files held out per type/distance group")
+                   help="Middle piece fraction per type/distance group")
     p.add_argument("--test_fraction", type=float, default=0.15,
-                   help="Fraction of latest acquisition dates used for test per type")
+                   help="Latest piece fraction per type/distance group")
     p.add_argument("--num_workers", type=int, default=0,
                    help="DataLoader workers (0 is safest on Windows)")
     p.add_argument("--lambda_dist", type=float, default=1.0,
@@ -990,11 +1003,10 @@ def build_arg_parser():
     p.add_argument("--distance_prediction", choices=["argmax", "expected"],
                    default="expected")
     p.add_argument("--skip_test", action="store_true",
-                   help="Do not evaluate the locked chronological test split")
+                   help="Do not evaluate the locked piece-level test split")
     p.add_argument("--deterministic", action="store_true",
                    help="Use deterministic cuDNN kernels instead of fast benchmark mode")
-    p.add_argument("--min_val_bins", type=int, default=12)
-    p.add_argument("--min_val_pieces", type=int, default=500)
+    p.add_argument("--min_eval_pieces", type=int, default=500)
     p.add_argument("--min_type_f1", type=float, default=0.85)
     p.add_argument("--min_type_precision", type=float, default=0.85)
     p.add_argument("--min_type_recall", type=float, default=0.70)
@@ -1019,10 +1031,10 @@ def main():
     logger.info(f"lambda_dist={args.lambda_dist}, soft_label={args.use_soft_distance_label}, "
                 f"soft_tau={args.distance_soft_tau}")
 
-    # Build coverage validation plus a date-isolated locked temporal test.
-    manifest, diagnostics = build_manifest(args.task_data, TYPE_NAMES)
-    if not manifest:
-        raise RuntimeError(f"No valid timestamped .lig files found under {args.task_data}")
+    # Split pieces chronologically inside every type/distance group.
+    file_manifest, diagnostics = build_manifest(args.task_data, TYPE_NAMES)
+    if not file_manifest:
+        raise RuntimeError(f"No valid .lig files found under {args.task_data}")
     logger.info(
         "Manifest: %d/%d valid files, %d invalid, %d timestamp errors, "
         "%d filename fallbacks, %d distance-labelled",
@@ -1033,52 +1045,63 @@ def main():
         diagnostics["filename_timestamp_fallbacks"],
         diagnostics["distance_labeled_files"],
     )
-    split_entries = coverage_temporal_split_manifest(
-        manifest,
+    piece_manifest = build_piece_manifest(file_manifest)
+    logger.info("Piece manifest: %d timestamped pieces", len(piece_manifest))
+    split_entries = piece_time_split_manifest(
+        piece_manifest,
         val_fraction=args.val_fraction,
         test_fraction=args.test_fraction,
-        seed=args.seed,
     )
-    validate_split_coverage(
+    validate_piece_split_isolation(split_entries)
+    validate_piece_split_coverage(
         split_entries,
         TYPE_NAMES,
-        min_bins=args.min_val_bins,
-        min_pieces=args.min_val_pieces,
+        min_eval_pieces=args.min_eval_pieces,
     )
     for split_name, entries in split_entries.items():
-        logger.info("%s: %d files, %d pieces", split_name, len(entries),
-                    sum(item.n_pieces for item in entries))
+        logger.info(
+            "%s: %d pieces from %d files",
+            split_name,
+            len(entries),
+            len({item.filepath for item in entries}),
+        )
         for type_idx, type_name in enumerate(TYPE_NAMES):
             typed = [item for item in entries if item.type_idx == type_idx]
             if not typed:
-                logger.warning("  %s: no %s files", split_name, type_name)
+                logger.warning("  %s: no %s pieces", split_name, type_name)
                 continue
-            dates = sorted({item.acquisition_date for item in typed})
+            timestamps = sorted(item.timestamp for item in typed)
             dist_bins = {item.dist_bin for item in typed if item.dist_bin >= 0}
             logger.info(
-                "  %s: %d files, %d pieces, %d dates (%s to %s), %d distance bins",
+                "  %s: %d pieces, %d files, %s to %s, %d distance bins",
                 type_name,
                 len(typed),
-                sum(item.n_pieces for item in typed),
-                len(dates),
-                dates[0],
-                dates[-1],
+                len({item.filepath for item in typed}),
+                timestamps[0],
+                timestamps[-1],
                 len(dist_bins),
             )
             missing = sorted(set(range(30)) - dist_bins)
             if missing:
                 logger.warning("    missing distance bins: %s", missing)
 
-    train_set = MultiTaskDataset(
-        split_entries["train"],
-        "train",
-        seed=args.seed,
+    cross_split_file_count = count_cross_split_files(split_entries)
+    logger.warning(
+        "%d source files contribute pieces to multiple splits; "
+        "piece identities are disjoint, but evaluation does not measure "
+        "cross-file generalization",
+        cross_split_file_count,
     )
-    val_set = MultiTaskDataset(split_entries["val"], "val", seed=args.seed)
+    shared_lig = LigFileIndex(
+        sorted({entry.filepath for entry in piece_manifest}),
+        validate=False,
+    )
+    train_set = MultiTaskDataset(split_entries["train"], "train", shared_lig)
+    val_set = MultiTaskDataset(split_entries["val"], "val", shared_lig)
     test_set = (
         None
         if args.skip_test
-        else MultiTaskDataset(split_entries["test"], "test", seed=args.seed)
+        else MultiTaskDataset(split_entries["test"], "test", shared_lig)
     )
 
     type_samples = balanced_type_sample_count(
@@ -1191,11 +1214,14 @@ def main():
         "dist_bin_starts": DIST_BIN_STARTS,
         "preprocessing": {"normalize_mode": "minmax", "target_length": 8000},
         "split_config": {
-            "strategy": "coverage_validation_with_locked_temporal_test",
+            "strategy": "distance_stratified_piece_time_v1",
+            "train_fraction": 1.0 - args.val_fraction - args.test_fraction,
             "val_fraction": args.val_fraction,
             "test_fraction": args.test_fraction,
-            "min_val_bins": args.min_val_bins,
-            "min_val_pieces": args.min_val_pieces,
+            "min_eval_pieces": args.min_eval_pieces,
+            "files_may_overlap": True,
+            "piece_identities_disjoint": True,
+            "cross_split_file_count": cross_split_file_count,
         },
         "split_hashes": {
             split_name: compute_split_hash(entries, split_name)
@@ -1445,7 +1471,7 @@ def main():
     report = {"evaluated_split": evaluated_split, **test}
     if args.skip_test:
         passed = False
-        reasons = ["locked temporal test was skipped"]
+        reasons = ["locked test was skipped"]
     else:
         passed, reasons = evaluate_release_gate(
             test,

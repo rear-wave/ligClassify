@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import train
-from data.training_manifest import ManifestEntry, PieceManifestEntry
+from data.training_manifest import PieceManifestEntry
 from distance_ordinal import ordinal_distance_loss
 from models import create_mtl_model
 from tests.test_training_manifest import write_lig
@@ -142,8 +142,7 @@ def test_v2_training_arguments_have_reliable_defaults():
     assert args.max_distance_samples_per_file == 256
     assert args.type_samples_per_epoch == 180000
     assert args.distance_samples_per_epoch == 60000
-    assert args.min_val_bins == 12
-    assert args.min_val_pieces == 500
+    assert args.min_eval_pieces == 500
     assert args.min_type_f1 == 0.85
     assert args.min_test_type_w2 == 0.70
     assert args.min_test_macro_w2 == 0.75
@@ -488,22 +487,48 @@ def test_uncovered_end_to_end_prediction_counts_as_w2_failure():
 
 def test_split_hash_is_order_independent_but_label_sensitive(tmp_path):
     entries = [
-        ManifestEntry(str(tmp_path / "b.lig"), 2, 4, datetime(2020, 1, 2), 3),
-        ManifestEntry(str(tmp_path / "a.lig"), 1, 2, datetime(2020, 1, 1), 5),
+        PieceManifestEntry(
+            str(tmp_path / "b.lig"), 2, 2, 4, datetime(2020, 1, 2)
+        ),
+        PieceManifestEntry(
+            str(tmp_path / "a.lig"), 1, 1, 2, datetime(2020, 1, 1)
+        ),
     ]
 
     first = train.compute_split_hash(entries, "train")
     second = train.compute_split_hash(list(reversed(entries)), "train")
-    changed_entries = [entries[0], ManifestEntry(
-        entries[1].filepath,
-        entries[1].type_idx,
-        3,
-        entries[1].acquisition_date,
-        entries[1].n_pieces,
-    )]
+    changed_entries = [
+        entries[0],
+        PieceManifestEntry(
+            entries[1].filepath,
+            2,
+            entries[1].type_idx,
+            entries[1].dist_bin,
+            entries[1].timestamp,
+        ),
+    ]
 
     assert first == second
     assert train.compute_split_hash(changed_entries, "train") != first
+
+
+def test_shared_file_count_reports_expected_overlap():
+    def piece(path, piece_index):
+        return PieceManifestEntry(
+            path,
+            piece_index,
+            0,
+            0,
+            datetime(2020, 1, 1),
+        )
+
+    splits = {
+        "train": [piece("same.lig", 0)],
+        "val": [piece("same.lig", 1)],
+        "test": [piece("same.lig", 2), piece("other.lig", 0)],
+    }
+
+    assert train.count_cross_split_files(splits) == 1
 
 
 def test_evaluate_reports_macro_worst_and_end_to_end_w2():
