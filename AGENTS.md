@@ -4,9 +4,9 @@
 
 This repository is a PyTorch classifier for binary `.lig` lightning waveforms.
 
-- `train.py` builds chronological train/validation/test splits and trains the type and distance heads.
+- `train.py` builds piece-level train/validation/test views and trains the type and distance heads.
 - `classify.py` is the production inference entry point. It preserves original piece bytes and writes an audit CSV.
-- `models.py` defines the 1D ResNet architectures. `distance_ordinal.py` handles distance objectives; `open_set.py` handles four-class calibration and rejection.
+- `models.py` defines the 1D ResNet architectures. `distance_ordinal.py` handles distance objectives, `distance_metrics.py` handles equal-bin evaluation, and `open_set.py` handles four-class calibration and rejection.
 - `data/` contains parsing, preprocessing, manifest, and sampling code.
 - `tests/` contains synthetic unit tests. Do not add real waveform files as fixtures.
 - `weights/old/` and `weights/four_class/` contain local deployment weights and are ignored by Git.
@@ -31,13 +31,13 @@ python -m pytest -q
 python -m compileall -q .
 ```
 
-Training keeps the latest dates as a locked temporal test, uses file-level validation, and samples the four researched types equally. Random initialization is the default; `--init_model <path>` explicitly warm-starts compatible encoder tensors. Every run writes `candidate.pt`; promotion also requires the baseline metrics file. During four-class inference, `IC` means rejected/not researched, and calibrated per-type thresholds replace `--min_type_confidence`.
+Training expands each valid file into `(filepath, piece_index)` identities. Within every `(type, distance_bin)` group, pieces are sorted by their binary timestamp and split into earliest 70% training, middle 15% validation, and latest 15% test views. Files may occur in several views, but piece identities must remain disjoint. Shared-file evaluation measures held-out pieces and must not be described as cross-file generalization. The four researched types are sampled equally. Random initialization is the default; `--init_model <path>` explicitly warm-starts compatible encoder tensors. Every run writes `candidate.pt`; promotion also requires the baseline metrics file. During four-class inference, `IC` means rejected/not researched, and calibrated per-type thresholds replace `--min_type_confidence`.
 
 ## Style and Tests
 
 Use four-space indentation, `snake_case` functions and variables, `PascalCase` classes, and `UPPER_CASE` constants. Keep CLI orchestration out of `data/`. Add type hints and short docstrings to reusable public helpers.
 
-Name tests `test_<module>.py`. Cover parsing, split isolation/coverage, sampler balance, output shape, checkpoint compatibility, routing, and raw-byte preservation. Before handoff, run the full test suite, compile check, and a bounded smoke test.
+Name tests `test_<module>.py`. Cover parsing, piece-identity isolation, distance-bin coverage, sampler balance, output shape, checkpoint compatibility, routing, and raw-byte preservation. Before handoff, run the full test suite, compile check, and a bounded smoke test.
 
 ## Commits and Data Safety
 
