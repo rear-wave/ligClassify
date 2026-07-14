@@ -6,7 +6,7 @@ from models import create_mtl_model
 from data.preprocessing import preprocess_batch
 
 # Config
-MODEL_PATH = r"C:\Users\Administrator\Desktop\ligClassify\checkpoints_v2\mtl.pt"
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "weights", "old", "model.pt")
 LOC_FILE = r"E:\Guoxing Yang\2021.0413-type&distance\AE20210413.loc"
 INPUT_DIR = r"E:\Guoxing Yang\typhoon_classified\2021.0413-2021.0425"
 DATE_FILTER = "210413"

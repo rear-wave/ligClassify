@@ -23,6 +23,7 @@
 import os
 import struct
 import logging
+from datetime import datetime, timedelta
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -700,3 +701,69 @@ class LigFileIndex:
 
     def __len__(self):
         return self.total_pieces
+
+
+def _datetime_from_lig_fields(year, month, day, hour, minute, second, sec_frac=0.0):
+    """Convert validated LIG timestamp fields to ``datetime``.
+
+    Some source files encode midnight as hour 24. Treat it as the following
+    day instead of dropping an otherwise valid acquisition.
+    """
+    if year < 100:
+        year += 2000
+    if not 1 <= month <= 12:
+        raise ValueError(f"invalid month: {month}")
+    if not 0 <= minute <= 59:
+        raise ValueError(f"invalid minute: {minute}")
+    if not 0 <= second <= 60:
+        raise ValueError(f"invalid second: {second}")
+    if not 0.0 <= sec_frac < 1.0:
+        raise ValueError(f"invalid fractional second: {sec_frac}")
+    if not 0 <= hour <= 24:
+        raise ValueError(f"invalid hour: {hour}")
+
+    base = datetime(year, month, day)
+    if hour == 24:
+        logger.warning(
+            "Normalizing LIG hour 24 to the following day: %04d-%02d-%02d",
+            year,
+            month,
+            day,
+        )
+    return base + timedelta(
+        hours=hour,
+        minutes=minute,
+        seconds=second + sec_frac,
+    )
+
+
+def read_lig_timestamp(filepath, piece_index=0):
+    """Read one piece timestamp without loading its waveform."""
+    n_pieces = count_lig_pieces(filepath)
+    if piece_index < 0 or piece_index >= n_pieces:
+        raise IndexError(
+            f"piece_index={piece_index} outside file with {n_pieces} pieces"
+        )
+
+    offset = (
+        _LIG_FILE_HEADER_BYTES
+        + piece_index * _LIG_PIECE_BYTES
+        + _LIG_PIECE_HEADER_BYTES
+    )
+    try:
+        with open(filepath, "rb") as handle:
+            handle.seek(offset)
+            raw = handle.read(_LIG_TIMESTAMP_BYTES + _LIG_SECFRAC_BYTES)
+    except OSError as exc:
+        raise LigFormatError(f"failed to read timestamp: {filepath}: {exc}") from exc
+
+    if len(raw) != _LIG_TIMESTAMP_BYTES + _LIG_SECFRAC_BYTES:
+        raise LigFormatError(f"incomplete timestamp: {filepath}")
+    try:
+        year, month, day, hour, minute, second = struct.unpack_from("6i4x", raw, 0)
+        sec_frac = struct.unpack_from("d", raw, _LIG_TIMESTAMP_BYTES)[0]
+        return _datetime_from_lig_fields(
+            year, month, day, hour, minute, second, sec_frac
+        )
+    except (struct.error, ValueError) as exc:
+        raise LigFormatError(f"invalid timestamp: {filepath}: {exc}") from exc

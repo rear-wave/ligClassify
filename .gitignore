@@ -1,5 +1,5 @@
 train_data/
-checkpoints_v2/
+weights/
 __pycache__/
 *.pyc
 .DS_Store

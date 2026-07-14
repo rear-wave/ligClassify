@@ -90,19 +90,113 @@ class MultiTaskResNet(nn.Module):
             blocks.append(ResidualBlock(out_ch, out_ch))
         return nn.Sequential(*blocks)
 
-    def forward(self, x):
+    def _encode(self, x):
         x = self.stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        x = self.gap(x).squeeze(-1)
-        type_logits = self.type_head(x)
-        dist_logits = [h(x) for h in self.d_heads]  # list of 4 tensors [B, 30]
+        return self.gap(x).squeeze(-1)
+
+    def forward_type(self, x):
+        return self.type_head(self.extract_type_features(x))
+
+    def extract_type_features(self, x):
+        """Return pooled encoder features used by the type head."""
+        return self._encode(x)
+
+    def forward(self, x):
+        features = self._encode(x)
+        type_logits = self.type_head(features)
+        dist_logits = [h(features) for h in self.d_heads]
         return type_logits, dist_logits
 
 
-def create_mtl_model(base_channels=64):
-    model = MultiTaskResNet(base=base_channels)
+class MultiTaskOrdinalResNet(nn.Module):
+    """Shared type encoder with a distance-specific pooled projection."""
+
+    def __init__(
+        self,
+        base=64,
+        num_types=5,
+        num_dists=30,
+        dist_mlp_dim=128,
+        dist_dropout=0.2,
+    ):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, base, 15, stride=2, padding=7),
+            _gn(base),
+            nn.ReLU(),
+        )
+        self.layer1 = self._layer(base, base, 3, 1)
+        self.layer2 = self._layer(base, base * 2, 3, 2)
+        self.layer3 = self._layer(base * 2, base * 2, 3, 2)
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.gmp = nn.AdaptiveMaxPool1d(1)
+
+        feat_dim = base * 2
+        self.type_head = nn.Linear(feat_dim, num_types)
+        self.distance_projection = nn.Sequential(
+            nn.LayerNorm(feat_dim * 2),
+            nn.Linear(feat_dim * 2, dist_mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dist_dropout),
+        )
+        self.d_heads = nn.ModuleList([
+            nn.Linear(dist_mlp_dim, num_dists) for _ in range(4)
+        ])
+
+    def _layer(self, in_ch, out_ch, n, stride):
+        blocks = [ResidualBlock(in_ch, out_ch, stride)]
+        for _ in range(1, n):
+            blocks.append(ResidualBlock(out_ch, out_ch))
+        return nn.Sequential(*blocks)
+
+    def _encode_map(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        return x
+
+    def forward_type(self, x):
+        return self.type_head(self.extract_type_features(x))
+
+    def extract_type_features(self, x):
+        """Return pooled encoder features used by the type head."""
+        encoded = self._encode_map(x)
+        return self.gap(encoded).squeeze(-1)
+
+    def forward(self, x):
+        x = self._encode_map(x)
+        average = self.gap(x).squeeze(-1)
+        maximum = self.gmp(x).squeeze(-1)
+        type_logits = self.type_head(average)
+        distance_features = self.distance_projection(
+            torch.cat([average, maximum], dim=1)
+        )
+        distance_logits = [head(distance_features) for head in self.d_heads]
+        return type_logits, distance_logits
+
+
+def create_mtl_model(
+    base_channels=64,
+    architecture="mtl_resnet",
+    num_types=5,
+    dist_mlp_dim=128,
+    dist_dropout=0.2,
+):
+    if architecture == "mtl_resnet":
+        model = MultiTaskResNet(base=base_channels, num_types=num_types)
+    elif architecture == "ordinal_v2":
+        model = MultiTaskOrdinalResNet(
+            base=base_channels,
+            num_types=num_types,
+            dist_mlp_dim=dist_mlp_dim,
+            dist_dropout=dist_dropout,
+        )
+    else:
+        raise ValueError(f"Unknown MTL architecture: {architecture}")
     n = sum(p.numel() for p in model.parameters())
-    print(f"  MTL-ResNet: {n:,} params")
+    print(f"  MTL-ResNet ({architecture}): {n:,} params")
     return model
