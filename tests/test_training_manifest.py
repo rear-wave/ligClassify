@@ -19,13 +19,21 @@ def write_lig(
     timestamp=(19, 1, 2, 3, 4, 5),
     sec_frac=0.25,
     pieces=1,
+    piece_timestamps=None,
+    piece_sec_fracs=None,
 ):
+    timestamps = piece_timestamps or [timestamp] * pieces
+    fractions = piece_sec_fracs or [sec_frac] * pieces
+    if len(timestamps) != pieces or len(fractions) != pieces:
+        raise ValueError("piece timestamp metadata must match pieces")
     raw = bytearray(FILE_HEADER_BYTES + PIECE_BYTES * pieces)
-    for piece_idx in range(pieces):
+    for piece_idx, (piece_timestamp, piece_fraction) in enumerate(
+        zip(timestamps, fractions)
+    ):
         piece_start = FILE_HEADER_BYTES + PIECE_BYTES * piece_idx
         struct.pack_into("i", raw, piece_start, 1001)
-        struct.pack_into("6i4x", raw, piece_start + 108, *timestamp)
-        struct.pack_into("d", raw, piece_start + 136, sec_frac)
+        struct.pack_into("6i4x", raw, piece_start + 108, *piece_timestamp)
+        struct.pack_into("d", raw, piece_start + 136, piece_fraction)
         struct.pack_into("H", raw, piece_start + 208, piece_idx + 1)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
@@ -51,6 +59,39 @@ def test_read_lig_timestamp_normalizes_hour_24(tmp_path):
 
     assert hasattr(lig_parser, "read_lig_timestamp")
     assert lig_parser.read_lig_timestamp(str(path)) == datetime(2017, 8, 22, 0, 0, 7, 500000)
+
+
+def test_read_lig_timestamps_reads_each_piece_in_order(tmp_path):
+    path = write_lig(
+        tmp_path / "sample.lig",
+        pieces=3,
+        piece_timestamps=[
+            (19, 1, 2, 3, 4, 5),
+            (19, 1, 2, 3, 4, 6),
+            (19, 1, 2, 3, 4, 7),
+        ],
+        piece_sec_fracs=[0.1, 0.2, 0.3],
+    )
+
+    assert lig_parser.read_lig_timestamps(str(path)) == [
+        datetime(2019, 1, 2, 3, 4, 5, 100000),
+        datetime(2019, 1, 2, 3, 4, 6, 200000),
+        datetime(2019, 1, 2, 3, 4, 7, 300000),
+    ]
+
+
+def test_read_lig_timestamps_reports_bad_piece_index(tmp_path):
+    path = write_lig(
+        tmp_path / "bad.lig",
+        pieces=2,
+        piece_timestamps=[
+            (19, 1, 2, 3, 4, 5),
+            (19, 13, 2, 3, 4, 6),
+        ],
+    )
+
+    with pytest.raises(lig_parser.LigFormatError, match=r"piece_index=1"):
+        lig_parser.read_lig_timestamps(str(path))
 
 
 @pytest.mark.parametrize(

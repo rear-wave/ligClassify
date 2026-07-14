@@ -737,6 +737,24 @@ def _datetime_from_lig_fields(year, month, day, hour, minute, second, sec_frac=0
     )
 
 
+def _decode_lig_timestamp(raw, filepath, piece_index):
+    """Decode one timestamp record with an actionable piece location."""
+    if len(raw) != _LIG_TIMESTAMP_BYTES + _LIG_SECFRAC_BYTES:
+        raise LigFormatError(
+            f"incomplete timestamp: {filepath}: piece_index={piece_index}"
+        )
+    try:
+        year, month, day, hour, minute, second = struct.unpack_from("6i4x", raw, 0)
+        sec_frac = struct.unpack_from("d", raw, _LIG_TIMESTAMP_BYTES)[0]
+        return _datetime_from_lig_fields(
+            year, month, day, hour, minute, second, sec_frac
+        )
+    except (struct.error, ValueError) as exc:
+        raise LigFormatError(
+            f"invalid timestamp: {filepath}: piece_index={piece_index}: {exc}"
+        ) from exc
+
+
 def read_lig_timestamp(filepath, piece_index=0):
     """Read one piece timestamp without loading its waveform."""
     n_pieces = count_lig_pieces(filepath)
@@ -756,14 +774,26 @@ def read_lig_timestamp(filepath, piece_index=0):
             raw = handle.read(_LIG_TIMESTAMP_BYTES + _LIG_SECFRAC_BYTES)
     except OSError as exc:
         raise LigFormatError(f"failed to read timestamp: {filepath}: {exc}") from exc
+    return _decode_lig_timestamp(raw, filepath, piece_index)
 
-    if len(raw) != _LIG_TIMESTAMP_BYTES + _LIG_SECFRAC_BYTES:
-        raise LigFormatError(f"incomplete timestamp: {filepath}")
+
+def read_lig_timestamps(filepath):
+    """Read all piece timestamps while reusing a single file handle."""
+    n_pieces = count_lig_pieces(filepath)
+    timestamps = []
     try:
-        year, month, day, hour, minute, second = struct.unpack_from("6i4x", raw, 0)
-        sec_frac = struct.unpack_from("d", raw, _LIG_TIMESTAMP_BYTES)[0]
-        return _datetime_from_lig_fields(
-            year, month, day, hour, minute, second, sec_frac
-        )
-    except (struct.error, ValueError) as exc:
-        raise LigFormatError(f"invalid timestamp: {filepath}: {exc}") from exc
+        with open(filepath, "rb") as handle:
+            for piece_index in range(n_pieces):
+                offset = (
+                    _LIG_FILE_HEADER_BYTES
+                    + piece_index * _LIG_PIECE_BYTES
+                    + _LIG_PIECE_HEADER_BYTES
+                )
+                handle.seek(offset)
+                raw = handle.read(_LIG_TIMESTAMP_BYTES + _LIG_SECFRAC_BYTES)
+                timestamps.append(
+                    _decode_lig_timestamp(raw, filepath, piece_index)
+                )
+    except OSError as exc:
+        raise LigFormatError(f"failed to read timestamp: {filepath}: {exc}") from exc
+    return timestamps
