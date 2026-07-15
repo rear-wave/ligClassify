@@ -337,6 +337,7 @@ def create_mtl_model(
     num_types=5,
     dist_mlp_dim=128,
     dist_dropout=0.2,
+    context_dim=3,
 ):
     if architecture == "mtl_resnet":
         model = MultiTaskResNet(base=base_channels, num_types=num_types)
@@ -351,6 +352,7 @@ def create_mtl_model(
         model = ConditionalExpertNet(
             base=base_channels,
             num_types=num_types,
+            context_dim=context_dim,
             dist_mlp_dim=dist_mlp_dim,
             dist_dropout=dist_dropout,
         )

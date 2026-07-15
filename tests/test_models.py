@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from models import MultiTaskResNet, create_mtl_model
+from models import ConditionalExpertNet, MultiTaskResNet, create_mtl_model
 
 
 def test_ordinal_v2_output_shapes():
@@ -130,3 +130,32 @@ def test_conditional_type_logits_do_not_use_time_context():
         not torch.allclose(left, right)
         for left, right in zip(first[2], second[2])
     )
+
+
+def test_conditional_model_accepts_daylight_only_context():
+    model = ConditionalExpertNet(base=8, context_dim=1)
+
+    output = model(
+        torch.randn(2, 1, 8000),
+        torch.randn(2, 1, 8000),
+        torch.ones(2, 1),
+    )
+
+    assert output[0].shape == (2, 4)
+
+
+def test_conditional_factory_keeps_legacy_context_default_and_accepts_explicit_dim():
+    legacy = create_mtl_model(
+        base_channels=8,
+        architecture="conditional_expert_v1",
+        num_types=4,
+    )
+    daylight = create_mtl_model(
+        base_channels=8,
+        architecture="conditional_expert_v1",
+        num_types=4,
+        context_dim=1,
+    )
+
+    assert legacy.context_dim == 3
+    assert daylight.context_dim == 1

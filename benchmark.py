@@ -201,7 +201,10 @@ def evaluate_checkpoint(
     schema = classify.checkpoint_schema(checkpoint)
     if schema == "four_class_rejection_v2":
         dataset = LightningPieceDataset(
-            pieces, split="benchmark", data_root=task_data
+            pieces,
+            split="benchmark",
+            data_root=task_data,
+            time_context_mode=classify.checkpoint_time_context_mode(checkpoint),
         )
         loader = DataLoader(
             dataset,

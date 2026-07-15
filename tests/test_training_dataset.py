@@ -89,7 +89,7 @@ def test_training_dataset_returns_multiscale_interval_and_audit_fields(tmp_path)
     assert len(dataset) == 2
     assert tuple(item["local"].shape) == (1, 8000)
     assert tuple(item["global_view"].shape) == (1, 8000)
-    assert tuple(item["context"].shape) == (3,)
+    assert tuple(item["context"].shape) == (1,)
     assert tuple(item["quality"].shape) == (3,)
     assert item["type_label"].item() == 1
     assert item["distance_low_km"].item() == 1500
@@ -126,6 +126,27 @@ def test_training_dataset_returns_multiscale_interval_and_audit_fields(tmp_path)
     dataset.close()
     assert index.read_piece(0).shape == (16000,)
     index.close()
+
+
+def test_training_dataset_can_retain_cyclic_context_for_legacy_checkpoints(tmp_path):
+    path = write_lig(tmp_path / "NCG" / "sample.lig")
+    entry = PieceManifestEntry(
+        filepath=str(path),
+        piece_index=0,
+        type_idx=0,
+        dist_bin=0,
+        timestamp=datetime(2020, 1, 1),
+        distance_low_km=0,
+        distance_high_km=100,
+        is_daytime=True,
+    )
+    dataset = LightningPieceDataset(
+        [entry], use_filter=False, time_context_mode="cyclic"
+    )
+
+    assert tuple(dataset[0]["context"].shape) == (3,)
+
+    dataset.close()
 
 
 def test_training_dataset_marks_missing_distance_without_losing_type_label(tmp_path):

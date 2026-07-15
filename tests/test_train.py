@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import conditional_pipeline
 import train
 
 
@@ -21,9 +22,19 @@ def test_conditional_training_arguments_have_reliable_defaults():
     assert args.bootstrap_iterations == 1000
     assert args.rejection_target_precision == 0.95
     assert args.rejection_min_coverage == 0.80
+    assert args.samples_per_epoch == 120000
+    assert args.max_samples_per_file == 512
+    assert args.type_focus_epochs == 3
+    assert args.type_focus_distance_weight == 0.25
+    assert args.joint_distance_weight == 1.0
+    assert args.time_context == "daylight"
     assert args.baseline_metrics == ""
     assert args.baseline_model_name == "old"
     assert not hasattr(args, "target_ic_fraction")
+    assert not hasattr(args, "type_samples_per_epoch")
+    assert not hasattr(args, "distance_samples_per_epoch")
+    assert not hasattr(args, "distance_batch_size")
+    assert not hasattr(args, "distance_batch_type_weight")
 
 
 def test_resume_and_warm_start_are_mutually_exclusive():
@@ -33,6 +44,27 @@ def test_resume_and_warm_start_are_mutually_exclusive():
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         train._validate_args(args)
+
+
+def test_training_requires_at_least_one_joint_epoch():
+    args = train.build_arg_parser().parse_args([
+        "--epochs", "3", "--type_focus_epochs", "3"
+    ])
+
+    with pytest.raises(ValueError, match="joint-stage epoch"):
+        train._validate_args(args)
+
+
+def test_first_joint_epoch_is_selected_after_legacy_resume():
+    better_historical_score = (1.0, 1.0)
+    current_score = (0.0, 0.0)
+
+    assert conditional_pipeline._joint_checkpoint_improved(
+        "joint", current_score, better_historical_score, best_epoch=0
+    )
+    assert not conditional_pipeline._joint_checkpoint_improved(
+        "type_focus", current_score, None, best_epoch=0
+    )
 
 
 def test_conditional_distance_loss_routes_true_type_and_broad_intervals():

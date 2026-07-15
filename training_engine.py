@@ -11,6 +11,18 @@ from distance_ordinal import interval_distance_loss
 COARSE_DISTANCE_EDGES_KM = (0, 300, 600, 1200, 1700, 2400, 3000)
 
 
+def distance_weight_for_epoch(
+    epoch: int,
+    type_focus_epochs: int,
+    type_focus_weight: float,
+    joint_weight: float,
+) -> tuple[str, float]:
+    """Return the training stage and distance weight for a zero-based epoch."""
+    if epoch < type_focus_epochs:
+        return "type_focus", float(type_focus_weight)
+    return "joint", float(joint_weight)
+
+
 def coarse_interval_loss(logits, low_km, high_km):
     """Reward probability assigned to every coarse band overlapping a label."""
     if logits.ndim != 2 or logits.shape[1] != 6:
@@ -78,6 +90,67 @@ def compute_conditional_distance_loss(
     return interval + coarse_weight * coarse, {
         "interval": interval,
         "coarse": coarse,
+    }
+
+
+def conditional_joint_train_step(
+    model: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    type_criterion: torch.nn.Module,
+    distance_loss_weight: float,
+    coarse_weight: float = 0.5,
+    ordered_weight: float = 0.2,
+    scaler: object | None = None,
+    amp: bool = False,
+) -> dict[str, object]:
+    """Optimize type classification and true-type distance experts jointly."""
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    local = batch["local"]
+    amp_enabled = bool(amp and local.is_cuda)
+    with torch.autocast(device_type=local.device.type, enabled=amp_enabled):
+        type_logits, distance_logits, coarse_logits = model(
+            local,
+            batch["global_view"],
+            batch["context"],
+        )
+        type_loss = type_criterion(type_logits, batch["type_label"])
+        distance_loss, components = compute_conditional_distance_loss(
+            distance_logits,
+            coarse_logits,
+            batch["type_label"],
+            batch["distance_low_km"],
+            batch["distance_high_km"],
+            coarse_weight=coarse_weight,
+            ordered_weight=ordered_weight,
+        )
+        total_loss = type_loss + float(distance_loss_weight) * distance_loss
+
+    if scaler is not None and amp_enabled:
+        scaler.scale(total_loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        total_loss.backward()
+        optimizer.step()
+    valid_distance = (
+        (batch["distance_low_km"] >= 0)
+        & (batch["distance_high_km"] > batch["distance_low_km"])
+    )
+    return {
+        "type_loss": float(type_loss.detach().item()),
+        "distance_loss": float(distance_loss.detach().item()),
+        "total_loss": float(total_loss.detach().item()),
+        "type_correct": int((
+            type_logits.argmax(1) == batch["type_label"]
+        ).sum().item()),
+        "type_count": int(len(batch["type_label"])),
+        "distance_count": int(valid_distance.sum().item()),
+        "components": {
+            name: float(value.detach().item())
+            for name, value in components.items()
+        },
     }
 
 

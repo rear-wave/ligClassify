@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data.distance_sampling import ConditionBalancedSampler
+from data.distance_sampling import ConditionBalancedSampler, JointConditionSampler
 from data.group_split import group_stratified_split, validate_group_split
 from data.split_artifacts import build_data_audit, make_split_manifest, write_json
 from data.training_dataset import LightningPieceDataset, collate_training_batch
@@ -30,27 +30,23 @@ from evaluation import (
 )
 from models import create_mtl_model
 from open_set import decode_with_rejection, fit_feature_reference, fit_rejection_policy
-from training_engine import conditional_train_step
+from training_engine import conditional_joint_train_step, distance_weight_for_epoch
 
 
 LOGGER = logging.getLogger(__name__)
 TYPE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
 
 
-def _alternate(type_loader, distance_loader):
-    type_iterator, distance_iterator = iter(type_loader), iter(distance_loader)
-    type_done = distance_done = False
-    while not (type_done and distance_done):
-        if not type_done:
-            try:
-                yield "type", next(type_iterator)
-            except StopIteration:
-                type_done = True
-        if not distance_done:
-            try:
-                yield "distance", next(distance_iterator)
-            except StopIteration:
-                distance_done = True
+def _joint_checkpoint_improved(
+    stage: str,
+    score: tuple[float, ...],
+    best_score: tuple[float, ...] | None,
+    best_epoch: int,
+) -> bool:
+    """Select improvements only after entering the joint training stage."""
+    return stage == "joint" and (
+        best_epoch <= 0 or best_score is None or score > best_score
+    )
 
 
 def _move_batch(batch, device):
@@ -308,7 +304,12 @@ def run_conditional_training(args, device):
         name: build_piece_manifest(entries) for name, entries in file_splits.items()
     }
     datasets = {
-        name: LightningPieceDataset(entries, split=name, data_root=args.task_data)
+        name: LightningPieceDataset(
+            entries,
+            split=name,
+            data_root=args.task_data,
+            time_context_mode=args.time_context,
+        )
         for name, entries in piece_splits.items()
     }
     train_set, val_set, test_set = (
@@ -317,42 +318,21 @@ def run_conditional_training(args, device):
     if not len(val_set) or (not args.skip_test and not len(test_set)):
         raise RuntimeError("file-isolated validation/test split is empty")
 
-    requested_type = len(train_set) if args.type_samples_per_epoch < 0 else args.type_samples_per_epoch
-    requested_distance = (
-        int(train_set.distance_labelled.sum())
-        if args.distance_samples_per_epoch < 0
-        else args.distance_samples_per_epoch
-    )
-    type_sampler = ConditionBalancedSampler(
+    train_sampler = JointConditionSampler(
         train_set.type_labels,
         train_set.daylight,
         train_set.distance_low_km,
         train_set.distance_high_km,
         train_set.file_ids,
-        requested_type,
-        max_samples_per_file=args.max_distance_samples_per_file,
+        args.samples_per_epoch,
+        max_samples_per_file=args.max_samples_per_file,
         seed=args.seed,
-        distance_only=False,
-    )
-    distance_sampler = ConditionBalancedSampler(
-        train_set.type_labels,
-        train_set.daylight,
-        train_set.distance_low_km,
-        train_set.distance_high_km,
-        train_set.file_ids,
-        requested_distance,
-        max_samples_per_file=args.max_distance_samples_per_file,
-        seed=args.seed,
-        distance_only=True,
     )
     cuda = device == "cuda"
-    type_loader = _loader(
-        train_set, args.batch_size, type_sampler, workers=args.num_workers, cuda=cuda
-    )
-    distance_loader = _loader(
+    train_loader = _loader(
         train_set,
-        args.distance_batch_size,
-        distance_sampler,
+        args.batch_size,
+        train_sampler,
         workers=args.num_workers,
         cuda=cuda,
     )
@@ -367,6 +347,7 @@ def run_conditional_training(args, device):
         base_channels=args.base,
         architecture="conditional_expert_v1",
         num_types=4,
+        context_dim=1 if args.time_context == "daylight" else 3,
         dist_mlp_dim=args.dist_mlp_dim,
         dist_dropout=args.dist_dropout,
     ).to(device)
@@ -379,7 +360,7 @@ def run_conditional_training(args, device):
         # Compatibility with PyTorch releases that predate torch.amp.GradScaler.
         scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     type_criterion = nn.CrossEntropyLoss()
-    start_epoch, best_score, best_state, wait = 0, None, None, 0
+    start_epoch, best_score, best_state, best_epoch, wait = 0, None, None, 0, 0
     initialized_layers = []
     if args.resume:
         resume, state = _load_checkpoint_state(args.resume)
@@ -391,6 +372,7 @@ def run_conditional_training(args, device):
         start_epoch = int(resume["epoch"]) + 1
         best_score = tuple(resume.get("best_score", ())) or None
         best_state = resume.get("best_model_state_dict")
+        best_epoch = int(resume.get("best_epoch", 0))
         wait = int(resume.get("early_stop_wait", 0))
         LOGGER.info("Resumed exact training state from %s at epoch %d", args.resume, start_epoch + 1)
     elif args.init_model and not args.no_init:
@@ -408,6 +390,8 @@ def run_conditional_training(args, device):
         "base_channels": args.base,
         "dist_mlp_dim": args.dist_mlp_dim,
         "dist_dropout": args.dist_dropout,
+        "context_dim": 1 if args.time_context == "daylight" else 3,
+        "time_context": args.time_context,
         "distance_bins": 30,
         "coarse_distance_bins": [0, 300, 600, 1200, 1700, 2400, 3000],
         "preprocessing": {
@@ -423,25 +407,27 @@ def run_conditional_training(args, device):
     }
 
     for epoch in range(start_epoch, args.epochs):
-        type_sampler.set_epoch(epoch)
-        distance_sampler.set_epoch(epoch)
+        train_sampler.set_epoch(epoch)
+        stage, distance_loss_weight = distance_weight_for_epoch(
+            epoch,
+            args.type_focus_epochs,
+            args.type_focus_distance_weight,
+            args.joint_distance_weight,
+        )
         totals = {"type_loss": 0.0, "distance_loss": 0.0, "type_correct": 0, "type_count": 0, "distance_count": 0}
-        batches = _alternate(type_loader, distance_loader)
-        for stream, batch in tqdm(
-            batches,
-            total=len(type_loader) + len(distance_loader),
-            desc=f"Epoch {epoch + 1}",
+        for batch in tqdm(
+            train_loader,
+            total=len(train_loader),
+            desc=f"Epoch {epoch + 1} ({stage})",
             leave=False,
         ):
             batch = _move_batch(batch, device)
-            result = conditional_train_step(
+            result = conditional_joint_train_step(
                 model,
                 batch,
-                stream,
                 optimizer,
                 type_criterion,
-                distance_loss_weight=args.lambda_dist,
-                distance_batch_type_weight=args.distance_batch_type_weight,
+                distance_loss_weight=distance_loss_weight,
                 coarse_weight=args.lambda_coarse,
                 scaler=scaler,
                 amp=not args.no_amp,
@@ -455,16 +441,22 @@ def run_conditional_training(args, device):
         validation_metrics = evaluate_predictions(validation_bundle["records"])
         score = _selection_key(validation_metrics)
         _log_metrics(f"Epoch {epoch + 1:3d} validation", validation_metrics)
-        if best_score is None or score > best_score:
+        if _joint_checkpoint_improved(stage, score, best_score, best_epoch):
             best_score = score
             best_state = _clone_state(model)
+            best_epoch = epoch + 1
             wait = 0
             torch.save(best_state, output / "best.pt")
             torch.save(
-                {**metadata, "model_state_dict": best_state, "validation_metrics": validation_metrics},
+                {
+                    **metadata,
+                    "model_state_dict": best_state,
+                    "best_epoch": best_epoch,
+                    "validation_metrics": validation_metrics,
+                },
                 output / "best_checkpoint.pt",
             )
-        else:
+        elif stage == "joint":
             wait += 1
         torch.save({
             **metadata,
@@ -475,9 +467,10 @@ def run_conditional_training(args, device):
             "scaler_state_dict": scaler.state_dict(),
             "best_score": best_score,
             "best_model_state_dict": best_state,
+            "best_epoch": best_epoch,
             "early_stop_wait": wait,
         }, output / "latest.pt")
-        if wait >= args.patience:
+        if stage == "joint" and wait >= args.patience:
             LOGGER.info("Early stopping after epoch %d (patience=%d)", epoch + 1, args.patience)
             break
 
@@ -523,7 +516,7 @@ def run_conditional_training(args, device):
         train_set.distance_high_km,
         train_set.file_ids,
         min(args.calibration_samples, len(train_set)),
-        max_samples_per_file=min(args.max_distance_samples_per_file, 64),
+        max_samples_per_file=min(args.max_samples_per_file, 64),
         seed=args.seed + 991,
         distance_only=False,
     )
@@ -581,7 +574,9 @@ def run_conditional_training(args, device):
 
     reasons = []
     passed = False
-    if args.skip_test:
+    if args.time_context != "daylight":
+        reasons.append("time context must be daylight for promotion")
+    elif args.skip_test:
         reasons.append("locked test was skipped")
     elif calibration_error is not None:
         reasons.append(f"IC rejection calibration failed: {calibration_error}")
@@ -600,7 +595,11 @@ def run_conditional_training(args, device):
                 )
             baseline = baseline["models"][args.baseline_model_name]
         passed, reasons = evaluate_release(metrics, baseline)
-    checkpoint = {**metadata, "model_state_dict": best_state}
+    checkpoint = {
+        **metadata,
+        "model_state_dict": best_state,
+        "best_epoch": best_epoch,
+    }
     torch.save(checkpoint, output / "candidate.pt")
     report = {"release_passed": passed, "release_reasons": reasons, "evaluated_split": evaluated_split, **metrics}
     write_json(output / "candidate_metrics.json", report)

@@ -59,18 +59,23 @@ def build_arg_parser():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--distance_batch_size", type=int, default=128)
-    parser.add_argument("--type_samples_per_epoch", type=int, default=180000)
-    parser.add_argument("--distance_samples_per_epoch", type=int, default=60000)
-    parser.add_argument("--max_distance_samples_per_file", type=int, default=256)
+    parser.add_argument("--samples_per_epoch", type=int, default=120000)
+    parser.add_argument("--max_samples_per_file", type=int, default=512)
+    parser.add_argument("--type_focus_epochs", type=int, default=3)
+    parser.add_argument("--type_focus_distance_weight", type=float, default=0.25)
+    parser.add_argument("--joint_distance_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--time_context",
+        choices=["daylight", "cyclic"],
+        default="daylight",
+        help="Daylight-only training by default; cyclic is ablation-only",
+    )
     parser.add_argument("--base", type=int, default=64)
     parser.add_argument("--dist_mlp_dim", type=int, default=128)
     parser.add_argument("--dist_dropout", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--wd", type=float, default=5e-4)
-    parser.add_argument("--lambda_dist", type=float, default=1.0)
     parser.add_argument("--lambda_coarse", type=float, default=0.5)
-    parser.add_argument("--distance_batch_type_weight", type=float, default=0.1)
     parser.add_argument("--val_fraction", type=float, default=0.15)
     parser.add_argument("--test_fraction", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
@@ -103,8 +108,19 @@ def build_arg_parser():
 def _validate_args(args):
     if args.epochs <= 0 or args.patience <= 0:
         raise ValueError("--epochs and --patience must be positive")
-    if args.batch_size <= 0 or args.distance_batch_size <= 0:
-        raise ValueError("batch sizes must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("--batch_size must be positive")
+    if args.samples_per_epoch <= 0 or args.max_samples_per_file <= 0:
+        raise ValueError("sampling limits must be positive")
+    if args.type_focus_epochs < 0:
+        raise ValueError("--type_focus_epochs must be non-negative")
+    if args.epochs <= args.type_focus_epochs:
+        raise ValueError("training requires at least one joint-stage epoch")
+    if (
+        args.type_focus_distance_weight < 0
+        or args.joint_distance_weight < 0
+    ):
+        raise ValueError("distance loss weights must be non-negative")
     if args.num_workers < 0:
         raise ValueError("--num_workers must be non-negative")
     if args.val_fraction <= 0 or args.test_fraction <= 0:

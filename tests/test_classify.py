@@ -58,11 +58,13 @@ def make_four_class_checkpoint(architecture="ordinal_v2"):
     }
 
 
-def make_conditional_checkpoint():
-    return {
+def make_conditional_checkpoint(context_dim=1, include_model=False):
+    checkpoint = {
         "task_schema": "four_class_rejection_v2",
         "model_name": "conditional_expert_v1",
         "model_version": "conditional-test",
+        "context_dim": context_dim,
+        "time_context": "daylight" if context_dim == 1 else "cyclic",
         "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
         "rejected_type_name": "IC",
         "combined_split_hash": "split-hash",
@@ -79,6 +81,22 @@ def make_conditional_checkpoint():
         },
         "distance_calibration": {"temperatures": [1.0] * 4},
     }
+    if include_model:
+        model = create_mtl_model(
+            base_channels=8,
+            architecture="conditional_expert_v1",
+            num_types=4,
+            dist_mlp_dim=12,
+            dist_dropout=0.0,
+            context_dim=context_dim,
+        )
+        checkpoint.update({
+            "base_channels": 8,
+            "dist_mlp_dim": 12,
+            "dist_dropout": 0.0,
+            "model_state_dict": model.state_dict(),
+        })
+    return checkpoint
 
 
 def test_load_checkpoint_selects_legacy_and_v2_architectures(tmp_path):
@@ -102,6 +120,26 @@ def test_load_checkpoint_uses_four_class_type_head(tmp_path):
 
     assert model.type_head.out_features == 4
     assert classify.checkpoint_schema(checkpoint) == "four_class_rejection_v1"
+
+
+@pytest.mark.parametrize(
+    ("context_dim", "stored_context_dim", "expected_mode"),
+    [(1, True, "daylight"), (3, False, "cyclic")],
+)
+def test_load_conditional_checkpoint_preserves_context_compatibility(
+    tmp_path, context_dim, stored_context_dim, expected_mode
+):
+    path = tmp_path / f"conditional-{context_dim}.pt"
+    checkpoint = make_conditional_checkpoint(context_dim, include_model=True)
+    if not stored_context_dim:
+        checkpoint.pop("context_dim")
+        checkpoint.pop("time_context")
+    torch.save(checkpoint, path)
+
+    model, loaded = classify.load_mtl_checkpoint(path, "cpu")
+
+    assert model.context_dim == context_dim
+    assert classify.checkpoint_time_context_mode(loaded) == expected_mode
 
 
 def test_four_class_rejection_routes_failed_feature_to_ic():

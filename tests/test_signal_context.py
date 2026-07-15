@@ -9,12 +9,31 @@ def test_time_context_contains_daylight_and_periodic_local_hour():
     context = time_context_batch(
         [datetime(2019, 1, 1, 0), datetime(2019, 1, 2, 0)],
         [True, False],
+        mode="cyclic",
     )
 
     assert context.shape == (2, 3)
     assert context[:, 0].tolist() == [1.0, 0.0]
     assert np.allclose(np.linalg.norm(context[:, 1:], axis=1), 1.0)
     assert np.allclose(context[0, 1:], context[1, 1:])
+
+
+def test_default_time_context_is_daylight_only():
+    from data.signal_context import time_context_batch
+
+    context = time_context_batch(
+        [datetime(2020, 1, 1), datetime(2020, 1, 2)], [True, False]
+    )
+
+    assert context.shape == (2, 1)
+    assert context[:, 0].tolist() == [1.0, 0.0]
+
+
+def test_time_context_rejects_unknown_mode():
+    from data.signal_context import time_context_batch
+
+    with np.testing.assert_raises_regex(ValueError, "daylight or cyclic"):
+        time_context_batch([datetime(2020, 1, 1)], [True], mode="seasonal")
 
 
 def test_time_context_rejects_misaligned_inputs():

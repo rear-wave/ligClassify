@@ -88,10 +88,21 @@ def load_mtl_checkpoint(path, device):
         num_types=len(checkpoint.get("type_names", [])) or 5,
         dist_mlp_dim=checkpoint.get("dist_mlp_dim", 128),
         dist_dropout=checkpoint.get("dist_dropout", 0.2),
+        context_dim=checkpoint.get("context_dim", 3),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint
+
+
+def checkpoint_time_context_mode(checkpoint):
+    """Select daylight context or legacy cyclic context from checkpoint shape."""
+    context_dim = int(checkpoint.get("context_dim", 3))
+    if context_dim == 3:
+        return "cyclic"
+    if context_dim == 1:
+        return "daylight"
+    raise ValueError(f"Unsupported checkpoint context_dim: {context_dim}")
 
 
 def checkpoint_schema(checkpoint):
@@ -416,7 +427,13 @@ def decode_four_class_full_predictions(
     return predictions
 
 
-def conditional_batch_inputs(waveforms, raw_pieces, source_path, use_filter=True):
+def conditional_batch_inputs(
+    waveforms,
+    raw_pieces,
+    source_path,
+    use_filter=True,
+    time_context_mode="daylight",
+):
     """Build multiscale, time-context, and quality arrays once per batch."""
     raw_waveforms = np.asarray(waveforms, dtype=np.float32)
     local, global_view = preprocess_multiscale_batch(
@@ -439,7 +456,11 @@ def conditional_batch_inputs(waveforms, raw_pieces, source_path, use_filter=True
         )
         timestamps.append(timestamp)
         daylight.append(infer_daytime(source_path, timestamp))
-    context = time_context_batch(timestamps, daylight)
+    context = time_context_batch(
+        timestamps,
+        daylight,
+        mode=time_context_mode,
+    )
     return local, global_view, context, quality
 
 
@@ -598,6 +619,9 @@ def main():
                             use_filter=inference_ckpt.get(
                                 "preprocessing", {}
                             ).get("use_filter", True),
+                            time_context_mode=checkpoint_time_context_mode(
+                                inference_ckpt
+                            ),
                         )
                     )
                     local = torch.from_numpy(local_np).unsqueeze(1).to(dev)

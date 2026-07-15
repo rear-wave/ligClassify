@@ -29,11 +29,13 @@ class LightningPieceDataset(Dataset):
         use_filter=True,
         data_root=None,
         augmentation: WaveformAugmentationConfig | None = None,
+        time_context_mode: str = "daylight",
     ):
         self.entries = list(entries)
         self.split = str(split)
         self.use_filter = bool(use_filter)
         self.augmentation = augmentation
+        self.time_context_mode = str(time_context_mode)
         paths = sorted({entry.filepath for entry in self.entries})
         absolute_paths = [os.path.abspath(path) for path in paths]
         if data_root is not None:
@@ -109,7 +111,11 @@ class LightningPieceDataset(Dataset):
         self.piece_indices = np.asarray(piece_indices, dtype=np.int64)
         self.piece_keys = np.asarray(piece_keys, dtype=object)
         self.timestamps = timestamps
-        self.context = time_context_batch(self.timestamps, self.daylight)
+        self.context = time_context_batch(
+            self.timestamps,
+            self.daylight,
+            mode=self.time_context_mode,
+        )
 
     def __len__(self):
         return len(self.global_indices)
