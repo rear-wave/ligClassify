@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from pathlib import Path
@@ -23,6 +22,7 @@ from distance_ordinal import (
     fit_interval_temperature_grid,
 )
 from evaluation import (
+    checkpoint_selection_key,
     distance_calibration_is_safe,
     evaluate_predictions,
     evaluate_release,
@@ -232,28 +232,6 @@ def apply_distance_temperatures(bundle, temperatures):
         record["oracle_distance_km"] = float(oracle["expected_km"][row].item())
 
 
-def _selection_key(metrics):
-    """Protect type quality first, then optimize worst/file-macro distance."""
-    type_file_accuracy = float(metrics["type_file_macro_accuracy"])
-    minimum_type_recall = min(float(value) for value in metrics["type_recall"])
-    type_ready = type_file_accuracy >= 0.90 and minimum_type_recall >= 0.85
-    per_type_distance = metrics["distance_per_type_exact_within_200"]
-    if type_ready:
-        primary = float(metrics["distance_file_macro_within_200"])
-        secondary = min(float(value) for value in per_type_distance)
-    else:
-        primary = minimum_type_recall
-        secondary = type_file_accuracy
-    return (
-        float(type_ready),
-        primary,
-        secondary,
-        float(metrics["distance_exact_within_200"]),
-        float(metrics["type_piece_accuracy"]),
-        -float(metrics["distance_interval_mae_km"]),
-    )
-
-
 def _log_metrics(prefix, metrics):
     LOGGER.info(
         "%s type_piece=%.4f type_file=%.4f distance_w200=%.4f "
@@ -261,10 +239,21 @@ def _log_metrics(prefix, metrics):
         prefix,
         metrics["type_piece_accuracy"],
         metrics["type_file_macro_accuracy"],
-        metrics["distance_exact_within_200"],
+        metrics["distance_100km_interval_within_200"],
         metrics["distance_file_macro_within_200"],
         metrics["distance_interval_mae_km"],
     )
+
+
+def _evaluate_candidate_release(args, metrics, calibration_error):
+    """Apply run prerequisites before the candidate-only absolute release gate."""
+    if args.time_context != "daylight":
+        return False, ["time context must be daylight for promotion"]
+    if args.skip_test:
+        return False, ["locked test was skipped"]
+    if calibration_error is not None:
+        return False, [f"IC rejection calibration failed: {calibration_error}"]
+    return evaluate_release(metrics)
 
 
 def run_conditional_training(args, device):
@@ -439,7 +428,7 @@ def run_conditional_training(args, device):
             model, val_loader, device, split_manifest["split_hashes"]["val"]
         )
         validation_metrics = evaluate_predictions(validation_bundle["records"])
-        score = _selection_key(validation_metrics)
+        score = checkpoint_selection_key(validation_metrics)
         _log_metrics(f"Epoch {epoch + 1:3d} validation", validation_metrics)
         if _joint_checkpoint_improved(stage, score, best_score, best_epoch):
             best_score = score
@@ -572,29 +561,11 @@ def run_conditional_training(args, device):
     ))
     _log_metrics(evaluated_split.title(), metrics)
 
-    reasons = []
-    passed = False
-    if args.time_context != "daylight":
-        reasons.append("time context must be daylight for promotion")
-    elif args.skip_test:
-        reasons.append("locked test was skipped")
-    elif calibration_error is not None:
-        reasons.append(f"IC rejection calibration failed: {calibration_error}")
-    elif not args.baseline_metrics:
-        reasons.append("baseline metrics file is required for promotion")
-    elif not Path(args.baseline_metrics).is_file():
-        reasons.append(f"baseline metrics file not found: {args.baseline_metrics}")
-    else:
-        with Path(args.baseline_metrics).open("r", encoding="utf-8") as handle:
-            baseline = json.load(handle)
-        if "models" in baseline:
-            if args.baseline_model_name not in baseline["models"]:
-                raise ValueError(
-                    f"baseline model {args.baseline_model_name!r} is not in "
-                    f"{args.baseline_metrics}"
-                )
-            baseline = baseline["models"][args.baseline_model_name]
-        passed, reasons = evaluate_release(metrics, baseline)
+    passed, reasons = _evaluate_candidate_release(
+        args,
+        metrics,
+        calibration_error,
+    )
     checkpoint = {
         **metadata,
         "model_state_dict": best_state,

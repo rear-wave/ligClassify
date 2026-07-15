@@ -1,7 +1,10 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 import conditional_pipeline
+import evaluation
 import train
 
 
@@ -65,6 +68,44 @@ def test_first_joint_epoch_is_selected_after_legacy_resume():
     assert not conditional_pipeline._joint_checkpoint_improved(
         "type_focus", current_score, None, best_epoch=0
     )
+
+
+def test_conditional_pipeline_uses_shared_checkpoint_selection_key():
+    assert (
+        conditional_pipeline.checkpoint_selection_key
+        is evaluation.checkpoint_selection_key
+    )
+    assert not hasattr(conditional_pipeline, "_selection_key")
+
+
+def test_conditional_pipeline_logs_100km_interval_metric():
+    metrics = {
+        "type_piece_accuracy": 0.90,
+        "type_file_macro_accuracy": 0.91,
+        "distance_100km_interval_within_200": 0.92,
+        "distance_file_macro_within_200": 0.93,
+        "distance_interval_mae_km": 100.0,
+    }
+
+    conditional_pipeline._log_metrics("validation", metrics)
+
+
+def test_candidate_release_does_not_require_historical_baseline():
+    args = SimpleNamespace(time_context="daylight", skip_test=False)
+    metrics = {
+        "type_file_equal_precision": [0.96, 0.97, 0.98, 0.99],
+        "type_coverage": 0.82,
+        "type_file_equal_recall_mean": 0.91,
+        "distance_100km_interval_within_200": 0.88,
+        "distance_per_type_100km_interval_within_200": [0.80, 0.85, 0.90, 0.95],
+        "distance_conditions_100km": {},
+    }
+
+    assert conditional_pipeline._evaluate_candidate_release(
+        args,
+        metrics,
+        calibration_error=None,
+    ) == (True, [])
 
 
 def test_conditional_distance_loss_routes_true_type_and_broad_intervals():

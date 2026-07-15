@@ -23,16 +23,10 @@ from data.preprocessing import preprocess_batch
 from data.split_artifacts import split_hash, write_json
 from data.training_dataset import LightningPieceDataset, collate_training_batch
 from data.training_manifest import ManifestEntry, build_piece_manifest
-from evaluation import evaluate_predictions, evaluate_release, file_bootstrap_metrics
+from evaluation import evaluate_predictions, file_bootstrap_metrics
 
 
 TYPE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
-
-
-def compare_model_metrics(candidate, baseline):
-    """Compare already-computed metrics only when their split hashes match."""
-    return evaluate_release(candidate, baseline)
-
 
 def _file_entries(split_manifest, split_name, task_data):
     rows = split_manifest["splits"][split_name]
@@ -267,13 +261,18 @@ def main():
         manifest = json.load(handle)
     entries = _file_entries(manifest, args.split, args.task_data)
     locked_hash = manifest["split_hashes"][args.split]
-    results = {"split": args.split, "split_hash": locked_hash, "models": {}}
+    results = {
+        "reference_only": True,
+        "split": args.split,
+        "split_hash": locked_hash,
+        "models": {},
+    }
     for specification in args.model:
         if "=" not in specification:
             raise ValueError("--model must use NAME=PATH")
         name, path = specification.split("=", 1)
         print(f"Evaluating {name}: {path}")
-        results["models"][name] = evaluate_checkpoint(
+        metrics = evaluate_checkpoint(
             path,
             entries,
             args.task_data,
@@ -282,6 +281,8 @@ def main():
             args.num_workers,
             args.bootstrap_iterations,
         )
+        metrics["reference_only"] = True
+        results["models"][name] = metrics
     write_json(args.output, results)
     print(f"Wrote {args.output}")
 

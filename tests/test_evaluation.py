@@ -1,5 +1,7 @@
+import numpy as np
 import pytest
 
+import evaluation
 from evaluation import (
     distance_calibration_is_safe,
     evaluate_predictions,
@@ -17,8 +19,9 @@ def make_record(
     predicted_distance=50.0,
     daylight=True,
     accepted=True,
+    source_path=None,
 ):
-    return {
+    record = {
         "file_id": file_id,
         "true_type": true_type,
         "predicted_type": predicted_type,
@@ -29,20 +32,88 @@ def make_record(
         "oracle_distance_km": predicted_distance,
         "daylight": daylight,
     }
+    if source_path is not None:
+        record["source_path"] = source_path
+    return record
 
 
-def test_file_macro_prevents_one_large_file_from_dominating():
+def good_release_metrics():
+    return {
+        "type_file_equal_precision": [0.96, 0.97, 0.98, 0.99],
+        "type_coverage": 0.82,
+        "type_file_equal_recall_mean": 0.91,
+        "distance_100km_interval_within_200": 0.88,
+        "distance_per_type_100km_interval_within_200": [0.80, 0.85, 0.90, 0.95],
+        "distance_conditions_100km": {},
+    }
+
+
+def test_record_file_identity_prefers_source_path_and_requires_stable_identity():
+    assert evaluation.record_file_identity({
+        "source_path": "relative/a.lig",
+        "file_id": 7,
+    }) == "relative/a.lig"
+    assert evaluation.record_file_identity({"file_id": 7}) == "7"
+    with pytest.raises(ValueError, match="stable source identity"):
+        evaluation.record_file_identity({})
+
+
+def test_file_equal_piece_weights_give_each_file_total_weight_one():
+    file_ids = np.asarray(["large"] * 100 + ["small"])
+
+    weights = evaluation.file_equal_piece_weights(file_ids)
+
+    assert weights[file_ids == "large"].sum() == pytest.approx(1.0)
+    assert weights[file_ids == "small"].sum() == pytest.approx(1.0)
+
+
+def test_file_equal_precision_gives_each_file_total_weight_one():
     records = [make_record("large", 0, 0) for _ in range(100)]
-    records.append(make_record("small", 1, 0))
+    records += [make_record("small", 1, 0)]
 
     metrics = evaluate_predictions(records)
 
     assert metrics["type_piece_accuracy"] > 0.99
     assert metrics["type_file_macro_accuracy"] == pytest.approx(0.5)
-    assert metrics["type_file_macro_precision"][0] == pytest.approx(0.5)
+    assert metrics["type_precision"][0] == pytest.approx(100 / 101)
+    assert metrics["type_file_equal_precision"][0] == pytest.approx(0.5)
 
 
-def test_distance_reports_type_daylight_and_coarse_band_groups():
+def test_source_path_is_the_stable_file_equal_identity():
+    records = [
+        make_record(index, 0, 0, source_path="large.lig")
+        for index in range(100)
+    ]
+    records.append(make_record(100, 1, 0, source_path="small.lig"))
+
+    metrics = evaluate_predictions(records)
+
+    assert metrics["file_count"] == 2
+    assert metrics["type_file_equal_precision"][0] == pytest.approx(0.5)
+
+
+def test_rejected_metrics_are_separate_from_raw_piece_and_file_equal_metrics():
+    records = [
+        make_record("accepted", 0, 0, accepted=True),
+        make_record("rejected", 1, 1, accepted=False),
+    ]
+
+    metrics = evaluate_predictions(records)
+
+    assert metrics["type_piece_accuracy"] == pytest.approx(1.0)
+    assert metrics["type_file_macro_accuracy"] == pytest.approx(1.0)
+    assert metrics["type_coverage"] == pytest.approx(0.5)
+    assert metrics["type_precision"][1] == pytest.approx(0.0)
+    assert metrics["type_recall"][1] == pytest.approx(0.0)
+    assert metrics["type_file_equal_precision"][1] == pytest.approx(0.0)
+    assert metrics["type_file_equal_recall"][1] == pytest.approx(0.0)
+    assert metrics["raw_type_precision"][1] == pytest.approx(1.0)
+    assert metrics["raw_type_recall"][1] == pytest.approx(1.0)
+    assert metrics["raw_type_file_equal_precision"][1] == pytest.approx(1.0)
+    assert metrics["raw_type_file_equal_recall"][1] == pytest.approx(1.0)
+
+
+def test_distance_reports_100km_intervals_and_contextual_coarse_groups():
     records = [
         make_record("a", 0, 0, 0, 100, 50, True),
         make_record("b", 0, 0, 300, 400, 750, False),
@@ -53,25 +124,33 @@ def test_distance_reports_type_daylight_and_coarse_band_groups():
 
     assert "NCG/day/0-300km" in metrics["distance_subgroups"]
     assert "NCG/night/300-600km" in metrics["distance_subgroups"]
-    assert metrics["distance_exact_within_200"] == pytest.approx(0.5)
+    assert metrics["distance_100km_interval_count"] == 2
+    assert metrics["distance_100km_interval_within_200"] == pytest.approx(0.5)
     assert metrics["distance_interval_mae_km"] == pytest.approx(350 / 3)
+    assert "distance_exact_count" not in metrics
+    assert "distance_exact_within_100" not in metrics
+    assert "distance_exact_within_200" not in metrics
+    assert "distance_per_type_exact_within_200" not in metrics
 
 
-def test_rejection_metrics_count_unaccepted_true_types_in_recall():
+def test_distance_conditions_use_exact_100km_bins_and_stable_source_files():
     records = [
-        make_record("a", 0, 0, accepted=True),
-        make_record("b", 0, 0, accepted=False),
-        make_record("c", 1, 1, accepted=True),
+        make_record(0, 3, 3, 300, 400, 350, False, source_path="a.lig"),
+        make_record(1, 3, 3, 300, 400, 700, False, source_path="a.lig"),
+        make_record(2, 3, 3, 300, 400, 350, False, source_path="b.lig"),
+        make_record(3, 3, 3, 300, 500, 400, False, source_path="c.lig"),
     ]
 
     metrics = evaluate_predictions(records)
 
-    assert metrics["type_coverage"] == pytest.approx(2 / 3)
-    assert metrics["type_precision"][0] == pytest.approx(1.0)
-    assert metrics["type_recall"][0] == pytest.approx(0.5)
+    condition = metrics["distance_conditions_100km"]["PNBE/night/300-400km"]
+    assert condition["piece_count"] == 3
+    assert condition["file_count"] == 2
+    assert condition["file_macro_within_200"] == pytest.approx(0.75)
+    assert len(metrics["distance_conditions_100km"]) == 1
 
 
-def test_rejected_distance_counts_as_uncovered_and_release_failure():
+def test_rejected_distance_counts_as_uncovered_and_interval_failure():
     records = [
         make_record("a", 0, 0, predicted_distance=50, accepted=True),
         make_record("b", 0, 0, predicted_distance=50, accepted=False),
@@ -80,10 +159,10 @@ def test_rejected_distance_counts_as_uncovered_and_release_failure():
     metrics = evaluate_predictions(records)
 
     assert metrics["distance_coverage"] == pytest.approx(0.5)
-    assert metrics["distance_exact_within_200"] == pytest.approx(0.5)
+    assert metrics["distance_100km_interval_within_200"] == pytest.approx(0.5)
 
 
-def test_file_bootstrap_is_reproducible_and_returns_intervals():
+def test_file_bootstrap_is_reproducible_and_returns_renamed_intervals():
     records = [
         make_record("a", 0, 0),
         make_record("a", 0, 0),
@@ -96,77 +175,194 @@ def test_file_bootstrap_is_reproducible_and_returns_intervals():
     assert first == second
     assert set(first) == {
         "type_file_macro_accuracy_ci95",
-        "distance_exact_within_200_ci95",
+        "distance_100km_interval_within_200_ci95",
     }
 
 
-def good_release_metrics(split_hash="same"):
-    return {
-        "split_hash": split_hash,
-        "type_precision": [0.96, 0.97, 0.98, 0.99],
-        "type_coverage": 0.82,
-        "type_macro_recall": 0.91,
-        "distance_exact_within_200": 0.88,
-        "distance_per_type_exact_within_200": [0.80, 0.85, 0.90, 0.95],
-        "distance_subgroups": {"NCG/day/0-300km": {"within_200": 0.90}},
+def test_bootstrap_duplicate_source_draws_remain_independent_pseudo_files():
+    records = [
+        make_record(0, 0, 0, source_path="a"),
+        make_record(1, 0, 1, source_path="b"),
+        make_record(2, 0, 1, source_path="c"),
+    ]
+
+    metrics = file_bootstrap_metrics(records, iterations=1, seed=2)
+
+    assert metrics["type_file_macro_accuracy_ci95"] == pytest.approx([2 / 3, 2 / 3])
+
+
+def test_only_supported_subgroups_are_hard_gates():
+    passing = good_release_metrics()
+    passing["distance_conditions_100km"] = {
+        "PNBE/night/300-400km": {
+            "file_count": 2,
+            "file_macro_within_200": 0.10,
+        }
     }
+    assert evaluate_release(passing)[0]
+
+    passing["distance_conditions_100km"]["PNBE/night/300-400km"]["file_count"] = 3
+    passed, reasons = evaluate_release(passing)
+
+    assert not passed
+    assert any("supported subgroup" in reason for reason in reasons)
 
 
-def test_release_requires_same_split_and_all_approved_gates():
+def test_release_uses_only_fixed_absolute_file_equal_gates():
     candidate = good_release_metrics()
-    baseline = good_release_metrics()
 
-    assert evaluate_release(candidate, baseline) == (True, [])
+    assert evaluate_release(candidate) == (True, [])
 
-    candidate["type_precision"][0] = 0.94
-    candidate["distance_per_type_exact_within_200"][2] = 0.70
-    passed, reasons = evaluate_release(candidate, baseline)
+    candidate["type_file_equal_precision"][0] = 0.94
+    candidate["type_coverage"] = 0.79
+    candidate["type_file_equal_recall_mean"] = 0.89
+    candidate["distance_100km_interval_within_200"] = 0.84
+    candidate["distance_per_type_100km_interval_within_200"][2] = 0.74
+    passed, reasons = evaluate_release(candidate)
+
     assert passed is False
-    assert any("type_precision[0]" in reason for reason in reasons)
+    assert any("type_file_equal_precision[0]" in reason for reason in reasons)
+    assert any("type_coverage" in reason for reason in reasons)
+    assert any("type_file_equal_recall_mean" in reason for reason in reasons)
+    assert any("distance_100km_interval_within_200" in reason for reason in reasons)
     assert any("distance_within_200[2]" in reason for reason in reasons)
 
-    with pytest.raises(ValueError, match="split hash"):
-        evaluate_release(good_release_metrics("candidate"), good_release_metrics("baseline"))
 
-
-def test_release_rejects_reported_subgroup_regression():
+def test_release_requires_four_per_type_values():
     candidate = good_release_metrics()
-    baseline = good_release_metrics()
-    candidate["distance_subgroups"]["NCG/day/0-300km"]["within_200"] = 0.80
+    candidate["type_file_equal_precision"] = candidate["type_file_equal_precision"][:3]
+    candidate["distance_per_type_100km_interval_within_200"] = []
 
-    passed, reasons = evaluate_release(candidate, baseline)
+    passed, reasons = evaluate_release(candidate)
 
-    assert passed is False
-    assert any("subgroup regression" in reason for reason in reasons)
-
-
-def test_release_uses_file_macro_precision_when_available():
-    candidate = good_release_metrics()
-    candidate["type_file_macro_precision"] = [0.90, 0.97, 0.98, 0.99]
-
-    passed, reasons = evaluate_release(candidate, good_release_metrics())
-
-    assert passed is False
-    assert any("type_file_macro_precision[0]" in reason for reason in reasons)
+    assert not passed
+    assert "four file-equal per-type precision values are required" in reasons
+    assert "four per-type 100-km interval values are required" in reasons
 
 
-def test_distance_calibration_must_not_degrade_point_metrics():
+def test_checkpoint_selection_key_uses_supported_condition_and_readiness_floor():
+    metrics = {
+        "type_file_equal_recall_mean": 0.86,
+        "type_file_equal_recall": [0.75, 0.80, 0.90, 1.0],
+        "distance_conditions_100km": {
+            "supported": {"file_count": 3, "file_macro_within_200": 0.71},
+            "sparse": {"file_count": 2, "file_macro_within_200": 0.10},
+        },
+        "distance_file_macro_within_200": 0.80,
+        "distance_per_type_100km_interval_within_200": [0.75, 0.80, 0.85, 0.90],
+        "distance_interval_mae_km": 100.0,
+    }
+
+    assert evaluation.checkpoint_selection_key(metrics) == (
+        1,
+        0.86,
+        0.75,
+        0.71,
+        0.80,
+        0.75,
+        -100.0,
+    )
+
+    metrics["type_file_equal_recall_mean"] = 0.849
+    assert evaluation.checkpoint_selection_key(metrics)[0] == 0
+
+
+def test_checkpoint_selection_key_defaults_unsupported_condition_score_to_zero():
+    metrics = {
+        "type_file_equal_recall_mean": 0.90,
+        "type_file_equal_recall": [0.80, 0.80, 0.80, 0.80],
+        "distance_conditions_100km": {
+            "sparse": {"file_count": 2, "file_macro_within_200": 0.99},
+        },
+        "distance_file_macro_within_200": 0.85,
+        "distance_per_type_100km_interval_within_200": [0.80] * 4,
+        "distance_interval_mae_km": 90.0,
+    }
+
+    assert evaluation.checkpoint_selection_key(metrics)[3] == 0.0
+
+
+def test_distance_calibration_must_not_degrade_three_interval_metrics():
     before = {
         "distance_file_macro_within_200": 0.80,
-        "distance_exact_within_200": 0.82,
+        "distance_100km_interval_within_200": 0.82,
         "distance_interval_mae_km": 120.0,
     }
 
     assert distance_calibration_is_safe(before, dict(before))
-    assert not distance_calibration_is_safe(before, {
+    assert distance_calibration_is_safe(before, {
         **before,
-        "distance_file_macro_within_200": 0.79,
+        "distance_file_macro_within_200": 0.80 - 1e-12,
+        "distance_100km_interval_within_200": 0.82 - 1e-12,
+        "distance_interval_mae_km": 120.0 + 1e-12,
     })
     assert not distance_calibration_is_safe(before, {
         **before,
-        "distance_exact_within_200": 0.81,
+        "distance_file_macro_within_200": 0.80 - 2e-12,
     })
     assert not distance_calibration_is_safe(before, {
         **before,
-        "distance_interval_mae_km": 121.0,
+        "distance_100km_interval_within_200": 0.82 - 2e-12,
     })
+    assert not distance_calibration_is_safe(before, {
+        **before,
+        "distance_interval_mae_km": 120.0 + 2e-12,
+    })
+
+
+def test_round_metrics_sorts_keys_normalizes_sequences_and_rejects_non_finite():
+    rounded = evaluation.round_metrics({
+        "z": np.float64(1 / 3),
+        "a": (np.int64(2), 0.1234567890128),
+    })
+
+    assert list(rounded) == ["a", "z"]
+    assert rounded == {
+        "a": [2, 0.123456789013],
+        "z": 0.333333333333,
+    }
+    for value in (float("nan"), float("inf"), np.float64("-inf")):
+        with pytest.raises(ValueError, match="non-finite"):
+            evaluation.round_metrics(value)
+
+
+def test_historical_benchmark_output_is_reference_only(monkeypatch, tmp_path):
+    import json
+    import sys
+
+    import benchmark
+
+    manifest_path = tmp_path / "split_manifest.json"
+    manifest_path.write_text(json.dumps({
+        "split_hashes": {"test": "locked"},
+    }), encoding="utf-8")
+    written = {}
+    monkeypatch.setattr(benchmark, "_file_entries", lambda *args: [])
+    monkeypatch.setattr(
+        benchmark,
+        "evaluate_checkpoint",
+        lambda *args, **kwargs: {"type_piece_accuracy": 0.99},
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "write_json",
+        lambda path, payload: written.update(payload),
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "benchmark.py",
+        "--split_manifest",
+        str(manifest_path),
+        "--model",
+        "historical=old.pt",
+    ])
+
+    benchmark.main()
+
+    assert written["reference_only"] is True
+    assert written["models"]["historical"]["reference_only"] is True
+
+
+def test_historical_benchmark_has_no_automatic_release_comparator():
+    import benchmark
+
+    assert not hasattr(benchmark, "compare_model_metrics")
