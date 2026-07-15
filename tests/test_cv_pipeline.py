@@ -20,9 +20,10 @@ from cv_pipeline import (
 )
 from data.cross_validation import assign_exact_folds, fold_train_holdout
 from data.oof_manifest import oof_row_id
-from data.split_artifacts import split_hash
+from data.split_artifacts import make_fold_manifest, split_hash
 from data.training_manifest import ManifestEntry
 from data.training_manifest import build_manifest
+from models import create_mtl_model
 from tests.test_training_manifest import write_lig
 
 
@@ -54,6 +55,7 @@ def config(tmp_path, resume_cv=False, stop_after_oof=True):
         seed=7,
         resume_cv=resume_cv,
         stop_after_oof=stop_after_oof,
+        bootstrap_iterations=5,
     )
 
 
@@ -63,24 +65,30 @@ def fake_fold_trainer(calls):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         oof_path = output_dir / "oof.csv"
-        fields = ["piece_key", "fold", "true_type"]
+        train_hash = split_hash(train_entries, config.task_data)
+        holdout_hash = split_hash(holdout_entries, config.task_data)
+        config_hash = training_config_hash(config)
         with oof_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer = csv.DictWriter(handle, fieldnames=OOF_FIELDS)
             writer.writeheader()
             for entry in holdout_entries:
                 relative = Path(entry.filepath).relative_to(config.task_data).as_posix()
                 for piece_index in range(entry.n_pieces):
-                    writer.writerow({
-                        "piece_key": oof_row_id(relative, piece_index),
-                        "fold": fold_index,
-                        "true_type": entry.type_idx,
-                    })
+                    writer.writerow(_complete_oof_row(
+                        source_path=relative,
+                        piece_index=piece_index,
+                        fold=fold_index,
+                        true_type=entry.type_idx,
+                        train_hash=train_hash,
+                        holdout_hash=holdout_hash,
+                        config_hash=config_hash,
+                    ))
         return FoldResult(
             fold_index=fold_index,
             best_epoch=fold_index + 2,
-            train_hash=split_hash(train_entries, config.task_data),
-            holdout_hash=split_hash(holdout_entries, config.task_data),
-            config_hash=training_config_hash(config),
+            train_hash=train_hash,
+            holdout_hash=holdout_hash,
+            config_hash=config_hash,
             checkpoint_path=str(output_dir / "best.pt"),
             oof_path=str(oof_path),
             metrics={},
@@ -88,26 +96,133 @@ def fake_fold_trainer(calls):
     return train
 
 
+def _write_fake_fold_calibrations(rows, output_dir):
+    for fold in range(3):
+        fold_row = next(row for row in rows if int(row["fold"]) == fold)
+        fold_hashes = {
+            name: str(fold_row[name])
+            for name in ("train_hash", "holdout_hash", "config_hash")
+        }
+        directory = Path(output_dir) / "folds" / f"fold_{fold}"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "fold_state.json").write_text(json.dumps({
+            "status": "complete",
+            "fold_index": fold,
+            **fold_hashes,
+            "metrics": {
+                "distance_calibration": {
+                    "before": {"distance_interval_mae_km": 0.0},
+                    "after": {"distance_interval_mae_km": 0.0},
+                    "fitted_temperatures": [1.0] * 4,
+                    "accepted_temperatures": [1.0] * 4,
+                    "accepted": True,
+                    "guard_reason": "accepted",
+                }
+            },
+        }), encoding="utf-8")
+
+
 def passing_oof_evaluator(rows, expected, output_dir, config):
-    return {
-        "passed": True,
-        "reasons": [],
-        "oof_piece_count": len(rows),
-        "expected_piece_count": len(expected),
-    }
+    _write_fake_fold_calibrations(rows, output_dir)
+    return evaluate_oof_artifacts(rows, expected, output_dir, config)
 
 
 def failing_oof_evaluator(rows, expected, output_dir, config):
-    return {
-        "passed": False,
-        "reasons": ["type_file_equal_precision[0]=0.90 below 0.95"],
-        "oof_piece_count": len(rows),
-        "expected_piece_count": len(expected),
-    }
+    failed_rows = [dict(row) for row in rows]
+    for row in failed_rows:
+        row["predicted_distance_km"] = 5000.0
+        row["oracle_distance_km"] = 5000.0
+    _write_fake_fold_calibrations(failed_rows, output_dir)
+    return evaluate_oof_artifacts(failed_rows, expected, output_dir, config)
 
 
 def fail_if_called(*args, **kwargs):
     raise AssertionError("final trainer must not be called")
+
+
+def test_evaluator_true_without_artifacts_cannot_authorize_final_training(tmp_path):
+    final_calls = []
+
+    def malicious_evaluator(*args, **kwargs):
+        return {"passed": True, "reasons": []}
+
+    def final_trainer(*args, **kwargs):
+        final_calls.append(True)
+
+    with pytest.raises(ValueError, match="OOF artifact verification failed"):
+        run_cross_validated_training(
+            config(tmp_path, stop_after_oof=False), trusted_entries(tmp_path), "cpu",
+            fold_trainer=fake_fold_trainer([]), final_trainer=final_trainer,
+            oof_evaluator=malicious_evaluator,
+        )
+    assert final_calls == []
+
+
+def test_evaluator_true_after_tampering_cannot_authorize_final_training(tmp_path):
+    final_calls = []
+
+    def malicious_evaluator(rows, expected, output_dir, fold_config):
+        passing_oof_evaluator(rows, expected, output_dir, fold_config)
+        metrics_path = Path(output_dir) / "cv_metrics.json"
+        saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+        saved["type_rejection"]["calibration_hash"] = "tampered"
+        metrics_path.write_text(json.dumps(saved), encoding="utf-8")
+        return {"passed": True, "reasons": []}
+
+    def final_trainer(*args, **kwargs):
+        final_calls.append(True)
+
+    with pytest.raises(ValueError, match="OOF artifact verification failed"):
+        run_cross_validated_training(
+            config(tmp_path, stop_after_oof=False), trusted_entries(tmp_path), "cpu",
+            fold_trainer=fake_fold_trainer([]), final_trainer=final_trainer,
+            oof_evaluator=malicious_evaluator,
+        )
+    assert final_calls == []
+
+
+def test_evaluator_cannot_redefine_expected_fold_hashes(tmp_path):
+    final_calls = []
+
+    def malicious_evaluator(rows, expected, output_dir, fold_config):
+        for row in rows:
+            row["train_hash"] = f"attacker-{int(row['fold'])}"
+        _write_fake_fold_calibrations(rows, output_dir)
+        evaluate_oof_artifacts(rows, expected, output_dir, fold_config)
+        return {"passed": True, "reasons": []}
+
+    def final_trainer(*args, **kwargs):
+        final_calls.append(True)
+
+    with pytest.raises(ValueError, match="OOF artifact verification failed"):
+        run_cross_validated_training(
+            config(tmp_path, stop_after_oof=False), trusted_entries(tmp_path), "cpu",
+            fold_trainer=fake_fold_trainer([]), final_trainer=final_trainer,
+            oof_evaluator=malicious_evaluator,
+        )
+    assert final_calls == []
+
+
+def test_evaluator_false_return_cannot_veto_verified_artifacts(tmp_path):
+    final_calls = []
+
+    def lying_evaluator(rows, expected, output_dir, fold_config):
+        passing_oof_evaluator(rows, expected, output_dir, fold_config)
+        return {"passed": False, "reasons": ["fabricated"]}
+
+    def final_trainer(*args, **kwargs):
+        final_calls.append(True)
+        return {"trained": True}
+
+    report = run_cross_validated_training(
+        config(tmp_path, stop_after_oof=False), trusted_entries(tmp_path), "cpu",
+        fold_trainer=fake_fold_trainer([]), final_trainer=final_trainer,
+        oof_evaluator=lying_evaluator,
+    )
+
+    assert report["passed"] is True
+    assert report["final_result"] == {"trained": True}
+    assert final_calls == [True]
 
 
 def test_cv_runs_each_fold_once_and_validates_all_oof_rows(tmp_path):
@@ -214,19 +329,80 @@ def _one_expected_row():
     }
 
 
+def _complete_oof_row(
+    *, source_path="NCG/day/0-100km/file.lig", piece_index=0, fold=0,
+    true_type=0, train_hash="train", holdout_hash="holdout",
+    config_hash="config",
+):
+    row = {name: "" for name in OOF_FIELDS}
+    row.update({
+        "piece_key": oof_row_id(source_path, piece_index),
+        "source_path": source_path,
+        "piece_index": piece_index,
+        "fold": fold,
+        "true_type": true_type,
+        "predicted_type": true_type,
+        "final_type": true_type,
+        "accepted": True,
+        "rejection_reason": "accepted",
+        "confidence": 1.0,
+        "margin": 1.0,
+        "normalized_feature_distance": 0.0,
+        "quality_score": 1.0,
+        "distance_low_km": 0.0,
+        "distance_high_km": 100.0,
+        "predicted_distance_km": 50.0,
+        "oracle_distance_km": 50.0,
+        "distance_temperature": 1.0,
+        "daylight": True,
+        "support_status": "supported",
+        "train_hash": train_hash,
+        "holdout_hash": holdout_hash,
+        "config_hash": config_hash,
+    })
+    for index, name in enumerate(("NCG", "NNBE", "PCG", "PNBE")):
+        row[f"logit_{name}"] = 8.0 if index == true_type else 0.0
+        row[f"prob_{name}"] = 1.0 if index == true_type else 0.0
+    return row
+
+
+def _checkpoint_fixture(hashes=None):
+    hashes = hashes or {
+        "train_hash": "train", "holdout_hash": "holdout", "config_hash": "config"
+    }
+    model_config = {
+        "base_channels": 1,
+        "architecture": "conditional_expert_v1",
+        "num_types": 4,
+        "context_dim": 1,
+        "dist_mlp_dim": 2,
+        "dist_dropout": 0.0,
+    }
+    model = create_mtl_model(**model_config)
+    return {
+        "schema": "conditional_expert_cv_fold_v1",
+        "fold_index": 0,
+        **hashes,
+        "random_initialization": True,
+        "best_epoch": 4,
+        "stage_config": {
+            "type_focus_epochs": 1,
+            "type_focus_distance_weight": 0.25,
+            "joint_distance_weight": 1.0,
+            "max_epochs": 5,
+            "patience": 2,
+        },
+        "model_config": model_config,
+        "model_state": model.state_dict(),
+        "metrics": {"score": 1.0},
+    }
+
+
 def _write_minimal_oof(path):
     with Path(path).open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=(
-            "piece_key", "source_path", "piece_index", "fold", "true_type"
-        ))
+        writer = csv.DictWriter(handle, fieldnames=OOF_FIELDS)
         writer.writeheader()
-        writer.writerow({
-            "piece_key": "NCG/day/0-100km/file.lig#0",
-            "source_path": "NCG/day/0-100km/file.lig",
-            "piece_index": 0,
-            "fold": 0,
-            "true_type": 0,
-        })
+        writer.writerow(_complete_oof_row())
 
 
 def test_read_oof_csv_converts_bound_fields(tmp_path):
@@ -262,8 +438,26 @@ def test_read_oof_csv_converts_bound_fields(tmp_path):
 
 def test_read_oof_csv_rejects_invalid_boolean(tmp_path):
     path = tmp_path / "oof.csv"
-    path.write_text("piece_key,accepted\nx#0,yes\n", encoding="utf-8")
+    row = _complete_oof_row()
+    row["accepted"] = "yes"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=OOF_FIELDS)
+        writer.writeheader()
+        writer.writerow(row)
     with pytest.raises(ValueError, match="invalid OOF boolean accepted"):
+        read_oof_csv(path)
+
+
+@pytest.mark.parametrize("fieldnames", [
+    OOF_FIELDS[:-1],
+    OOF_FIELDS + ("extra",),
+    (OOF_FIELDS[1], OOF_FIELDS[0], *OOF_FIELDS[2:]),
+])
+def test_read_oof_csv_requires_exact_ordered_header(tmp_path, fieldnames):
+    path = tmp_path / "oof.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        csv.DictWriter(handle, fieldnames=fieldnames).writeheader()
+    with pytest.raises(ValueError, match="OOF CSV header mismatch"):
         read_oof_csv(path)
 
 
@@ -274,22 +468,145 @@ def test_validate_fold_checkpoint_rejects_wrong_schema():
         })
 
 
-def test_load_verified_fold_returns_verified_complete_result(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda row: row.update(best_epoch=0), "best_epoch"),
+        (lambda row: row.pop("stage_config"), "stage_config"),
+        (lambda row: row.pop("metrics"), "metrics"),
+        (lambda row: row.pop("model_config"), "model_config"),
+        (lambda row: row.pop("model_state"), "model_state"),
+    ],
+)
+def test_validate_fold_checkpoint_requires_complete_schema(mutation, message):
+    checkpoint = _checkpoint_fixture()
+    mutation(checkpoint)
+    with pytest.raises(ValueError, match=message):
+        validate_fold_checkpoint(checkpoint, 0, {
+            "train_hash": "train", "holdout_hash": "holdout", "config_hash": "config"
+        })
+
+
+def test_load_verified_fold_rejects_checkpoint_state_metrics_mismatch(tmp_path):
+    directory = tmp_path / "folds" / "fold_0"
+    directory.mkdir(parents=True)
+    checkpoint = _checkpoint_fixture()
+    state = {
+        "status": "complete",
+        "fold_index": 0,
+        "best_epoch": 4,
+        "metrics": {"score": 2.0},
+        "stage_config": checkpoint["stage_config"],
+        "model_config": checkpoint["model_config"],
+        "random_initialization": True,
+        "train_hash": "train",
+        "holdout_hash": "holdout",
+        "config_hash": "config",
+    }
+    (directory / "fold_state.json").write_text(json.dumps(state), encoding="utf-8")
+    torch.save(checkpoint, directory / "best.pt")
+    with (directory / "oof.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=OOF_FIELDS)
+        writer.writeheader()
+        writer.writerow(_complete_oof_row())
+    with pytest.raises(ValueError, match="metrics mismatch"):
+        load_verified_fold(
+            tmp_path, 0,
+            {"train_hash": "train", "holdout_hash": "holdout", "config_hash": "config"},
+            _one_expected_row(),
+        )
+
+
+@pytest.mark.parametrize("field", ["stage_config", "model_config"])
+def test_load_verified_fold_rejects_checkpoint_state_config_mismatch(
+    tmp_path, field
+):
+    directory = tmp_path / "folds" / "fold_0"
+    directory.mkdir(parents=True)
+    checkpoint = _checkpoint_fixture()
+    state = {
+        "status": "complete",
+        "fold_index": 0,
+        "best_epoch": checkpoint["best_epoch"],
+        "metrics": checkpoint["metrics"],
+        "stage_config": dict(checkpoint["stage_config"]),
+        "model_config": dict(checkpoint["model_config"]),
+        "random_initialization": True,
+        "train_hash": "train",
+        "holdout_hash": "holdout",
+        "config_hash": "config",
+    }
+    if field == "stage_config":
+        state[field]["patience"] += 1
+    else:
+        state[field]["base_channels"] += 1
+    (directory / "fold_state.json").write_text(json.dumps(state), encoding="utf-8")
+    torch.save(checkpoint, directory / "best.pt")
+    _write_minimal_oof(directory / "oof.csv")
+
+    with pytest.raises(ValueError, match=f"{field} mismatch"):
+        load_verified_fold(
+            tmp_path, 0,
+            {"train_hash": "train", "holdout_hash": "holdout", "config_hash": "config"},
+            _one_expected_row(),
+        )
+
+
+def test_fold_oof_requires_explicit_source_identity_and_hashes(tmp_path):
+    entries = trusted_entries(tmp_path)
+
+    def bad_trainer(train_entries, holdout_entries, output_dir, cfg, device, fold_index):
+        result = fake_fold_trainer([])(
+            train_entries, holdout_entries, output_dir, cfg, device, fold_index
+        )
+        rows = []
+        for entry in holdout_entries:
+            relative = Path(entry.filepath).relative_to(cfg.task_data).as_posix()
+            for piece_index in range(entry.n_pieces):
+                rows.append(_complete_oof_row(
+                    source_path=relative,
+                    piece_index=piece_index,
+                    fold=fold_index,
+                    true_type=entry.type_idx,
+                    train_hash=result.train_hash,
+                    holdout_hash=result.holdout_hash,
+                    config_hash=result.config_hash,
+                ))
+        rows[0]["source_path"] = ""
+        with Path(result.oof_path).open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=OOF_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        return result
+
+    with pytest.raises(ValueError, match="OOF source_path is required"):
+        run_cross_validated_training(
+            config(tmp_path), entries, "cpu",
+            fold_trainer=bad_trainer,
+            oof_evaluator=passing_oof_evaluator,
+        )
+
+
+def test_load_verified_fold_returns_verified_complete_result(tmp_path):
     directory = tmp_path / "folds" / "fold_0"
     directory.mkdir(parents=True)
     hashes = {
         "train_hash": "train", "holdout_hash": "holdout", "config_hash": "config"
     }
+    checkpoint = _checkpoint_fixture(hashes)
     state = {
         "status": "complete",
+        "fold_index": 0,
         "best_epoch": 4,
         "metrics": {"score": 1.0},
+        "stage_config": checkpoint["stage_config"],
+        "model_config": checkpoint["model_config"],
+        "random_initialization": True,
         **hashes,
     }
     (directory / "fold_state.json").write_text(json.dumps(state), encoding="utf-8")
-    torch.save({"checkpoint": True, "best_epoch": 4}, directory / "best.pt")
+    torch.save(checkpoint, directory / "best.pt")
     _write_minimal_oof(directory / "oof.csv")
-    monkeypatch.setattr("cv_pipeline.validate_fold_checkpoint", lambda *args: None)
 
     result = load_verified_fold(tmp_path, 0, hashes, _one_expected_row())
 
@@ -301,8 +618,13 @@ def test_load_verified_fold_returns_verified_complete_result(tmp_path, monkeypat
 def test_load_verified_fold_returns_false_for_hash_mismatch(tmp_path):
     directory = tmp_path / "folds" / "fold_0"
     directory.mkdir(parents=True)
+    checkpoint = _checkpoint_fixture()
     state = {
         "status": "complete", "best_epoch": 1, "metrics": {},
+        "fold_index": 0,
+        "stage_config": checkpoint["stage_config"],
+        "model_config": checkpoint["model_config"],
+        "random_initialization": True,
         "train_hash": "old", "holdout_hash": "holdout", "config_hash": "config",
     }
     (directory / "fold_state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -313,19 +635,25 @@ def test_load_verified_fold_returns_false_for_hash_mismatch(tmp_path):
     }, _one_expected_row()) is False
 
 
-def test_load_verified_fold_rejects_best_epoch_mismatch(tmp_path, monkeypatch):
+def test_load_verified_fold_rejects_best_epoch_mismatch(tmp_path):
     directory = tmp_path / "folds" / "fold_0"
     directory.mkdir(parents=True)
     hashes = {
         "train_hash": "train", "holdout_hash": "holdout", "config_hash": "config"
     }
+    checkpoint = _checkpoint_fixture(hashes)
+    checkpoint["best_epoch"] = 3
     state = {
-        "status": "complete", "best_epoch": 4, "metrics": {}, **hashes,
+        "status": "complete", "fold_index": 0, "best_epoch": 4,
+        "metrics": checkpoint["metrics"],
+        "stage_config": checkpoint["stage_config"],
+        "model_config": checkpoint["model_config"],
+        "random_initialization": True,
+        **hashes,
     }
     (directory / "fold_state.json").write_text(json.dumps(state), encoding="utf-8")
-    torch.save({"best_epoch": 3}, directory / "best.pt")
+    torch.save(checkpoint, directory / "best.pt")
     _write_minimal_oof(directory / "oof.csv")
-    monkeypatch.setattr("cv_pipeline.validate_fold_checkpoint", lambda *args: None)
 
     with pytest.raises(ValueError, match="best_epoch mismatch"):
         load_verified_fold(tmp_path, 0, hashes, _one_expected_row())
@@ -355,11 +683,56 @@ def test_without_resume_existing_fold_artifact_aborts(tmp_path):
         )
 
 
-def test_train_conditional_fold_writes_resumable_checkpoint_and_raw_oof(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("artifact_name", ["oof_predictions.csv", "cv_metrics.json"])
+def test_without_resume_root_cv_artifact_aborts_before_training(
+    tmp_path, artifact_name
 ):
-    from cv_pipeline import train_conditional_fold
+    artifact = config(tmp_path).output / artifact_name
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("old", encoding="utf-8")
+    calls = []
+    with pytest.raises(ValueError, match="--resume_cv"):
+        run_cross_validated_training(
+            config(tmp_path), trusted_entries(tmp_path), "cpu",
+            fold_trainer=fake_fold_trainer(calls),
+            oof_evaluator=passing_oof_evaluator,
+        )
+    assert calls == []
 
+
+def test_without_resume_mismatched_fold_manifest_aborts(tmp_path):
+    manifest_path = config(tmp_path).output / "fold_manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text('{"schema":"wrong"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="fold_manifest.json does not match"):
+        run_cross_validated_training(
+            config(tmp_path), trusted_entries(tmp_path), "cpu",
+            fold_trainer=fake_fold_trainer([]),
+            oof_evaluator=passing_oof_evaluator,
+        )
+
+
+def test_without_resume_reuses_identical_audit_fold_manifest_without_rewrite(
+    tmp_path
+):
+    entries = trusted_entries(tmp_path)
+    folds = assign_exact_folds(entries, n_folds=3, seed=7)
+    manifest = make_fold_manifest(folds, config(tmp_path).task_data, seed=7)
+    manifest_path = config(tmp_path).output / "fold_manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    original = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    manifest_path.write_text(original, encoding="utf-8")
+
+    run_cross_validated_training(
+        config(tmp_path), entries, "cpu",
+        fold_trainer=fake_fold_trainer([]),
+        oof_evaluator=passing_oof_evaluator,
+    )
+
+    assert manifest_path.read_text(encoding="utf-8") == original
+
+
+def _real_fold_case(tmp_path, monkeypatch, *, max_epochs=2, patience=1):
     data_root = tmp_path / "train"
     for type_name in ("NCG", "NNBE", "PCG", "PNBE"):
         for file_index in range(3):
@@ -376,8 +749,8 @@ def test_train_conditional_fold_writes_resumable_checkpoint_and_raw_oof(
         samples_per_epoch=8,
         max_samples_per_file=2,
         type_focus_epochs=1,
-        max_epochs=2,
-        patience=1,
+        max_epochs=max_epochs,
+        patience=patience,
         num_workers=0,
         no_amp=True,
     )
@@ -390,6 +763,17 @@ def test_train_conditional_fold_writes_resumable_checkpoint_and_raw_oof(
         "dist_mlp_dim": 2,
         "dist_dropout": 0.0,
     })
+    return fold_config, train_entries, holdout_entries
+
+
+def test_train_conditional_fold_writes_resumable_checkpoint_and_raw_oof(
+    tmp_path, monkeypatch
+):
+    from cv_pipeline import train_conditional_fold
+
+    fold_config, train_entries, holdout_entries = _real_fold_case(
+        tmp_path, monkeypatch
+    )
 
     result = train_conditional_fold(
         train_entries,
@@ -414,6 +798,101 @@ def test_train_conditional_fold_writes_resumable_checkpoint_and_raw_oof(
     assert len(rows) == 4
     assert set(OOF_FIELDS).issubset(rows[0])
     assert all(row["source_path"].endswith("file-2.lig") for row in rows)
+
+
+def test_resume_with_progress_but_missing_latest_checkpoint_fails(
+    tmp_path, monkeypatch
+):
+    import cv_pipeline
+
+    fold_config, train_entries, holdout_entries = _real_fold_case(
+        tmp_path, monkeypatch, max_epochs=3
+    )
+    fold_config = CVConfig(**{**fold_config.__dict__, "resume_cv": True})
+    output_dir = fold_config.output / "folds" / "fold_0"
+    output_dir.mkdir(parents=True)
+    hashes = {
+        "train_hash": split_hash(train_entries, fold_config.task_data),
+        "holdout_hash": split_hash(holdout_entries, fold_config.task_data),
+        "config_hash": training_config_hash(fold_config),
+    }
+    state = {
+        "status": "in_progress",
+        "fold_index": 0,
+        **hashes,
+        "random_initialization": True,
+        "stage_config": {
+            "type_focus_epochs": 1,
+            "type_focus_distance_weight": 0.25,
+            "joint_distance_weight": 1.0,
+            "max_epochs": 3,
+            "patience": 1,
+        },
+        "model_config": dict(cv_pipeline.FOLD_MODEL_CONFIG),
+        "best_epoch": 1,
+        "metrics": {"score": 1.0},
+        "completed_epochs": 1,
+        "early_stop_wait": 0,
+    }
+    (output_dir / "fold_state.json").write_text(
+        json.dumps(state), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="in-progress fold is missing latest.pt"):
+        cv_pipeline.train_conditional_fold(
+            train_entries, holdout_entries, output_dir, fold_config, "cpu", 0
+        )
+
+
+def test_resume_already_at_patience_does_not_run_an_extra_epoch(
+    tmp_path, monkeypatch
+):
+    import cv_pipeline
+
+    fold_config, train_entries, holdout_entries = _real_fold_case(
+        tmp_path, monkeypatch, max_epochs=3, patience=1
+    )
+    output_dir = fold_config.output / "folds" / "fold_0"
+    original_epoch = cv_pipeline.run_conditional_epoch
+
+    def interrupt_after_two_epochs(*args, **kwargs):
+        if int(args[7]) == 2:
+            raise RuntimeError("simulated interruption")
+        return original_epoch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cv_pipeline, "run_conditional_epoch", interrupt_after_two_epochs
+    )
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        cv_pipeline.train_conditional_fold(
+            train_entries, holdout_entries, output_dir, fold_config, "cpu", 0
+        )
+
+    latest_path = output_dir / "latest.pt"
+    latest = torch.load(latest_path, map_location="cpu", weights_only=False)
+    latest["early_stop_wait"] = fold_config.patience
+    torch.save(latest, latest_path)
+    state_path = output_dir / "fold_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update({
+        "completed_epochs": latest["completed_epochs"],
+        "early_stop_wait": fold_config.patience,
+        "best_epoch": latest["best_epoch"],
+        "metrics": latest["best_metrics"],
+    })
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    def unexpected_epoch(*args, **kwargs):
+        raise AssertionError("resume ran an extra epoch after patience was met")
+
+    monkeypatch.setattr(cv_pipeline, "run_conditional_epoch", unexpected_epoch)
+    resumed = CVConfig(**{**fold_config.__dict__, "resume_cv": True})
+    result = cv_pipeline.train_conditional_fold(
+        train_entries, holdout_entries, output_dir, resumed, "cpu", 0
+    )
+
+    assert result.best_epoch == latest["best_epoch"]
+    assert read_oof_csv(result.oof_path)
 
 
 def test_completed_hash_mismatch_retrains_from_random_epoch_zero(
@@ -548,7 +1027,30 @@ def _perfect_raw_oof(tmp_path):
     return rows, expected, hashes
 
 
-def test_evaluate_oof_writes_verified_csv_metrics_and_guarded_medians(tmp_path):
+def _write_oof_rows(path, rows):
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=OOF_FIELDS)
+        writer.writeheader()
+        writer.writerows([
+            {name: "" if row.get(name) is None else row.get(name, "")
+             for name in OOF_FIELDS}
+            for row in rows
+        ])
+
+
+def _evaluated_oof_case(tmp_path):
+    rows, expected, hashes = _perfect_raw_oof(tmp_path)
+    fold_config = CVConfig(
+        task_data=tmp_path / "train",
+        output=tmp_path / "weights",
+        bootstrap_iterations=5,
+        stop_after_oof=True,
+    )
+    evaluate_oof_artifacts(rows, expected, fold_config.output, fold_config)
+    return fold_config, expected, hashes
+
+
+def test_evaluate_oof_writes_csv_metrics_and_guarded_medians(tmp_path):
     rows, expected, hashes = _perfect_raw_oof(tmp_path)
     fold_config = CVConfig(
         task_data=tmp_path / "train",
@@ -557,13 +1059,19 @@ def test_evaluate_oof_writes_verified_csv_metrics_and_guarded_medians(tmp_path):
         stop_after_oof=True,
     )
 
-    report = evaluate_oof_artifacts(rows, expected, fold_config.output, fold_config)
+    generated = evaluate_oof_artifacts(
+        rows, expected, fold_config.output, fold_config
+    )
+    report = verify_cv_artifacts(
+        fold_config.output, expected, hashes, fold_config
+    )
 
     final_rows = read_oof_csv(fold_config.output / "oof_predictions.csv")
     saved = json.loads(
         (fold_config.output / "cv_metrics.json").read_text(encoding="utf-8")
     )
     assert report["passed"] is True
+    assert generated["oof_piece_count"] == len(expected)
     assert len(final_rows) == len(expected) == 12
     assert tuple(final_rows[0]) == OOF_FIELDS
     assert all(row["accepted"] for row in final_rows)
@@ -572,11 +1080,7 @@ def test_evaluate_oof_writes_verified_csv_metrics_and_guarded_medians(tmp_path):
     assert saved["distance_calibration"]["folds"]["1"]["accepted_temperatures"] == [1.0] * 4
     assert saved["type_rejection"]["version"] == 3
     assert saved["historical_metrics"]["status"] == "reference_only"
-    assert saved["verified_release"] == {
-        "passed": True,
-        "reasons": [],
-        "source": "verify_cv_artifacts_v1",
-    }
+    assert "verified_release" not in saved
 
 
 def test_verify_cv_artifacts_rejects_tampered_final_csv(tmp_path):
@@ -619,3 +1123,112 @@ def test_verify_cv_artifacts_rejects_changed_fold_hashes(tmp_path):
     changed["0"]["train_hash"] = "changed"
     with pytest.raises(ValueError, match="fold hashes changed"):
         verify_cv_artifacts(fold_config.output, expected, changed, fold_config)
+
+
+def test_verify_cv_artifacts_rejects_tampered_saved_metrics(tmp_path):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    metrics_path = fold_config.output / "cv_metrics.json"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    saved["metrics"]["piece_count"] = 999
+    metrics_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="saved metrics hash"):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        (lambda saved: saved.update(schema="wrong"), "saved CV metrics schema"),
+        (lambda saved: saved.update(rounding_decimals=6), "rounding_decimals"),
+        (
+            lambda saved: saved["type_rejection"].update(version=2),
+            "rejection policy version",
+        ),
+        (
+            lambda saved: saved["type_rejection"].update(target_precision=0.5),
+            "target_precision",
+        ),
+    ],
+)
+def test_verify_cv_artifacts_rejects_tampered_saved_schema_metadata(
+    tmp_path, tamper, message
+):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    metrics_path = fold_config.output / "cv_metrics.json"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    tamper(saved)
+    metrics_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
+
+
+@pytest.mark.parametrize("tamper", ["threshold", "calibration_hash"])
+def test_verify_cv_artifacts_rejects_tampered_rejection_calibration(
+    tmp_path, tamper
+):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    metrics_path = fold_config.output / "cv_metrics.json"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    if tamper == "threshold":
+        saved["type_rejection"]["probability_thresholds"][0] += 0.1
+    else:
+        saved["type_rejection"]["calibration_hash"] = "tampered"
+    metrics_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="calibration_hash"):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
+
+
+def test_verify_cv_artifacts_rejects_tampered_policy_oof_metrics(tmp_path):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    metrics_path = fold_config.output / "cv_metrics.json"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    saved["type_rejection"]["oof_metrics"]["type_coverage"] = 0.0
+    metrics_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="policy OOF metrics"):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
+
+
+def test_verify_cv_artifacts_rejects_tampered_final_distance_vector(tmp_path):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    metrics_path = fold_config.output / "cv_metrics.json"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    saved["distance_calibration"]["final_temperatures"] = [9.0] * 4
+    metrics_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="distance temperature median"):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
+
+
+def test_verify_cv_artifacts_binds_distance_vectors_to_fold_states(tmp_path):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    metrics_path = fold_config.output / "cv_metrics.json"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    calibration = saved["distance_calibration"]
+    calibration["folds"]["0"]["accepted_temperatures"] = [8.0] * 4
+    calibration["folds"]["0"]["fitted_temperatures"] = [8.0] * 4
+    calibration["final_temperatures"] = [4.0] * 4
+    metrics_path.write_text(json.dumps(saved), encoding="utf-8")
+    final_path = fold_config.output / "oof_predictions.csv"
+    rows = read_oof_csv(final_path)
+    for row in rows:
+        if int(row["fold"]) == 0:
+            row["distance_temperature"] = 8.0
+    _write_oof_rows(final_path, rows)
+
+    with pytest.raises(ValueError, match="fold states"):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
+
+
+def test_verify_cv_artifacts_rejects_tampered_csv_row_hash(tmp_path):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    final_path = fold_config.output / "oof_predictions.csv"
+    rows = read_oof_csv(final_path)
+    rows[0]["train_hash"] = "tampered"
+    _write_oof_rows(final_path, rows)
+
+    with pytest.raises(ValueError, match="row fold hashes"):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)

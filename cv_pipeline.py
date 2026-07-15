@@ -6,6 +6,7 @@ import csv
 import dataclasses
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from data.cross_validation import (
     fold_train_holdout,
     validate_fold_assignment,
 )
-from data.oof_manifest import expected_oof_rows, validate_oof_rows
+from data.oof_manifest import expected_oof_rows, oof_row_id, validate_oof_rows
 from data.split_artifacts import make_fold_manifest, split_hash, stable_json_hash
 from data.training_manifest import ManifestEntry
 from data.training_manifest import build_piece_manifest
@@ -65,6 +66,13 @@ FOLD_MODEL_CONFIG = {
 FOLD_LEARNING_RATE = 3e-4
 FOLD_WEIGHT_DECAY = 5e-4
 FOLD_COARSE_WEIGHT = 0.5
+STAGE_CONFIG_FIELDS = (
+    "type_focus_epochs",
+    "type_focus_distance_weight",
+    "joint_distance_weight",
+    "max_epochs",
+    "patience",
+)
 OOF_FIELDS = (
     "piece_key", "source_path", "piece_index", "fold", "true_type",
     "predicted_type", "final_type", "accepted", "rejection_reason",
@@ -169,12 +177,32 @@ def _atomic_write_csv(path, rows, fieldnames):
     temporary.replace(path)
 
 
+def _reuse_or_write_fold_manifest(path, canonical):
+    """Reuse an identical audit manifest without mutating its bytes."""
+    path = Path(path)
+    if not path.exists():
+        _atomic_write_json(path, canonical)
+        return
+    if not path.is_file():
+        raise ValueError("existing fold_manifest.json is not a regular file")
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid existing fold_manifest.json: {exc}") from exc
+    if existing != canonical:
+        raise ValueError("existing fold_manifest.json does not match canonical folds")
+
+
 def read_oof_csv(path):
     """Read OOF rows and convert every field in the stable typed contract."""
     with Path(path).open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
             raise ValueError("OOF CSV has no header")
+        if tuple(reader.fieldnames) != OOF_FIELDS:
+            raise ValueError(
+                "OOF CSV header mismatch: expected exact OOF_FIELDS order"
+            )
         rows = []
         for raw in reader:
             row = dict(raw)
@@ -195,8 +223,30 @@ def read_oof_csv(path):
     return rows
 
 
+def _validate_required_oof_fields(rows, expected_hashes=None):
+    """Require explicit stable identities and fold hashes on every OOF row."""
+    for row_index, row in enumerate(rows):
+        for name in (
+            "piece_key", "source_path", "piece_index", "fold", "true_type",
+            "train_hash", "holdout_hash", "config_hash",
+        ):
+            if name not in row or row[name] in {None, ""}:
+                raise ValueError(f"OOF {name} is required at row {row_index}")
+        if int(row["piece_index"]) < 0:
+            raise ValueError(f"OOF piece_index must be non-negative at row {row_index}")
+        identity = oof_row_id(str(row["source_path"]), int(row["piece_index"]))
+        if str(row["piece_key"]) != identity:
+            raise ValueError(f"OOF piece_key does not match source identity: {identity}")
+        if expected_hashes is not None:
+            for key in ("train_hash", "holdout_hash", "config_hash"):
+                if str(row[key]) != str(expected_hashes[key]):
+                    raise ValueError(f"OOF {key} mismatch at row {row_index}")
+
+
 def validate_fold_checkpoint(checkpoint, fold_index, expected_hashes):
     """Validate fold identity and prove its model state loads strictly."""
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("fold checkpoint must be a mapping")
     if checkpoint.get("schema") != "conditional_expert_cv_fold_v1":
         raise ValueError("invalid fold checkpoint schema")
     if int(checkpoint.get("fold_index", -1)) != int(fold_index):
@@ -207,10 +257,46 @@ def validate_fold_checkpoint(checkpoint, fold_index, expected_hashes):
     if checkpoint.get("random_initialization") is not True:
         raise ValueError("fold checkpoint was not random-initialized")
     try:
-        model = create_mtl_model(**checkpoint["model_config"])
-        model.load_state_dict(checkpoint["model_state"], strict=True)
-    except KeyError as exc:
-        raise ValueError(f"fold checkpoint missing field: {exc.args[0]}") from exc
+        best_epoch = int(checkpoint["best_epoch"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("fold checkpoint best_epoch is invalid") from exc
+    if best_epoch <= 0:
+        raise ValueError("fold checkpoint best_epoch must be positive")
+    stage_config = checkpoint.get("stage_config")
+    if not isinstance(stage_config, Mapping) or set(stage_config) != set(
+        STAGE_CONFIG_FIELDS
+    ):
+        raise ValueError("fold checkpoint stage_config is invalid")
+    try:
+        if int(stage_config["type_focus_epochs"]) < 0:
+            raise ValueError
+        if int(stage_config["max_epochs"]) <= int(
+            stage_config["type_focus_epochs"]
+        ):
+            raise ValueError
+        if int(stage_config["patience"]) <= 0:
+            raise ValueError
+        if float(stage_config["type_focus_distance_weight"]) < 0:
+            raise ValueError
+        if float(stage_config["joint_distance_weight"]) < 0:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError("fold checkpoint stage_config values are invalid") from exc
+    if not isinstance(checkpoint.get("metrics"), Mapping):
+        raise ValueError("fold checkpoint metrics must be a mapping")
+    model_config = checkpoint.get("model_config")
+    if not isinstance(model_config, Mapping) or set(model_config) != set(
+        FOLD_MODEL_CONFIG
+    ):
+        raise ValueError("fold checkpoint model_config is invalid")
+    model_state = checkpoint.get("model_state")
+    if not isinstance(model_state, Mapping) or not model_state:
+        raise ValueError("fold checkpoint model_state is invalid")
+    try:
+        model = create_mtl_model(**model_config)
+        model.load_state_dict(model_state, strict=True)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"fold checkpoint model configuration/state is invalid: {exc}") from exc
 
 
 def load_verified_fold(output_dir, fold_index, expected_hashes, expected_rows):
@@ -229,6 +315,13 @@ def load_verified_fold(output_dir, fold_index, expected_hashes, expected_rows):
         return None
     if not (best_path.is_file() and oof_path.is_file()):
         raise ValueError(f"completed fold is missing artifacts: fold {fold_index}")
+    if int(state.get("fold_index", -1)) != int(fold_index):
+        raise ValueError(f"completed fold state index mismatch: fold {fold_index}")
+    if state.get("random_initialization") is not True:
+        raise ValueError(f"completed fold state was not random-initialized: fold {fold_index}")
+    for name in ("stage_config", "model_config", "metrics"):
+        if not isinstance(state.get(name), Mapping):
+            raise ValueError(f"completed fold state {name} is invalid: fold {fold_index}")
     for key in ("train_hash", "holdout_hash", "config_hash"):
         if state.get(key) != expected_hashes[key]:
             return False
@@ -248,8 +341,12 @@ def load_verified_fold(output_dir, fold_index, expected_hashes, expected_rows):
         ) from exc
     if state_best_epoch <= 0 or checkpoint_best_epoch != state_best_epoch:
         raise ValueError(f"fold checkpoint best_epoch mismatch: fold {fold_index}")
+    for name in ("stage_config", "model_config", "metrics"):
+        if checkpoint[name] != state[name]:
+            raise ValueError(f"fold checkpoint/state {name} mismatch: fold {fold_index}")
     try:
         rows = read_oof_csv(oof_path)
+        _validate_required_oof_fields(rows, expected_hashes)
         validate_oof_rows(rows, expected_rows)
     except (OSError, ValueError, KeyError) as exc:
         raise ValueError(f"invalid fold OOF for fold {fold_index}: {exc}") from exc
@@ -284,6 +381,8 @@ def train_conditional_fold(
         "holdout_hash": split_hash(holdout_entries, config.task_data),
         "config_hash": training_config_hash(config),
     }
+    model_config = dict(FOLD_MODEL_CONFIG)
+    model_config["context_dim"] = 1 if config.time_context == "daylight" else 3
     stage_config = {
         "type_focus_epochs": int(config.type_focus_epochs),
         "type_focus_distance_weight": float(config.type_focus_distance_weight),
@@ -296,9 +395,12 @@ def train_conditional_fold(
         **hashes,
         "random_initialization": True,
         "stage_config": stage_config,
+        "model_config": model_config,
     }
     state_path = output_dir / "fold_state.json"
+    latest_path = output_dir / "latest.pt"
     prior_state = None
+    should_load_latest = False
     if config.resume_cv and state_path.is_file():
         try:
             prior_state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -306,6 +408,57 @@ def train_conditional_fold(
             raise ValueError(
                 f"invalid fold state for fold {fold_index}: {exc}"
             ) from exc
+        if not isinstance(prior_state, Mapping):
+            raise ValueError(f"invalid fold state for fold {fold_index}: expected object")
+        hashes_match = all(
+            prior_state.get(key) == value for key, value in hashes.items()
+        )
+        if prior_state.get("status") != "complete" and hashes_match:
+            if prior_state.get("status") != "in_progress":
+                raise ValueError(f"invalid in-progress fold status: fold {fold_index}")
+            if int(prior_state.get("fold_index", -1)) != fold_index:
+                raise ValueError(f"in-progress fold index mismatch: fold {fold_index}")
+            if prior_state.get("random_initialization") is not True:
+                raise ValueError(
+                    f"in-progress fold was not random-initialized: fold {fold_index}"
+                )
+            if prior_state.get("stage_config") != stage_config:
+                raise ValueError(
+                    f"in-progress fold stage_config mismatch: fold {fold_index}"
+                )
+            if prior_state.get("model_config") != model_config:
+                raise ValueError(
+                    f"in-progress fold model_config mismatch: fold {fold_index}"
+                )
+            if not isinstance(prior_state.get("metrics"), Mapping):
+                raise ValueError(f"invalid in-progress fold metrics: fold {fold_index}")
+            try:
+                completed_epochs = int(prior_state.get("completed_epochs", 0))
+                prior_best_epoch = int(prior_state.get("best_epoch", 0))
+                prior_wait = int(prior_state.get("early_stop_wait", 0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid in-progress fold progress: fold {fold_index}"
+                ) from exc
+            if (
+                completed_epochs < 0
+                or completed_epochs > int(config.max_epochs)
+                or prior_best_epoch < 0
+                or prior_best_epoch > completed_epochs
+                or prior_wait < 0
+            ):
+                raise ValueError(f"invalid in-progress fold progress: fold {fold_index}")
+            has_progress = bool(
+                completed_epochs
+                or prior_best_epoch
+                or prior_wait
+                or prior_state["metrics"]
+            )
+            if has_progress and not latest_path.is_file():
+                raise ValueError(
+                    f"in-progress fold is missing latest.pt: fold {fold_index}"
+                )
+            should_load_latest = latest_path.is_file()
 
     train_pieces = build_piece_manifest(train_entries)
     holdout_pieces = build_piece_manifest(holdout_entries)
@@ -352,8 +505,6 @@ def train_conditional_fold(
     torch.manual_seed(fold_seed)
     if cuda:
         torch.cuda.manual_seed_all(fold_seed)
-    model_config = dict(FOLD_MODEL_CONFIG)
-    model_config["context_dim"] = 1 if config.time_context == "daylight" else 3
     model = create_mtl_model(**model_config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=FOLD_LEARNING_RATE, weight_decay=FOLD_WEIGHT_DECAY
@@ -374,22 +525,19 @@ def train_conditional_fold(
     best_metrics = {}
     wait = 0
 
-    latest_path = output_dir / "latest.pt"
     resume_state = None
-    if config.resume_cv and prior_state is not None and latest_path.is_file():
-        hashes_match = all(
-            prior_state.get(key) == value for key, value in hashes.items()
-        )
-        if prior_state.get("status") != "complete" and hashes_match:
-            try:
-                resume_state = torch.load(
-                    latest_path, map_location="cpu", weights_only=False
-                )
-            except (OSError, RuntimeError, EOFError) as exc:
-                raise ValueError(
-                    f"invalid latest fold checkpoint for fold {fold_index}: {exc}"
-                ) from exc
+    if should_load_latest:
+        try:
+            resume_state = torch.load(
+                latest_path, map_location="cpu", weights_only=False
+            )
+        except (OSError, RuntimeError, EOFError) as exc:
+            raise ValueError(
+                f"invalid latest fold checkpoint for fold {fold_index}: {exc}"
+            ) from exc
     if resume_state is not None:
+        if not isinstance(resume_state, Mapping):
+            raise ValueError(f"invalid latest fold checkpoint: fold {fold_index}")
         if resume_state.get("schema") != "conditional_expert_cv_fold_state_v1":
             raise ValueError(f"invalid latest fold state schema: fold {fold_index}")
         if int(resume_state.get("fold_index", -1)) != fold_index:
@@ -399,20 +547,45 @@ def train_conditional_fold(
                 raise ValueError(f"latest fold checkpoint {key} mismatch: fold {fold_index}")
         if resume_state.get("random_initialization") is not True:
             raise ValueError(f"latest fold checkpoint was not random-initialized: fold {fold_index}")
-        model.load_state_dict(resume_state["model_state"], strict=True)
-        optimizer.load_state_dict(resume_state["optimizer_state"])
-        scheduler.load_state_dict(resume_state["scheduler_state"])
-        scaler.load_state_dict(resume_state.get("scaler_state", {}))
-        start_epoch = int(resume_state["completed_epochs"])
+        if resume_state.get("stage_config") != stage_config:
+            raise ValueError(f"latest fold stage_config mismatch: fold {fold_index}")
+        if resume_state.get("model_config") != model_config:
+            raise ValueError(f"latest fold model_config mismatch: fold {fold_index}")
+        try:
+            start_epoch = int(resume_state["completed_epochs"])
+            latest_wait = int(resume_state.get("early_stop_wait", 0))
+            latest_best_epoch = int(resume_state.get("best_epoch", 0))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid latest fold progress: fold {fold_index}"
+            ) from exc
+        if (
+            start_epoch != int(prior_state["completed_epochs"])
+            or latest_wait != int(prior_state["early_stop_wait"])
+            or latest_best_epoch != int(prior_state["best_epoch"])
+            or resume_state.get("best_metrics") != prior_state["metrics"]
+        ):
+            raise ValueError(
+                f"latest checkpoint/state progress mismatch: fold {fold_index}"
+            )
+        try:
+            model.load_state_dict(resume_state["model_state"], strict=True)
+            optimizer.load_state_dict(resume_state["optimizer_state"])
+            scheduler.load_state_dict(resume_state["scheduler_state"])
+            scaler.load_state_dict(resume_state.get("scaler_state", {}))
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError(
+                f"invalid latest fold training state: fold {fold_index}: {exc}"
+            ) from exc
         best_score = (
             tuple(resume_state["best_score"])
             if resume_state.get("best_score") is not None
             else None
         )
         best_state = resume_state.get("best_model_state")
-        best_epoch = int(resume_state.get("best_epoch", 0))
+        best_epoch = latest_best_epoch
         best_metrics = dict(resume_state.get("best_metrics", {}))
-        wait = int(resume_state.get("early_stop_wait", 0))
+        wait = latest_wait
         if "torch_rng_state" in resume_state:
             torch.set_rng_state(resume_state["torch_rng_state"])
         if cuda and "cuda_rng_state_all" in resume_state:
@@ -423,10 +596,15 @@ def train_conditional_fold(
         "status": "in_progress",
         "best_epoch": best_epoch,
         "metrics": best_metrics,
+        "completed_epochs": start_epoch,
+        "early_stop_wait": wait,
     })
 
     try:
-        for epoch in range(start_epoch, config.max_epochs):
+        epochs = () if resume_state is not None and wait >= config.patience else range(
+            start_epoch, config.max_epochs
+        )
+        for epoch in epochs:
             stage, _, _ = run_conditional_epoch(
                 model,
                 train_loader,
@@ -489,6 +667,8 @@ def train_conditional_fold(
                 "status": "in_progress",
                 "best_epoch": best_epoch,
                 "metrics": best_metrics,
+                "completed_epochs": epoch + 1,
+                "early_stop_wait": wait,
             })
             if stage == "joint" and wait >= config.patience:
                 break
@@ -692,6 +872,210 @@ def _distance_calibration_summary(output_dir, fold_hashes):
     }
 
 
+def _verify_saved_rejection_policy(rows, policy, fold_hashes, saved_metrics):
+    """Reconstruct calibrated decisions and their Task-7 identity from disk."""
+    if not isinstance(policy, Mapping):
+        raise ValueError("saved type_rejection policy must be an object")
+    if policy.get("fold_hashes") != fold_hashes:
+        raise ValueError("policy fold_hashes do not match saved OOF rows")
+    threshold_names = (
+        "probability_thresholds",
+        "margin_thresholds",
+        "normalized_distance_thresholds",
+        "quality_thresholds",
+    )
+    thresholds = {}
+    for name in threshold_names:
+        try:
+            vector = [float(value) for value in policy[name]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid rejection policy {name}") from exc
+        if len(vector) != len(TYPE_NAMES) or not np.isfinite(vector).all():
+            raise ValueError(f"invalid rejection policy {name}")
+        thresholds[name] = vector
+    calibration_hash = stable_json_hash({
+        "fold_hashes": fold_hashes,
+        "piece_keys": [str(row["piece_key"]) for row in rows],
+        "accepted": [bool(row["accepted"]) for row in rows],
+        **{
+            name: [round(float(value), 12) for value in thresholds[name]]
+            for name in threshold_names
+        },
+    })
+    if calibration_hash != policy.get("calibration_hash"):
+        raise ValueError("rejection policy calibration_hash mismatch")
+
+    try:
+        fold_temperatures = {
+            str(key): float(value)
+            for key, value in policy["fold_temperatures"].items()
+        }
+    except (KeyError, AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("invalid rejection policy fold_temperatures") from exc
+    if set(fold_temperatures) != {"0", "1", "2"} or any(
+        not np.isfinite(value) or value <= 0
+        for value in fold_temperatures.values()
+    ):
+        raise ValueError("invalid rejection policy fold_temperatures")
+    median_temperature = float(np.median(list(fold_temperatures.values())))
+    if not np.isclose(
+        float(policy.get("temperature", float("nan"))),
+        median_temperature,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError("rejection policy temperature median mismatch")
+
+    policy_records = [None] * len(rows)
+    for fold in range(3):
+        positions = [
+            index for index, row in enumerate(rows) if int(row["fold"]) == fold
+        ]
+        logits = torch.as_tensor([
+            [float(rows[index][f"logit_{name}"]) for name in TYPE_NAMES]
+            for index in positions
+        ], dtype=torch.float32)
+        labels = torch.as_tensor([
+            int(rows[index]["true_type"]) for index in positions
+        ], dtype=torch.long)
+        recomputed_temperature = float(_fit_temperature(logits, labels))
+        if not np.isclose(
+            fold_temperatures[str(fold)], recomputed_temperature,
+            rtol=1e-7, atol=1e-9,
+        ):
+            raise ValueError(f"rejection fold temperature mismatch: fold {fold}")
+        probabilities = (logits / recomputed_temperature).softmax(dim=1)
+        top_two = probabilities.topk(2, dim=1).values
+        predicted = probabilities.argmax(dim=1)
+        for local_index, row_index in enumerate(positions):
+            row = rows[row_index]
+            predicted_type = int(predicted[local_index].item())
+            probability_vector = probabilities[local_index].tolist()
+            saved_probabilities = [
+                float(row[f"prob_{name}"]) for name in TYPE_NAMES
+            ]
+            confidence = float(top_two[local_index, 0].item())
+            margin = float(
+                (top_two[local_index, 0] - top_two[local_index, 1]).item()
+            )
+            if (
+                int(row["predicted_type"]) != predicted_type
+                or not np.allclose(
+                    saved_probabilities, probability_vector, rtol=1e-6, atol=1e-7
+                )
+                or not np.isclose(
+                    float(row["confidence"]), confidence, rtol=1e-6, atol=1e-7
+                )
+                or not np.isclose(
+                    float(row["margin"]), margin, rtol=1e-6, atol=1e-7
+                )
+            ):
+                raise ValueError(f"OOF calibrated probability mismatch: row {row_index}")
+            normalized_distance = float(row["normalized_feature_distance"])
+            quality_score = float(row["quality_score"])
+            if not np.isfinite(normalized_distance) or not np.isfinite(quality_score):
+                raise ValueError(f"OOF rejection signals are non-finite: row {row_index}")
+            accepted = bool(
+                np.float32(confidence)
+                >= np.float32(thresholds["probability_thresholds"][predicted_type])
+                and np.float32(margin)
+                >= np.float32(thresholds["margin_thresholds"][predicted_type])
+                and np.float32(normalized_distance)
+                <= np.float32(
+                    thresholds["normalized_distance_thresholds"][predicted_type]
+                )
+                and np.float32(quality_score)
+                >= np.float32(thresholds["quality_thresholds"][predicted_type])
+            )
+            expected_final = predicted_type if accepted else -1
+            expected_reason = "accepted" if accepted else "rejected"
+            if (
+                bool(row["accepted"]) != accepted
+                or int(row["final_type"]) != expected_final
+                or str(row["rejection_reason"]) != expected_reason
+            ):
+                raise ValueError(f"OOF rejection decision mismatch: row {row_index}")
+            policy_records[row_index] = {
+                "file_id": str(row["source_path"]),
+                "true_type": int(row["true_type"]),
+                "predicted_type": predicted_type,
+                "accepted": accepted,
+            }
+
+    recomputed_policy_metrics = round_metrics(evaluate_predictions(policy_records))
+    if recomputed_policy_metrics != policy.get("oof_metrics"):
+        raise ValueError("policy OOF metrics do not match calibrated decisions")
+    shared_metric_names = (
+        "split_hash", "piece_count", "file_count",
+        *(
+            name for name in recomputed_policy_metrics
+            if name.startswith("type_") or name.startswith("raw_type_")
+        ),
+    )
+    if any(
+        saved_metrics.get(name) != recomputed_policy_metrics.get(name)
+        for name in shared_metric_names
+    ):
+        raise ValueError("policy OOF metrics do not match saved metrics layer")
+
+
+def _verify_saved_distance_calibration(rows, distance_calibration):
+    """Verify guarded fold vectors and their persisted median aggregation."""
+    if not isinstance(distance_calibration, Mapping):
+        raise ValueError("saved distance_calibration must be an object")
+    if distance_calibration.get("aggregation") != (
+        "elementwise_median_with_unsafe_fold_fallback_ones_v1"
+    ):
+        raise ValueError("invalid distance calibration aggregation")
+    folds = distance_calibration.get("folds")
+    if not isinstance(folds, Mapping) or set(folds) != {"0", "1", "2"}:
+        raise ValueError("distance calibration must contain exactly three folds")
+    vectors = []
+    for fold in range(3):
+        calibration = folds[str(fold)]
+        try:
+            vector = [float(value) for value in calibration["accepted_temperatures"]]
+            fitted = [float(value) for value in calibration["fitted_temperatures"]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid distance calibration fold {fold}") from exc
+        if (
+            len(vector) != len(TYPE_NAMES)
+            or len(fitted) != len(TYPE_NAMES)
+            or any(not np.isfinite(value) or value <= 0 for value in vector + fitted)
+        ):
+            raise ValueError(f"invalid distance calibration fold {fold}")
+        if bool(calibration.get("accepted")) and not np.allclose(
+            vector, fitted, rtol=0.0, atol=1e-12
+        ):
+            raise ValueError(f"accepted distance calibration changed: fold {fold}")
+        if not bool(calibration.get("accepted")) and vector != [1.0] * len(TYPE_NAMES):
+            raise ValueError(f"unsafe distance calibration lacks ones fallback: fold {fold}")
+        vectors.append(vector)
+    median = np.median(np.asarray(vectors, dtype=np.float64), axis=0)
+    try:
+        saved_final = np.asarray(
+            distance_calibration["final_temperatures"], dtype=np.float64
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid final distance temperatures") from exc
+    if (
+        saved_final.shape != (len(TYPE_NAMES),)
+        or not np.isfinite(saved_final).all()
+        or not np.allclose(saved_final, median, rtol=0.0, atol=1e-12)
+    ):
+        raise ValueError("final distance temperature median mismatch")
+    for row_index, row in enumerate(rows):
+        fold = int(row["fold"])
+        predicted_type = int(row["predicted_type"])
+        if not np.isclose(
+            float(row["distance_temperature"]),
+            vectors[fold][predicted_type],
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(f"OOF row distance temperature mismatch: row {row_index}")
+
+
 def verify_cv_artifacts(output_dir, expected_rows, expected_hashes, config):
     """Recompute release evidence from saved OOF rows before authorization."""
     rows = read_oof_csv(Path(output_dir) / "oof_predictions.csv")
@@ -707,11 +1091,58 @@ def verify_cv_artifacts(output_dir, expected_rows, expected_hashes, config):
         )
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid saved CV metrics: {exc}") from exc
-    recomputed_hash = stable_json_hash(round_metrics(metrics))
+    if saved.get("schema") != "conditional_expert_cv_metrics_v1":
+        raise ValueError("invalid saved CV metrics schema")
+    if saved.get("rounding_decimals") != 12:
+        raise ValueError("saved CV metrics rounding_decimals must be 12")
+    saved_policy = saved.get("type_rejection")
+    if not isinstance(saved_policy, Mapping):
+        raise ValueError("saved type_rejection policy must be an object")
+    if saved_policy.get("version") != 3:
+        raise ValueError("saved rejection policy version must be 3")
+    for name, expected_value in (
+        ("target_precision", config.rejection_target_precision),
+        ("minimum_coverage", config.rejection_min_coverage),
+    ):
+        try:
+            actual_value = float(saved_policy[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid rejection policy {name}") from exc
+        if not np.isclose(
+            actual_value, float(expected_value), rtol=0.0, atol=1e-12
+        ):
+            raise ValueError(f"rejection policy {name} mismatch")
+    rounded_metrics = round_metrics(metrics)
+    recomputed_hash = stable_json_hash(rounded_metrics)
     if recomputed_hash != saved.get("recomputed_metrics_hash"):
         raise ValueError("saved OOF metrics do not match oof_predictions.csv")
+    if not isinstance(saved.get("metrics"), Mapping) or (
+        stable_json_hash(saved["metrics"]) != saved.get("recomputed_metrics_hash")
+    ):
+        raise ValueError("saved metrics hash does not match recomputed_metrics_hash")
+    try:
+        row_fold_hashes = _fold_hashes_from_rows(rows)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid OOF row fold hashes: {exc}") from exc
+    if row_fold_hashes != expected_hashes:
+        raise ValueError("fold hashes changed after OOF evaluation")
+    if row_fold_hashes != saved.get("fold_hashes"):
+        raise ValueError("saved fold hashes do not match OOF row fold hashes")
     if expected_hashes != saved.get("fold_hashes"):
         raise ValueError("fold hashes changed after OOF evaluation")
+    _verify_saved_rejection_policy(
+        rows, saved_policy, row_fold_hashes, rounded_metrics
+    )
+    _verify_saved_distance_calibration(
+        rows, saved.get("distance_calibration")
+    )
+    reconstructed_distance = _distance_calibration_summary(
+        output_dir, row_fold_hashes
+    )
+    if stable_json_hash(reconstructed_distance) != stable_json_hash(
+        saved.get("distance_calibration")
+    ):
+        raise ValueError("saved distance calibration does not match fold states")
     return {
         "passed": bool(passed),
         "reasons": list(reasons),
@@ -722,8 +1153,10 @@ def verify_cv_artifacts(output_dir, expected_rows, expected_hashes, config):
 
 
 def evaluate_oof_artifacts(rows, expected, output_dir, config) -> dict:
-    """Calibrate pooled OOF rows, write artifacts, and return verified gates."""
-    rows = [dict(row) for row in rows]
+    """Calibrate pooled OOF rows and generate release artifacts for verification."""
+    rows = sorted(
+        (dict(row) for row in rows), key=lambda row: str(row["piece_key"])
+    )
     validate_oof_rows(rows, expected)
     fold_hashes = _fold_hashes_from_rows(rows)
     fold_temperatures = {}
@@ -816,14 +1249,10 @@ def evaluate_oof_artifacts(rows, expected, output_dir, config) -> dict:
         },
     }
     _atomic_write_json(output_dir / "cv_metrics.json", saved)
-    verified = verify_cv_artifacts(output_dir, expected, fold_hashes, config)
-    saved["verified_release"] = {
-        "passed": verified["passed"],
-        "reasons": verified["reasons"],
-        "source": "verify_cv_artifacts_v1",
+    return {
+        "oof_piece_count": len(final_rows),
+        "expected_piece_count": len(expected),
     }
-    _atomic_write_json(output_dir / "cv_metrics.json", saved)
-    return verified
 
 
 def run_cross_validated_training(
@@ -838,22 +1267,33 @@ def run_cross_validated_training(
     if int(config.folds) != 3:
         raise ValueError("cross-validation requires exactly three folds")
     folds_directory = Path(config.output) / "folds"
-    if (
-        not config.resume_cv
-        and folds_directory.is_dir()
-        and any(path.is_file() for path in folds_directory.rglob("*"))
-    ):
-        raise ValueError(
-            "fold training artifacts already exist; pass --resume_cv to verify them"
+    if not config.resume_cv:
+        root_artifacts = (
+            Path(config.output) / "oof_predictions.csv",
+            Path(config.output) / "cv_metrics.json",
         )
+        folds_have_artifacts = (
+            folds_directory.exists()
+            and (
+                not folds_directory.is_dir()
+                or next(folds_directory.rglob("*"), None) is not None
+            )
+        )
+        if folds_have_artifacts or any(path.exists() for path in root_artifacts):
+            raise ValueError(
+                "CV training artifacts already exist; pass --resume_cv to verify them"
+            )
     folds = assign_exact_folds(entries, n_folds=config.folds, seed=config.seed)
     validate_fold_assignment(folds, entries, n_folds=config.folds)
     fold_manifest = make_fold_manifest(folds, config.task_data, config.seed)
     expected = expected_oof_rows(fold_manifest)
-    _atomic_write_json(Path(config.output) / "fold_manifest.json", fold_manifest)
+    _reuse_or_write_fold_manifest(
+        Path(config.output) / "fold_manifest.json", fold_manifest
+    )
     config_hash = training_config_hash(config)
     results = []
     rows = []
+    expected_fold_hashes = {}
     for fold_index in range(config.folds):
         train_entries, holdout_entries = fold_train_holdout(folds, fold_index)
         expected_hashes = {
@@ -861,6 +1301,7 @@ def run_cross_validated_training(
             "holdout_hash": split_hash(holdout_entries, config.task_data),
             "config_hash": config_hash,
         }
+        expected_fold_hashes[str(fold_index)] = dict(expected_hashes)
         expected_fold_rows = {
             key: value
             for key, value in expected.items()
@@ -883,12 +1324,35 @@ def run_cross_validated_training(
                 fold_index,
             )
         results.append(result)
-        rows.extend(read_oof_csv(result.oof_path))
+        fold_rows = read_oof_csv(result.oof_path)
+        _validate_required_oof_fields(fold_rows, expected_hashes)
+        validate_oof_rows(fold_rows, expected_fold_rows)
+        rows.extend(fold_rows)
 
     validate_oof_rows(rows, expected)
-    report = oof_evaluator(rows, expected, config.output, config)
-    report.setdefault("oof_piece_count", len(rows))
-    report.setdefault("expected_piece_count", len(expected))
+    oof_evaluator(
+        [dict(row) for row in rows],
+        {key: dict(value) for key, value in expected.items()},
+        config.output,
+        dataclasses.replace(config),
+    )
+    try:
+        report = verify_cv_artifacts(
+            config.output, expected, expected_fold_hashes, config
+        )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"OOF artifact verification failed: {exc}") from exc
+    saved_path = Path(config.output) / "cv_metrics.json"
+    try:
+        saved = json.loads(saved_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"OOF artifact verification failed: {exc}") from exc
+    saved["verified_release"] = {
+        "passed": report["passed"],
+        "reasons": report["reasons"],
+        "source": "verify_cv_artifacts_v1",
+    }
+    _atomic_write_json(saved_path, saved)
     report["fold_results"] = [dataclasses.asdict(result) for result in results]
     report["median_best_epoch"] = int(np.median([
         int(result.best_epoch) for result in results
