@@ -20,6 +20,18 @@ RELEASE_GATES = {
 }
 
 
+def distance_calibration_is_safe(before, after, tolerance=1e-12):
+    """Accept calibration only when every reported point metric is preserved."""
+    return (
+        float(after["distance_file_macro_within_200"]) + tolerance
+        >= float(before["distance_file_macro_within_200"])
+        and float(after["distance_exact_within_200"]) + tolerance
+        >= float(before["distance_exact_within_200"])
+        and float(after["distance_interval_mae_km"])
+        <= float(before["distance_interval_mae_km"]) + tolerance
+    )
+
+
 def _safe_ratio(numerator, denominator):
     return float(numerator / denominator) if denominator else 0.0
 

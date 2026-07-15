@@ -22,7 +22,12 @@ from distance_ordinal import (
     decode_distance_distribution,
     fit_interval_temperature_grid,
 )
-from evaluation import evaluate_predictions, evaluate_release, file_bootstrap_metrics
+from evaluation import (
+    distance_calibration_is_safe,
+    evaluate_predictions,
+    evaluate_release,
+    file_bootstrap_metrics,
+)
 from models import create_mtl_model
 from open_set import decode_with_rejection, fit_feature_reference, fit_rejection_policy
 from training_engine import conditional_train_step
@@ -362,7 +367,12 @@ def run_conditional_training(args, device):
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.cuda.amp.GradScaler(enabled=cuda and not args.no_amp)
+    amp_enabled = cuda and not args.no_amp
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    except (AttributeError, TypeError):
+        # Compatibility with PyTorch releases that predate torch.amp.GradScaler.
+        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     type_criterion = nn.CrossEntropyLoss()
     start_epoch, best_score, best_state, wait = 0, None, None, 0
     initialized_layers = []
@@ -472,11 +482,33 @@ def run_conditional_training(args, device):
     validation_bundle = collect_prediction_bundle(
         model, val_loader, device, split_manifest["split_hashes"]["val"]
     )
-    distance_temperatures = fit_distance_temperatures(validation_bundle)
-    apply_distance_temperatures(validation_bundle, distance_temperatures)
+    uncalibrated_distance_metrics = evaluate_predictions(
+        validation_bundle["records"]
+    )
+    fitted_distance_temperatures = fit_distance_temperatures(validation_bundle)
+    apply_distance_temperatures(
+        validation_bundle, fitted_distance_temperatures
+    )
+    calibrated_distance_metrics = evaluate_predictions(
+        validation_bundle["records"]
+    )
+    distance_calibration_safe = distance_calibration_is_safe(
+        uncalibrated_distance_metrics, calibrated_distance_metrics
+    )
+    if distance_calibration_safe:
+        distance_temperatures = fitted_distance_temperatures
+    else:
+        distance_temperatures = [1.0] * len(TYPE_NAMES)
+        apply_distance_temperatures(validation_bundle, distance_temperatures)
+        LOGGER.warning(
+            "Distance temperature calibration was discarded because validation "
+            "point metrics regressed"
+        )
     metadata["distance_calibration"] = {
-        "method": "interval_nll_temperature_v1",
+        "method": "interval_nll_temperature_guarded_v2",
         "temperatures": distance_temperatures,
+        "fitted_temperatures": fitted_distance_temperatures,
+        "point_metric_guard_passed": distance_calibration_safe,
         "calibration_split_hash": split_manifest["split_hashes"]["val"],
     }
     reference_sampler = ConditionBalancedSampler(

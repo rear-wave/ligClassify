@@ -1,6 +1,7 @@
 import pytest
 
 from evaluation import (
+    distance_calibration_is_safe,
     evaluate_predictions,
     evaluate_release,
     file_bootstrap_metrics,
@@ -147,3 +148,25 @@ def test_release_uses_file_macro_precision_when_available():
 
     assert passed is False
     assert any("type_file_macro_precision[0]" in reason for reason in reasons)
+
+
+def test_distance_calibration_must_not_degrade_point_metrics():
+    before = {
+        "distance_file_macro_within_200": 0.80,
+        "distance_exact_within_200": 0.82,
+        "distance_interval_mae_km": 120.0,
+    }
+
+    assert distance_calibration_is_safe(before, dict(before))
+    assert not distance_calibration_is_safe(before, {
+        **before,
+        "distance_file_macro_within_200": 0.79,
+    })
+    assert not distance_calibration_is_safe(before, {
+        **before,
+        "distance_exact_within_200": 0.81,
+    })
+    assert not distance_calibration_is_safe(before, {
+        **before,
+        "distance_interval_mae_km": 121.0,
+    })
