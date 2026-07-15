@@ -12,6 +12,8 @@
 
 import numpy as np
 
+from data.waveform_quality import waveform_quality_batch
+
 
 def butterworth_filter(piece, fc=120000, fs=5000000, order=2):
     """
@@ -282,3 +284,69 @@ def preprocess_batch(pieces, use_filter=True, cut_peak=True,
         pieces = normalize_minmax_batch(pieces)
 
     return pieces
+
+
+def _fixed_windows(pieces, peak_indices, before=2000, target_length=8000):
+    """Gather fixed windows with deterministic boundary clamping."""
+    count, width = pieces.shape
+    result = np.zeros((count, target_length), dtype=np.float32)
+    for row, peak_index in enumerate(peak_indices):
+        begin = int(peak_index) - before
+        begin = min(max(begin, 0), max(width - target_length, 0))
+        segment = pieces[row, begin:begin + target_length]
+        result[row, :len(segment)] = segment
+    return result
+
+
+def _resize_global_view(pieces, target_length=8000):
+    """Downsample the full piece without cropping its propagation tail."""
+    count, width = pieces.shape
+    if width == target_length:
+        return pieces.astype(np.float32, copy=True)
+    if width == target_length * 2:
+        return pieces.reshape(count, target_length, 2).mean(axis=2).astype(np.float32)
+    source = np.linspace(0.0, 1.0, width, dtype=np.float64)
+    target = np.linspace(0.0, 1.0, target_length, dtype=np.float64)
+    return np.stack([
+        np.interp(target, source, row).astype(np.float32)
+        for row in pieces
+    ])
+
+
+def robust_signed_scale_batch(pieces, percentile=99.5, clip=4.0):
+    """Scale each centred waveform by a robust absolute amplitude."""
+    scale = np.percentile(np.abs(pieces), percentile, axis=1, keepdims=True)
+    peak = np.max(np.abs(pieces), axis=1, keepdims=True)
+    scale = np.where(scale > 1e-6, scale, peak)
+    scale = np.where(scale > 1e-6, scale, 1.0)
+    normalized = pieces / scale
+    return np.clip(normalized, -clip, clip).astype(np.float32)
+
+
+def preprocess_multiscale_batch(
+    pieces,
+    use_filter=True,
+    target_length=8000,
+):
+    """Return signed local and full-piece views for conditional models."""
+    pieces = np.asarray(pieces, dtype=np.float32)
+    if pieces.ndim == 1:
+        pieces = pieces.reshape(1, -1)
+    if pieces.ndim != 2 or pieces.shape[1] == 0:
+        raise ValueError("pieces must have shape (N, T) with T > 0")
+    if use_filter:
+        pieces = butterworth_filter_batch(pieces)
+    baseline = np.median(pieces, axis=1, keepdims=True)
+    centered = pieces - baseline
+    peak_indices = np.argmax(np.abs(centered), axis=1)
+    local = _fixed_windows(
+        centered,
+        peak_indices,
+        before=target_length // 4,
+        target_length=target_length,
+    )
+    global_view = _resize_global_view(centered, target_length=target_length)
+    return (
+        robust_signed_scale_batch(local),
+        robust_signed_scale_batch(global_view),
+    )
