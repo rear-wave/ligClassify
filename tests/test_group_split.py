@@ -111,3 +111,14 @@ def test_group_split_balances_piece_counts_inside_a_stratum():
         for name, selected in splits.items()
     }
     assert sum(errors.values()) <= 500, errors
+
+
+def test_three_file_condition_is_reserved_once_per_split():
+    entries = make_entries(files_per_stratum=3)
+    _, group_split = modules()
+
+    splits = group_split.group_stratified_split(entries, 0.15, 0.15, seed=9)
+
+    expected = {stratum(entry) for entry in entries}
+    for split_name in ("train", "val", "test"):
+        assert {stratum(entry) for entry in splits[split_name]} == expected

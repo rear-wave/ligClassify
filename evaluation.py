@@ -105,6 +105,30 @@ def evaluate_predictions(records):
     file_type_accuracy = [
         float(raw_correct[positions].mean()) for positions in by_file.values()
     ]
+    file_macro_precision, file_macro_recall = [], []
+    for lightning_type in range(len(TYPE_NAMES)):
+        precision_values, recall_values = [], []
+        for positions in by_file.values():
+            positions = np.asarray(positions, dtype=np.int64)
+            predicted = accepted[positions] & (
+                predicted_types[positions] == lightning_type
+            )
+            actual = true_types[positions] == lightning_type
+            if predicted.any():
+                precision_values.append(float(np.mean(
+                    true_types[positions][predicted] == lightning_type
+                )))
+            if actual.any():
+                recall_values.append(float(np.mean(
+                    accepted[positions][actual]
+                    & (predicted_types[positions][actual] == lightning_type)
+                )))
+        file_macro_precision.append(
+            float(np.mean(precision_values)) if precision_values else 0.0
+        )
+        file_macro_recall.append(
+            float(np.mean(recall_values)) if recall_values else 0.0
+        )
 
     interval_summary = _distance_summary(records)
     exact_summary = _distance_summary(records, exact_only=True)
@@ -158,6 +182,9 @@ def evaluate_predictions(records):
         "type_precision": precision,
         "type_recall": recall,
         "type_macro_recall": float(np.mean(recall)),
+        "type_file_macro_precision": file_macro_precision,
+        "type_file_macro_recall": file_macro_recall,
+        "type_file_macro_recall_mean": float(np.mean(file_macro_recall)),
         "distance_interval_count": interval_summary["count"],
         "distance_coverage": interval_summary["coverage"],
         "distance_interval_mae_km": interval_summary["mae_km"],
@@ -221,9 +248,24 @@ def evaluate_release(candidate, baseline=None, subgroup_tolerance=0.02):
             )
     if len(candidate.get("type_precision", [])) != 4:
         reasons.append("four per-type precision values are required")
+    file_precision = candidate.get("type_file_macro_precision")
+    if file_precision is not None:
+        for index, value in enumerate(file_precision):
+            if float(value) < RELEASE_GATES["min_per_type_precision"]:
+                reasons.append(
+                    f"type_file_macro_precision[{index}]={float(value):.4f} below "
+                    f"{RELEASE_GATES['min_per_type_precision']:.2f}"
+                )
+        if len(file_precision) != 4:
+            reasons.append("four file-macro precision values are required")
     for key, gate_key in (
         ("type_coverage", "min_coverage"),
-        ("type_macro_recall", "min_macro_recall"),
+        (
+            "type_file_macro_recall_mean"
+            if "type_file_macro_recall_mean" in candidate
+            else "type_macro_recall",
+            "min_macro_recall",
+        ),
         ("distance_exact_within_200", "min_exact_within_200"),
     ):
         value = float(candidate.get(key, 0.0))

@@ -99,7 +99,7 @@ def collect_prediction_bundle(model, loader, device, split_hash):
     model.eval()
     records = []
     logits_parts, feature_parts, label_parts, quality_parts = [], [], [], []
-    distance_parts, low_parts, high_parts = [], [], []
+    distance_parts, low_parts, high_parts, file_id_parts = [], [], [], []
     for batch in loader:
         batch = _move_batch(batch, device)
         features, type_logits, distance_logits, _ = model.forward_with_features(
@@ -121,6 +121,7 @@ def collect_prediction_bundle(model, loader, device, split_hash):
         distance_parts.append(stacked_distance.cpu())
         low_parts.append(batch["distance_low_km"].cpu())
         high_parts.append(batch["distance_high_km"].cpu())
+        file_id_parts.append(batch["file_id"].cpu())
         for row in range(len(predicted)):
             records.append({
                 "file_id": int(batch["file_id"][row].item()),
@@ -144,6 +145,7 @@ def collect_prediction_bundle(model, loader, device, split_hash):
         "distance_logits": torch.cat(distance_parts),
         "distance_low_km": torch.cat(low_parts),
         "distance_high_km": torch.cat(high_parts),
+        "file_ids": torch.cat(file_id_parts),
     }
 
 
@@ -499,6 +501,7 @@ def run_conditional_training(args, device):
             target_precision=args.rejection_target_precision,
             min_coverage=args.rejection_min_coverage,
             calibration_split_hash=split_manifest["split_hashes"]["val"],
+            groups=validation_bundle["file_ids"],
         )
         apply_rejection_policy(validation_bundle, policy)
         metadata["type_rejection"] = policy
@@ -540,6 +543,13 @@ def run_conditional_training(args, device):
     else:
         with Path(args.baseline_metrics).open("r", encoding="utf-8") as handle:
             baseline = json.load(handle)
+        if "models" in baseline:
+            if args.baseline_model_name not in baseline["models"]:
+                raise ValueError(
+                    f"baseline model {args.baseline_model_name!r} is not in "
+                    f"{args.baseline_metrics}"
+                )
+            baseline = baseline["models"][args.baseline_model_name]
         passed, reasons = evaluate_release(metrics, baseline)
     checkpoint = {**metadata, "model_state_dict": best_state}
     torch.save(checkpoint, output / "candidate.pt")

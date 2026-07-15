@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -58,14 +57,6 @@ def _fit_temperature(logits, labels):
     return float(candidates[int(losses.argmin())].item())
 
 
-def _threshold_values(values, lower_is_stricter):
-    array = np.asarray(values, dtype=np.float64)
-    quantiles = np.unique(np.quantile(array, np.linspace(0.0, 1.0, 11)))
-    if lower_is_stricter:
-        return sorted(quantiles.tolist(), reverse=True)
-    return sorted(quantiles.tolist())
-
-
 def waveform_quality_score(quality):
     """Compress waveform diagnostics to a bounded higher-is-better score."""
     quality = _as_float_tensor(quality)
@@ -87,6 +78,7 @@ def _fit_joint_thresholds(
     distance,
     quality,
     correct,
+    weights,
     true_count,
     target_precision,
     recall_floor,
@@ -118,7 +110,11 @@ def _fit_joint_thresholds(
         if not accepted_count:
             return
         correct_count = int((accepted & correct).sum().item())
-        precision = correct_count / accepted_count
+        accepted_weight = weights[accepted].sum().clamp_min(1e-8)
+        precision = float(
+            (weights[accepted] * correct[accepted].to(weights.dtype)).sum().item()
+            / accepted_weight.item()
+        )
         recall = correct_count / true_count
         if precision < target_precision:
             return
@@ -167,6 +163,7 @@ def fit_rejection_policy(
     target_precision=0.95,
     min_coverage=0.80,
     calibration_split_hash="",
+    groups=None,
 ):
     """Maximize validation coverage under per-type precision constraints."""
     logits = _as_float_tensor(logits)
@@ -188,6 +185,13 @@ def fit_rejection_policy(
         quality_score = waveform_quality_score(quality)
         if len(quality_score) != len(labels):
             raise ValueError("quality must align with logits and labels")
+    groups_are_files = groups is not None
+    if groups is None:
+        groups = torch.arange(len(labels), dtype=torch.long)
+    else:
+        groups = torch.as_tensor(groups, dtype=torch.long).detach().cpu()
+        if groups.ndim != 1 or len(groups) != len(labels):
+            raise ValueError("groups must align with logits and labels")
     num_types = logits.shape[1]
     temperature = _fit_temperature(logits, labels)
     predicted, confidence, margin, distance = _type_signals(
@@ -213,12 +217,17 @@ def fit_rejection_policy(
             raise ValueError(f"type {type_idx} has no correct validation prediction")
 
         class_positions = torch.nonzero(predicted_mask, as_tuple=False).flatten()
+        _, inverse, group_counts = torch.unique(
+            groups[class_positions], return_inverse=True, return_counts=True
+        )
+        file_equal_weights = 1.0 / group_counts[inverse].to(torch.float32)
         fitted = _fit_joint_thresholds(
             confidence[class_positions],
             margin[class_positions],
             distance[class_positions],
             quality_score[class_positions],
             labels[class_positions] == type_idx,
+            file_equal_weights,
             true_count,
             target_precision,
             recall_floor,
@@ -269,6 +278,9 @@ def fit_rejection_policy(
         "minimum_coverage": float(min_coverage),
         "calibration_split_hash": str(calibration_split_hash),
         "quality_score": "snr_unclipped_stable_v1",
+        "precision_weighting": (
+            "equal_source_file_v1" if groups_are_files else "piece_v1"
+        ),
     }
 
 

@@ -1,44 +1,45 @@
 # Repository Guidelines
 
-## Project Structure
+## Project Structure & Architecture
 
-This repository is a PyTorch classifier for binary `.lig` lightning waveforms.
+This repository classifies binary `.lig` lightning waveforms with PyTorch.
 
-- `train.py` builds piece-level train/validation/test views and trains the type and distance heads.
-- `classify.py` is the production inference entry point. It preserves original piece bytes and writes an audit CSV.
-- `models.py` defines the 1D ResNet architectures. `distance_ordinal.py` handles distance objectives, `distance_metrics.py` handles equal-bin evaluation, and `open_set.py` handles four-class calibration and rejection.
-- `data/` contains parsing, preprocessing, manifest, and sampling code.
-- `tests/` contains synthetic unit tests. Do not add real waveform files as fixtures.
-- `weights/old/` and `weights/four_class/` contain local deployment weights and are ignored by Git.
+- `train.py` launches the conditional-expert training pipeline; `conditional_pipeline.py` owns split, training, calibration, and checkpoint orchestration.
+- `classify.py` performs bounded, byte-preserving production inference and writes `predictions.csv`.
+- `models.py`, `training_engine.py`, `distance_ordinal.py`, `open_set.py`, and `evaluation.py` contain model, loss, rejection, and release logic.
+- `data/` contains LIG parsing, signed local/global preprocessing, manifests, file-isolated splitting, datasets, sampling, and audit artifacts.
+- `audit_data.py` validates data without training. `benchmark.py` compares structured checkpoints on one locked split.
+- `tests/` uses synthetic fixtures only. Local datasets and weights belong under `../train_data/` and `weights/`; both are ignored by Git.
 
-The local dataset is `../train_data/`. Training reads only `NCG`, `NNBE`, `PCG`, and `PNBE`; the low-quality `IC` folder is excluded.
+Training includes only `NCG`, `NNBE`, `PCG`, and `PNBE`. `IC` is an inference-only rejection result, never a training class.
 
-## Development Commands
+## Build, Test, and Development Commands
 
-Install dependencies in the active environment:
+Install dependencies in the active `ligclassify` environment:
 
 ```powershell
-pip install numpy torch scikit-learn tqdm pytest
+pip install numpy scipy torch scikit-learn tqdm pytest
 ```
 
-Common commands:
+Run the standard workflow:
 
 ```powershell
-python train.py --help
-python train.py --task_data ..\train_data --output .\weights\four_class --no_init --baseline_metrics .\weights\old\four_class_baseline.json
-python classify.py --input_dir <lig-dir> --output_dir .\classified --type_only --model .\weights\four_class\model.pt
+python audit_data.py --task_data ..\train_data --output .\weights\conditional\data_audit.json
+python train.py --task_data ..\train_data --output .\weights\conditional --no_init
+python classify.py --model .\weights\conditional\candidate.pt --input_dir <lig-dir> --output_dir .\classified
+python benchmark.py --split_manifest .\weights\conditional\split_manifest.json --model old=.\weights\old\model.pt --model candidate=.\weights\conditional\candidate.pt
 python -m pytest -q
 python -m compileall -q .
 ```
 
-Training expands each valid file into `(filepath, piece_index)` identities. Within every `(type, distance_bin)` group, pieces are sorted by their binary timestamp and split into earliest 70% training, middle 15% validation, and latest 15% test views. Files may occur in several views, but piece identities must remain disjoint. Shared-file evaluation measures held-out pieces and must not be described as cross-file generalization. The four researched types are sampled equally. Random initialization is the default; `--init_model <path>` explicitly warm-starts compatible encoder tensors. Every run writes `candidate.pt`; promotion also requires the baseline metrics file. During four-class inference, `IC` means rejected/not researched, and calibrated per-type thresholds replace `--min_type_confidence`.
+Random initialization is the default. Use `--init_model` only for an explicit warm start and `--resume .\weights\conditional\latest.pt` only for exact continuation. Source files are never shared across train, validation, and test; splits balance type, daylight, and coarse distance without forcing year boundaries. Promotion requires calibrated rejection, all release gates, and same-split baseline metrics.
 
-## Style and Tests
+## Coding Style & Testing
 
-Use four-space indentation, `snake_case` functions and variables, `PascalCase` classes, and `UPPER_CASE` constants. Keep CLI orchestration out of `data/`. Add type hints and short docstrings to reusable public helpers.
+Use four-space indentation, `snake_case` functions/variables, `PascalCase` classes, and `UPPER_CASE` constants. Add type hints and short docstrings to reusable public helpers. Keep CLI orchestration outside `data/`.
 
-Name tests `test_<module>.py`. Cover parsing, piece-identity isolation, distance-bin coverage, sampler balance, output shape, checkpoint compatibility, routing, and raw-byte preservation. Before handoff, run the full test suite, compile check, and a bounded smoke test.
+Name tests `test_<module>.py`. Cover parsing, file isolation, interval labels, polarity, sampler balance, expert routing, calibration, checkpoint compatibility, bounded inference, and raw-byte preservation. Never add real waveforms as fixtures.
 
-## Commits and Data Safety
+## Commits, Pull Requests, and Data Safety
 
-Use concise imperative commit subjects, such as `Add hybrid distance routing`. Pull requests should state the change, verification commands, required weights/data, and relevant metrics. Never commit `.lig` datasets, checkpoints, credentials, generated classifications, or machine-specific absolute paths.
+Use concise imperative commit subjects, such as `Add conditional expert inference`. Pull requests must list verification commands, required local data/weights, split hashes, and relevant validation/test metrics. Never commit `.lig` data, checkpoints, generated classifications, credentials, or machine-specific paths.

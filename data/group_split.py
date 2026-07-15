@@ -39,11 +39,25 @@ def _split_counts(size: int, val_fraction: float, test_fraction: float):
     if np.any(fractions < 0) or not np.isclose(fractions.sum(), 1.0):
         raise ValueError("train, validation, and test fractions must be non-negative")
     raw = fractions * size
-    counts = np.floor(raw).astype(np.int64)
+    positive = np.flatnonzero(fractions > 0)
+    counts = np.zeros(3, dtype=np.int64)
+    if size >= len(positive):
+        counts[positive] = 1
+    else:
+        order = sorted(positive.tolist(), key=lambda index: (-fractions[index], index))
+        counts[order[:size]] = 1
+        return tuple(int(value) for value in counts)
     remaining = size - int(counts.sum())
-    order = sorted(range(3), key=lambda index: (-(raw[index] - counts[index]), index))
-    for index in order[:remaining]:
+    while remaining:
+        index = min(
+            positive,
+            key=lambda candidate: (
+                -(raw[candidate] - counts[candidate]),
+                candidate,
+            ),
+        )
         counts[index] += 1
+        remaining -= 1
     return tuple(int(value) for value in counts)
 
 

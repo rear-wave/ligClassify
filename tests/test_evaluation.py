@@ -32,12 +32,13 @@ def make_record(
 
 def test_file_macro_prevents_one_large_file_from_dominating():
     records = [make_record("large", 0, 0) for _ in range(100)]
-    records.append(make_record("small", 0, 1))
+    records.append(make_record("small", 1, 0))
 
     metrics = evaluate_predictions(records)
 
     assert metrics["type_piece_accuracy"] > 0.99
     assert metrics["type_file_macro_accuracy"] == pytest.approx(0.5)
+    assert metrics["type_file_macro_precision"][0] == pytest.approx(0.5)
 
 
 def test_distance_reports_type_daylight_and_coarse_band_groups():
@@ -136,3 +137,13 @@ def test_release_rejects_reported_subgroup_regression():
 
     assert passed is False
     assert any("subgroup regression" in reason for reason in reasons)
+
+
+def test_release_uses_file_macro_precision_when_available():
+    candidate = good_release_metrics()
+    candidate["type_file_macro_precision"] = [0.90, 0.97, 0.98, 0.99]
+
+    passed, reasons = evaluate_release(candidate, good_release_metrics())
+
+    assert passed is False
+    assert any("type_file_macro_precision[0]" in reason for reason in reasons)
