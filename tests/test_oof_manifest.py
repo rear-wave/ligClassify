@@ -104,6 +104,32 @@ def test_expected_oof_rows_expand_canonical_fold_paths():
     }
 
 
+def test_expected_oof_rows_normalizes_foreign_source_separators():
+    manifest = {
+        "schema": "file_isolated_exact_interval_cv_v1",
+        "folds": {
+            "0": [
+                {
+                    "path": r"NCG\day/0-100km\a.lig",
+                    "n_pieces": 1,
+                    "type_idx": 0,
+                }
+            ]
+        },
+    }
+
+    expected = expected_oof_rows(manifest)
+
+    assert expected == {
+        "NCG/day/0-100km/a.lig#0": {
+            "fold": 0,
+            "type_idx": 0,
+            "source_path": "NCG/day/0-100km/a.lig",
+            "piece_index": 0,
+        }
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

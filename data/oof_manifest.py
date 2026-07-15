@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
-from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 
 TRAINING_TYPE_COUNT = 4
 
 
-def oof_row_id(relative_path: str | Path, piece_index: int) -> str:
+def _canonical_source_path(path: str | os.PathLike[str]) -> str:
+    """Normalize native or foreign separators to the artifact path format."""
+    return PurePosixPath(os.fspath(path).replace("\\", "/")).as_posix()
+
+
+def oof_row_id(relative_path: str | os.PathLike[str], piece_index: int) -> str:
     """Return the source-relative identity for one waveform piece."""
-    return f"{Path(relative_path).as_posix()}#{int(piece_index)}"
+    return f"{_canonical_source_path(relative_path)}#{int(piece_index)}"
 
 
 def expected_oof_rows(fold_manifest: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -27,7 +33,7 @@ def expected_oof_rows(fold_manifest: Mapping[str, Any]) -> dict[str, dict[str, A
     for fold_text, files in sorted(folds.items(), key=lambda item: int(item[0])):
         fold = int(fold_text)
         for file_row in files:
-            source_path = Path(file_row["path"]).as_posix()
+            source_path = _canonical_source_path(file_row["path"])
             type_idx = int(file_row["type_idx"])
             if not 0 <= type_idx < TRAINING_TYPE_COUNT:
                 raise ValueError(f"unexpected OOF training type: {type_idx}")
