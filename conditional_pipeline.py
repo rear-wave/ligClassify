@@ -18,7 +18,10 @@ from data.group_split import group_stratified_split, validate_group_split
 from data.split_artifacts import build_data_audit, make_split_manifest, write_json
 from data.training_dataset import LightningPieceDataset, collate_training_batch
 from data.training_manifest import build_manifest, build_piece_manifest
-from distance_ordinal import decode_distance_distribution
+from distance_ordinal import (
+    decode_distance_distribution,
+    fit_interval_temperature_grid,
+)
 from evaluation import evaluate_predictions, evaluate_release, file_bootstrap_metrics
 from models import create_mtl_model
 from open_set import decode_with_rejection, fit_feature_reference, fit_rejection_policy
@@ -96,6 +99,7 @@ def collect_prediction_bundle(model, loader, device, split_hash):
     model.eval()
     records = []
     logits_parts, feature_parts, label_parts, quality_parts = [], [], [], []
+    distance_parts, low_parts, high_parts = [], [], []
     for batch in loader:
         batch = _move_batch(batch, device)
         features, type_logits, distance_logits, _ = model.forward_with_features(
@@ -114,6 +118,9 @@ def collect_prediction_bundle(model, loader, device, split_hash):
         feature_parts.append(features.cpu())
         label_parts.append(batch["type_label"].cpu())
         quality_parts.append(batch["quality"].cpu())
+        distance_parts.append(stacked_distance.cpu())
+        low_parts.append(batch["distance_low_km"].cpu())
+        high_parts.append(batch["distance_high_km"].cpu())
         for row in range(len(predicted)):
             records.append({
                 "file_id": int(batch["file_id"][row].item()),
@@ -134,6 +141,9 @@ def collect_prediction_bundle(model, loader, device, split_hash):
         "features": torch.cat(feature_parts),
         "labels": torch.cat(label_parts),
         "quality": torch.cat(quality_parts),
+        "distance_logits": torch.cat(distance_parts),
+        "distance_low_km": torch.cat(low_parts),
+        "distance_high_km": torch.cat(high_parts),
     }
 
 
@@ -167,6 +177,51 @@ def apply_rejection_policy(bundle, policy):
         record["feature_distance"] = float(decoded["feature_distance"][row].item())
         record["quality_score"] = float(decoded["quality_score"][row].item())
     return decoded
+
+
+def fit_distance_temperatures(bundle):
+    """Fit one interval-likelihood temperature per true-type expert."""
+    temperatures = []
+    valid = (
+        (bundle["distance_low_km"] >= 0)
+        & (bundle["distance_high_km"] > bundle["distance_low_km"])
+    )
+    rows = torch.arange(len(bundle["labels"]))
+    oracle_logits = bundle["distance_logits"][rows, bundle["labels"]]
+    for type_index in range(4):
+        selected = valid & (bundle["labels"] == type_index)
+        if not selected.any():
+            raise ValueError(
+                f"validation split has no distance interval for type {type_index}"
+            )
+        temperatures.append(fit_interval_temperature_grid(
+            oracle_logits[selected],
+            bundle["distance_low_km"][selected],
+            bundle["distance_high_km"][selected],
+        ))
+    return temperatures
+
+
+def apply_distance_temperatures(bundle, temperatures):
+    """Re-decode routed and oracle distances with validation temperatures."""
+    temperatures = torch.as_tensor(temperatures, dtype=torch.float32)
+    labels = bundle["labels"]
+    predicted = torch.as_tensor(
+        [record["predicted_type"] for record in bundle["records"]],
+        dtype=torch.long,
+    )
+    rows = torch.arange(len(labels))
+    routed_logits = bundle["distance_logits"][rows, predicted]
+    oracle_logits = bundle["distance_logits"][rows, labels]
+    routed = decode_distance_distribution(
+        routed_logits / temperatures[predicted].unsqueeze(1)
+    )
+    oracle = decode_distance_distribution(
+        oracle_logits / temperatures[labels].unsqueeze(1)
+    )
+    for row, record in enumerate(bundle["records"]):
+        record["predicted_distance_km"] = float(routed["expected_km"][row].item())
+        record["oracle_distance_km"] = float(oracle["expected_km"][row].item())
 
 
 def _selection_key(metrics):
@@ -326,7 +381,11 @@ def run_conditional_training(args, device):
         "dist_dropout": args.dist_dropout,
         "distance_bins": 30,
         "coarse_distance_bins": [0, 300, 600, 1200, 1700, 2400, 3000],
-        "preprocessing": {"name": "signed_multiscale_v1", "target_length": 8000},
+        "preprocessing": {
+            "name": "signed_multiscale_v1",
+            "target_length": 8000,
+            "use_filter": True,
+        },
         "split_config": {"strategy": "file_isolated_condition_v1", "files_may_overlap": False},
         "split_hashes": split_manifest["split_hashes"],
         "combined_split_hash": split_manifest["combined_split_hash"],
@@ -399,6 +458,13 @@ def run_conditional_training(args, device):
     validation_bundle = collect_prediction_bundle(
         model, val_loader, device, split_manifest["split_hashes"]["val"]
     )
+    distance_temperatures = fit_distance_temperatures(validation_bundle)
+    apply_distance_temperatures(validation_bundle, distance_temperatures)
+    metadata["distance_calibration"] = {
+        "method": "interval_nll_temperature_v1",
+        "temperatures": distance_temperatures,
+        "calibration_split_hash": split_manifest["split_hashes"]["val"],
+    }
     reference_sampler = ConditionBalancedSampler(
         train_set.type_labels,
         train_set.daylight,
@@ -450,6 +516,7 @@ def run_conditional_training(args, device):
         device,
         split_manifest["split_hashes"][evaluated_split],
     )
+    apply_distance_temperatures(evaluation_bundle, distance_temperatures)
     if policy is not None:
         apply_rejection_policy(evaluation_bundle, policy)
     metrics = evaluate_predictions(evaluation_bundle["records"])

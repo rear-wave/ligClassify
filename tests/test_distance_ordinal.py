@@ -7,6 +7,7 @@ from distance_ordinal import (
     decode_distance_distribution,
     decode_distance_logits,
     fit_temperature_grid,
+    fit_interval_temperature_grid,
     interval_distance_loss,
     is_meaningful_improvement,
     make_selection_key,
@@ -119,6 +120,24 @@ def test_temperature_grid_does_not_increase_nll():
 
     temperature = fit_temperature_grid(logits, targets)
     calibrated = F.cross_entropy(logits / temperature, targets)
+
+    assert 0.5 <= temperature <= 5.0
+    assert calibrated <= baseline + 1e-7
+
+
+def test_interval_temperature_grid_does_not_increase_interval_nll():
+    logits = torch.full((3, 30), -4.0)
+    logits[0, 20] = 8.0
+    logits[1, 5] = 8.0
+    logits[2, 8] = 8.0
+    low = torch.tensor([400, 500, 600])
+    high = torch.tensor([500, 600, 1200])
+    baseline = interval_distance_loss(logits, low, high, ordered_weight=0.0)[0]
+
+    temperature = fit_interval_temperature_grid(logits, low, high)
+    calibrated = interval_distance_loss(
+        logits / temperature, low, high, ordered_weight=0.0
+    )[0]
 
     assert 0.5 <= temperature <= 5.0
     assert calibrated <= baseline + 1e-7

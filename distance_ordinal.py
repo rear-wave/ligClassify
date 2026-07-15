@@ -210,6 +210,30 @@ def fit_temperature_grid(logits, targets):
     return best_temperature
 
 
+def fit_interval_temperature_grid(logits, low_km, high_km):
+    """Choose a validation-only temperature by interval negative likelihood."""
+    logits = logits.detach()
+    low_km = torch.as_tensor(low_km, device=logits.device).detach()
+    high_km = torch.as_tensor(high_km, device=logits.device).detach()
+    if not len(logits):
+        raise ValueError("interval temperature fitting requires labelled samples")
+    best_temperature = 1.0
+    best_loss = float(interval_distance_loss(
+        logits, low_km, high_km, ordered_weight=0.0
+    )[0].item())
+    for temperature in torch.arange(0.50, 5.01, 0.05).tolist():
+        loss = float(interval_distance_loss(
+            logits / temperature,
+            low_km,
+            high_km,
+            ordered_weight=0.0,
+        )[0].item())
+        if loss < best_loss:
+            best_loss = loss
+            best_temperature = float(temperature)
+    return best_temperature
+
+
 def select_confidence_threshold(confidence, error_bins, target_w2=0.8):
     """Maximize retained coverage subject to a validation w2 requirement."""
     confidence = torch.as_tensor(confidence, dtype=torch.float32)

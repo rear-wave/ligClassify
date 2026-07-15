@@ -58,6 +58,29 @@ def make_four_class_checkpoint(architecture="ordinal_v2"):
     }
 
 
+def make_conditional_checkpoint():
+    return {
+        "task_schema": "four_class_rejection_v2",
+        "model_name": "conditional_expert_v1",
+        "model_version": "conditional-test",
+        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
+        "rejected_type_name": "IC",
+        "combined_split_hash": "split-hash",
+        "type_rejection": {
+            "version": 2,
+            "temperature": 1.0,
+            "centroids": [[0.0, 0.0]] * 4,
+            "scales": [[1.0, 1.0]] * 4,
+            "probability_thresholds": [0.5] * 4,
+            "margin_thresholds": [0.1] * 4,
+            "distance_thresholds": [2.0] * 4,
+            "quality_thresholds": [0.1] * 4,
+            "calibration_split_hash": "validation-hash",
+        },
+        "distance_calibration": {"temperatures": [1.0] * 4},
+    }
+
+
 def test_load_checkpoint_selects_legacy_and_v2_architectures(tmp_path):
     legacy_path = tmp_path / "legacy.pt"
     v2_path = tmp_path / "v2.pt"
@@ -95,6 +118,97 @@ def test_four_class_rejection_routes_failed_feature_to_ic():
     assert predictions[0]["class_name"] == "IC"
     assert predictions[0]["rejection_reason"] == "feature_distance"
     assert predictions[0]["status"] == "rejected"
+
+
+def test_four_class_full_prediction_uses_per_type_distance_mode():
+    checkpoint = make_four_class_checkpoint()
+    checkpoint["distance_training"] = {
+        "prediction": "expected",
+        "prediction_by_type": {
+            "NCG": "argmax",
+            "NNBE": "argmax",
+            "PCG": "expected",
+            "PNBE": "expected",
+        },
+    }
+    checkpoint["distance_calibration"] = {
+        "temperatures": [1.0] * 4,
+        "confidence_threshold": 0.0,
+    }
+    distance_logits = [torch.full((1, 30), -20.0) for _ in range(4)]
+    distance_logits[0][0, 4] = 20.0
+
+    predictions = classify.decode_four_class_full_predictions(
+        torch.tensor([[8.0, 0.0, 0.0, 0.0]]),
+        torch.tensor([[0.0, 0.0]]),
+        distance_logits,
+        checkpoint,
+    )
+
+    assert predictions[0]["type"] == "NCG"
+    assert predictions[0]["bin_start_km"] == 400
+    assert predictions[0]["head_source"] == "single"
+    assert predictions[0]["rejection_reason"] == "accepted"
+
+
+def test_four_class_full_prediction_keeps_rejected_piece_without_distance():
+    checkpoint = make_four_class_checkpoint()
+    distance_logits = [torch.zeros(1, 30) for _ in range(4)]
+
+    predictions = classify.decode_four_class_full_predictions(
+        torch.tensor([[5.0, 0.0, 0.0, 0.0]]),
+        torch.tensor([[20.0, 20.0]]),
+        distance_logits,
+        checkpoint,
+    )
+
+    assert predictions[0]["type"] == "IC"
+    assert predictions[0]["distance_km"] is None
+    assert predictions[0]["class_name"] == "IC"
+
+
+def test_conditional_checkpoint_routes_context_expert_and_distance():
+    checkpoint = make_conditional_checkpoint()
+    distance_logits = [torch.full((1, 30), -20.0) for _ in range(4)]
+    distance_logits[0][0, 4] = 20.0
+
+    predictions = classify.decode_conditional_batch(
+        torch.tensor([[8.0, 0.0, 0.0, 0.0]]),
+        torch.tensor([[0.0, 0.0]]),
+        distance_logits,
+        quality=torch.tensor([[10.0, 0.0, 0.0]]),
+        checkpoint=checkpoint,
+        daylight=torch.tensor([1.0]),
+    )
+
+    assert predictions[0]["final_type"] == "NCG"
+    assert predictions[0]["expected_distance_km"] == pytest.approx(450.0)
+    assert predictions[0]["distance_low_km"] <= predictions[0]["distance_high_km"]
+    assert set(predictions[0]["type_probabilities"]) == {
+        "NCG", "NNBE", "PCG", "PNBE"
+    }
+    assert predictions[0]["model_version"] == "conditional-test"
+    assert predictions[0]["split_hash"] == "split-hash"
+
+
+def test_conditional_rejected_piece_has_no_distance_and_keeps_probabilities():
+    checkpoint = make_conditional_checkpoint()
+    distance_logits = [torch.zeros((1, 30)) for _ in range(4)]
+
+    prediction = classify.decode_conditional_batch(
+        torch.tensor([[8.0, 0.0, 0.0, 0.0]]),
+        torch.tensor([[0.0, 0.0]]),
+        distance_logits,
+        quality=torch.tensor([[0.1, 1.0, 20.0]]),
+        checkpoint=checkpoint,
+        daylight=torch.tensor([0.0]),
+    )[0]
+
+    assert prediction["final_type"] == prediction["class_name"] == "IC"
+    assert prediction["expected_distance_km"] is None
+    assert prediction["distance_low_km"] is None
+    assert len(prediction["type_probabilities"]) == 4
+    assert prediction["rejection_reason"] == "low_quality"
 
 
 def test_v2_route_marks_low_confidence_prediction_uncertain():
@@ -245,6 +359,27 @@ def test_type_only_cli_uses_one_explicit_checkpoint():
     assert args.min_type_confidence == 0.0
 
 
+def test_four_class_cli_uses_single_model_for_type_and_distance():
+    args = classify.build_arg_parser().parse_args([
+        "--input_dir", "input", "--output_dir", "output",
+        "--four_class", "--model", "candidate.pt",
+    ])
+
+    assert args.four_class is True
+    assert args.type_only is False
+    assert args.model == "candidate.pt"
+
+
+def test_single_checkpoint_is_default_and_legacy_hybrid_is_explicit():
+    args = classify.build_arg_parser().parse_args([
+        "--input_dir", "input", "--output_dir", "output",
+        "--model", "candidate.pt",
+    ])
+
+    assert args.legacy_hybrid is False
+    assert args.model == "candidate.pt"
+
+
 def test_four_class_checkpoint_rejects_legacy_confidence_override():
     with pytest.raises(ValueError, match="min_type_confidence"):
         classify.validate_type_only_options(
@@ -294,6 +429,20 @@ def test_prediction_csv_writer_has_reliability_columns(tmp_path):
         "feature_distance",
         "rejection_reason",
         "final_type",
+    }.issubset(row)
+    assert {
+        "prob_NCG",
+        "prob_NNBE",
+        "prob_PCG",
+        "prob_PNBE",
+        "expected_distance_km",
+        "distance_low_km",
+        "distance_high_km",
+        "daylight",
+        "snr_score",
+        "clipping_fraction",
+        "model_version",
+        "split_hash",
     }.issubset(row)
 
 
