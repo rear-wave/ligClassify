@@ -2,10 +2,55 @@ from datetime import datetime
 
 import numpy as np
 
+from data.augmentation import WaveformAugmentationConfig
+from data.distance_sampling import SampleRequest
 from data.lig_parser import LigFileIndex
 from data.training_dataset import LightningPieceDataset, collate_training_batch
 from data.training_manifest import PieceManifestEntry
 from tests.test_training_manifest import write_lig
+
+
+class OnePieceIndex:
+    def __init__(self, waveform):
+        self.filepaths = ["synthetic.lig"]
+        self.num_pieces_per_file = np.asarray([1], dtype=np.int64)
+        self._cumsum = np.asarray([0, 1], dtype=np.int64)
+        self.waveform = np.asarray(waveform, dtype=np.float32)
+
+    def read_pieces_batch(self, indices):
+        assert list(indices) == [0]
+        return [self.waveform.copy()]
+
+
+def dataset_item(split, request_seed):
+    waveform = np.zeros(16000, dtype=np.float32)
+    waveform[100:120] = np.linspace(1.0, 10.0, 20)
+    entry = PieceManifestEntry(
+        filepath="synthetic.lig",
+        piece_index=0,
+        type_idx=0,
+        dist_bin=0,
+        timestamp=datetime(2020, 1, 1, 4),
+        distance_low_km=0,
+        distance_high_km=100,
+        is_daytime=True,
+    )
+    dataset = LightningPieceDataset(
+        [entry],
+        split=split,
+        lig_index=OnePieceIndex(waveform),
+        use_filter=False,
+        augmentation=WaveformAugmentationConfig(noise_fraction=0.0),
+    )
+    return dataset[SampleRequest(position=0, augmentation_seed=request_seed)]
+
+
+def test_validation_dataset_ignores_augmentation_request():
+    train = dataset_item(split="train", request_seed=9)
+    first_val = dataset_item(split="val", request_seed=9)
+    second_val = dataset_item(split="val", request_seed=123)
+    assert not np.array_equal(train["local"].numpy(), first_val["local"].numpy())
+    assert np.array_equal(first_val["local"].numpy(), second_val["local"].numpy())
 
 
 def test_training_dataset_returns_multiscale_interval_and_audit_fields(tmp_path):

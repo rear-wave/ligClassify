@@ -9,6 +9,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from data.augmentation import WaveformAugmentationConfig, augment_waveforms
+from data.distance_sampling import SampleRequest
 from data.lig_parser import LigFileIndex
 from data.oof_manifest import oof_row_id
 from data.preprocessing import preprocess_multiscale_batch
@@ -26,10 +28,12 @@ class LightningPieceDataset(Dataset):
         lig_index=None,
         use_filter=True,
         data_root=None,
+        augmentation: WaveformAugmentationConfig | None = None,
     ):
         self.entries = list(entries)
         self.split = str(split)
         self.use_filter = bool(use_filter)
+        self.augmentation = augmentation
         paths = sorted({entry.filepath for entry in self.entries})
         absolute_paths = [os.path.abspath(path) for path in paths]
         if data_root is not None:
@@ -111,12 +115,34 @@ class LightningPieceDataset(Dataset):
         return len(self.global_indices)
 
     def _items_from_positions(self, positions):
-        positions = [int(position) for position in positions]
+        augmentation_rows = []
+        augmentation_seeds = []
+        resolved_positions = []
+        for row, request in enumerate(positions):
+            if isinstance(request, SampleRequest):
+                resolved_positions.append(int(request.position))
+                augmentation_rows.append(row)
+                augmentation_seeds.append(int(request.augmentation_seed))
+            else:
+                resolved_positions.append(int(request))
+        positions = resolved_positions
         global_indices = [int(self.global_indices[position]) for position in positions]
         raw = np.stack(self.lig.read_pieces_batch(global_indices), axis=0)
         quality = waveform_quality_batch(raw)
+        preprocessing_input = raw
+        if (
+            self.split == "train"
+            and self.augmentation is not None
+            and augmentation_rows
+        ):
+            preprocessing_input = raw.copy()
+            preprocessing_input[augmentation_rows] = augment_waveforms(
+                raw[augmentation_rows],
+                augmentation_seeds,
+                self.augmentation,
+            )
         local, global_view = preprocess_multiscale_batch(
-            raw,
+            preprocessing_input,
             use_filter=self.use_filter,
         )
         items = []
