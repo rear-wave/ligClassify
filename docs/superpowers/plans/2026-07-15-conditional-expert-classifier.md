@@ -264,7 +264,7 @@ Commit: `git commit -m Add-interval-distance-objective`
 **Interfaces:**
 - Produces: architecture name `conditional_expert_v1`
 - Produces: `ConditionalExpertNet.forward_with_features(local, global_view, context)` returning `(type_features, type_logits, distance_logits, coarse_logits)`
-- Distance and coarse outputs are lists of four tensors shaped `(N, 30)` and `(N, 5)`.
+- Distance and coarse outputs are lists of four tensors shaped `(N, 30)` and `(N, 6)`.
 
 - [ ] **Step 1: Write the failing architecture contract test**
 
@@ -277,7 +277,7 @@ def test_conditional_expert_output_contract():
     assert type_logits.shape == (3, 4)
     assert len(distance) == len(coarse) == 4
     assert all(x.shape == (3, 30) for x in distance)
-    assert all(x.shape == (3, 5) for x in coarse)
+    assert all(x.shape == (3, 6) for x in coarse)
 ```
 
 - [ ] **Step 2: Verify failure**
