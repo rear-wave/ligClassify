@@ -31,6 +31,9 @@ class ManifestEntry:
     dist_bin: int
     timestamp: datetime
     n_pieces: int
+    distance_low_km: int | None = None
+    distance_high_km: int | None = None
+    is_daytime: bool | None = None
 
     @property
     def acquisition_date(self):
@@ -46,6 +49,9 @@ class PieceManifestEntry:
     type_idx: int
     dist_bin: int
     timestamp: datetime
+    distance_low_km: int | None = None
+    distance_high_km: int | None = None
+    is_daytime: bool | None = None
 
     @property
     def identity(self):
@@ -69,6 +75,35 @@ def parse_distance_bin(path: str) -> int:
         ):
             valid.append(low // 100)
     return valid[-1] if valid else -1
+
+
+def parse_distance_interval(path: str) -> tuple[int, int] | None:
+    """Return the last valid 100-km-aligned distance interval in a path."""
+    valid = []
+    for match in _DISTANCE_RE.finditer(path):
+        low, high = int(match.group(1)), int(match.group(2))
+        if (
+            low % 100 == 0
+            and high % 100 == 0
+            and 0 <= low < high <= 3000
+        ):
+            valid.append((low, high))
+    return valid[-1] if valid else None
+
+
+def infer_daytime(path: str, timestamp: datetime) -> bool:
+    """Read an explicit day/night folder or infer it from UTC+8 local time."""
+    parts = {
+        part.lower()
+        for part in re.split(r"[\\/]", os.path.normpath(path))
+        if part
+    }
+    if "day" in parts:
+        return True
+    if "night" in parts:
+        return False
+    local_hour = (timestamp.hour + 8 + timestamp.minute / 60.0) % 24
+    return 5.5 <= local_hour < 19.0
 
 
 def parse_filename_timestamp(path: str) -> datetime:
@@ -131,10 +166,23 @@ def build_manifest(data_dir: str, type_names) -> tuple[list[ManifestEntry], dict
                     diagnostics["skipped_files"].append(filepath)
                     continue
 
-            dist_bin = (
-                -1 if type_name.upper() == "IC" else parse_distance_bin(filepath)
+            distance_interval = (
+                None
+                if type_name.upper() == "IC"
+                else parse_distance_interval(filepath)
             )
-            if dist_bin >= 0:
+            if distance_interval is None:
+                distance_low_km = None
+                distance_high_km = None
+                dist_bin = -1
+            else:
+                distance_low_km, distance_high_km = distance_interval
+                dist_bin = (
+                    distance_low_km // 100
+                    if distance_high_km - distance_low_km == 100
+                    else -1
+                )
+            if distance_interval is not None:
                 diagnostics["distance_labeled_files"] += 1
             else:
                 diagnostics["type_only_files"] += 1
@@ -145,6 +193,9 @@ def build_manifest(data_dir: str, type_names) -> tuple[list[ManifestEntry], dict
                     dist_bin=dist_bin,
                     timestamp=timestamp,
                     n_pieces=int(result["n_pieces"]),
+                    distance_low_km=distance_low_km,
+                    distance_high_km=distance_high_km,
+                    is_daytime=infer_daytime(filepath, timestamp),
                 )
             )
             diagnostics["valid_files"] += 1
@@ -170,6 +221,9 @@ def build_piece_manifest(file_entries):
                 type_idx=file_entry.type_idx,
                 dist_bin=file_entry.dist_bin,
                 timestamp=timestamp,
+                distance_low_km=file_entry.distance_low_km,
+                distance_high_km=file_entry.distance_high_km,
+                is_daytime=file_entry.is_daytime,
             )
             for piece_index, timestamp in enumerate(timestamps)
         )

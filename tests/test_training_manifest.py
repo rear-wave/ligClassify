@@ -110,6 +110,37 @@ def test_parse_distance_bin_accepts_only_exact_100km_ranges(path, expected):
     assert module.parse_distance_bin(path) == expected
 
 
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (r"NCG\day\day_400-500km\a.lig", (400, 500)),
+        (r"NNBE\night\night_1500-3000km\a.lig", (1500, 3000)),
+        (r"PNBE\day\0-300km\day_300-400km_events.lig", (300, 400)),
+        (r"NCG\day\a.lig", None),
+        (r"PCG\day\2950-3050km\a.lig", None),
+    ],
+)
+def test_parse_distance_interval_keeps_exact_and_broad_ranges(path, expected):
+    module = training_manifest_module()
+
+    assert module.parse_distance_interval(path) == expected
+
+
+def test_infer_daytime_prefers_explicit_folder_label():
+    module = training_manifest_module()
+    noon_utc = datetime(2019, 1, 1, 12, 0)
+
+    assert module.infer_daytime(r"NCG\day\0-100km\a.lig", noon_utc) is True
+    assert module.infer_daytime(r"NCG\night\0-100km\a.lig", noon_utc) is False
+
+
+def test_infer_daytime_falls_back_to_utc_plus_eight():
+    module = training_manifest_module()
+
+    assert module.infer_daytime("NCG/0-100km/a.lig", datetime(2019, 1, 1, 0)) is True
+    assert module.infer_daytime("NCG/0-100km/a.lig", datetime(2019, 1, 1, 16)) is False
+
+
 def test_build_manifest_falls_back_to_filename_timestamp(tmp_path):
     module = training_manifest_module()
     path = write_lig(
@@ -140,6 +171,22 @@ def test_four_class_manifest_treats_zero_index_ncg_as_distance_labelled(tmp_path
     assert entries[0].filepath == str(path)
     assert entries[0].type_idx == 0
     assert entries[0].dist_bin == 5
+    assert diagnostics["distance_labeled_files"] == 1
+
+
+def test_manifest_preserves_broad_interval_for_distance_training(tmp_path):
+    path = write_lig(
+        tmp_path / "NNBE" / "night" / "night_1500-3000km" / "sample.lig"
+    )
+
+    module = training_manifest_module()
+    entries, diagnostics = module.build_manifest(str(tmp_path), ["NNBE"])
+
+    assert entries[0].filepath == str(path)
+    assert entries[0].dist_bin == -1
+    assert entries[0].distance_low_km == 1500
+    assert entries[0].distance_high_km == 3000
+    assert entries[0].is_daytime is False
     assert diagnostics["distance_labeled_files"] == 1
 
 
