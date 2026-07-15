@@ -990,6 +990,16 @@ def build_arg_parser():
         action="store_true",
         help="Train all model parameters from random initialization",
     )
+    p.add_argument(
+        "--resume",
+        default="",
+        help="Exact conditional training checkpoint to resume; empty disables",
+    )
+    p.add_argument(
+        "--no_amp",
+        action="store_true",
+        help="Disable CUDA mixed precision (enabled by default)",
+    )
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=0.0003)
@@ -1056,6 +1066,12 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     if dev == "cuda":
         configure_cuda_backend(args.deterministic)
+
+    if args.model_arch == "conditional_expert_v1":
+        from conditional_pipeline import run_conditional_training
+
+        run_conditional_training(args, dev)
+        return
 
     logger.info(f"lambda_dist={args.lambda_dist}, soft_label={args.use_soft_distance_label}, "
                 f"soft_tau={args.distance_soft_tau}")

@@ -3,6 +3,25 @@
 import numpy as np
 
 
+def interval_distance_errors(predictions, low_km, high_km):
+    """Return distance to the nearest valid interval boundary in kilometres."""
+    predictions = np.asarray(predictions, dtype=np.float64)
+    low_km = np.asarray(low_km, dtype=np.float64)
+    high_km = np.asarray(high_km, dtype=np.float64)
+    if not (
+        predictions.ndim == low_km.ndim == high_km.ndim == 1
+        and predictions.shape == low_km.shape == high_km.shape
+    ):
+        raise ValueError("predictions and interval bounds must be aligned vectors")
+    if np.any((low_km < 0) | (high_km <= low_km)):
+        raise ValueError("distance intervals must be valid")
+    return np.maximum.reduce([
+        low_km - predictions,
+        predictions - high_km,
+        np.zeros_like(predictions),
+    ])
+
+
 def summarize_equal_bin_distance_predictions(predictions, targets):
     """Average metrics equally over populated true-distance bins."""
     predictions = np.asarray(predictions, dtype=np.int64)

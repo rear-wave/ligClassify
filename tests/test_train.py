@@ -152,6 +152,8 @@ def test_conditional_training_arguments_have_reliable_defaults():
     assert args.task_data == "../train_data"
     assert args.output == "./weights/conditional"
     assert args.init_model == ""
+    assert args.resume == ""
+    assert args.no_amp is False
     assert args.no_init is False
     assert args.min_type_precision == 0.85
     assert args.min_type_recall == 0.70
