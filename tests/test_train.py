@@ -131,12 +131,12 @@ def test_four_class_distance_loss_routes_zero_based_heads():
     )
 
 
-def test_v2_training_arguments_have_reliable_defaults():
+def test_conditional_training_arguments_have_reliable_defaults():
     args = train.build_arg_parser().parse_args([])
 
-    assert args.model_arch == "ordinal_v2"
-    assert args.distance_sampling == "hierarchical"
-    assert args.distance_objective == "ordinal"
+    assert args.model_arch == "conditional_expert_v1"
+    assert args.distance_sampling == "condition"
+    assert args.distance_objective == "interval"
     assert args.distance_prediction == "expected"
     assert args.distance_batch_size == 128
     assert args.max_distance_samples_per_file == 256
@@ -150,13 +150,34 @@ def test_v2_training_arguments_have_reliable_defaults():
     assert args.skip_test is False
     assert args.deterministic is False
     assert args.task_data == "../train_data"
-    assert args.output == "./weights/four_class"
+    assert args.output == "./weights/conditional"
     assert args.init_model == ""
     assert args.no_init is False
     assert args.min_type_precision == 0.85
     assert args.min_type_recall == 0.70
     assert args.baseline_metrics == ""
     assert train.build_arg_parser().parse_args(["--no_init"]).no_init is True
+
+
+def test_conditional_distance_loss_routes_true_type_and_broad_intervals():
+    distance_logits = [torch.zeros(4, 30, requires_grad=True) for _ in range(4)]
+    coarse_logits = [torch.zeros(4, 6, requires_grad=True) for _ in range(4)]
+    labels = torch.tensor([0, 1, 2, 3])
+    low = torch.tensor([0.0, 100.0, 600.0, 1500.0])
+    high = torch.tensor([300.0, 200.0, 1200.0, 3000.0])
+
+    loss, components = train.compute_conditional_distance_loss(
+        distance_logits,
+        coarse_logits,
+        labels,
+        low,
+        high,
+    )
+    loss.backward()
+
+    assert set(components) == {"interval", "coarse"}
+    assert all(head.grad[index].abs().sum() > 0 for index, head in enumerate(distance_logits))
+    assert all(head.grad[index].abs().sum() > 0 for index, head in enumerate(coarse_logits))
 
 
 def test_four_class_training_has_no_ic_sampling_argument():

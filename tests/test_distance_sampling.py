@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from data import distance_sampling
-from data.distance_sampling import HierarchicalDistanceSampler
+from data.distance_sampling import ConditionBalancedSampler, HierarchicalDistanceSampler
 
 
 def make_sampler(seed=7):
@@ -125,3 +125,53 @@ def test_distance_sampler_includes_zero_index_research_type():
     )
 
     assert set(sampler) == {0, 1, 2, 3}
+
+
+def make_condition_sampler(seed=23, distance_only=True):
+    return ConditionBalancedSampler(
+        type_labels=np.array([0, 0, 0, 0, 1, 1, 1, 1]),
+        daylight=np.array([0, 0, 1, 1, 0, 0, 1, 1]),
+        distance_low_km=np.array([0, 100, 600, 700, 1200, 1300, -1, 1700]),
+        distance_high_km=np.array([300, 200, 700, 800, 1300, 1400, -1, 2400]),
+        file_ids=np.array([0, 0, 1, 1, 2, 2, 3, 3]),
+        num_samples=8,
+        max_samples_per_file=2,
+        seed=seed,
+        distance_only=distance_only,
+    )
+
+
+def test_condition_sampler_includes_broad_intervals_and_excludes_missing_labels():
+    sampler = make_condition_sampler()
+
+    selected = list(sampler)
+
+    assert 0 in selected
+    assert 7 in selected
+    assert 6 not in selected
+    assert all(selected.count(index) == 1 for index in selected)
+    assert all(
+        sum(1 for index in selected if sampler.file_ids[index] == file_id) <= 2
+        for file_id in np.unique(sampler.file_ids)
+    )
+
+
+def test_condition_sampler_balances_available_conditions_and_is_deterministic():
+    first = make_condition_sampler()
+    second = make_condition_sampler()
+
+    first_selected = list(first)
+    second_selected = list(second)
+    assert first_selected == second_selected
+    keys = [first.condition_key(index) for index in first_selected]
+    counts = [keys.count(key) for key in set(keys)]
+    assert max(counts) - min(counts) <= 1
+
+    second.set_epoch(1)
+    assert first_selected != list(second)
+
+
+def test_condition_sampler_type_stream_keeps_unlabelled_examples():
+    sampler = make_condition_sampler(distance_only=False)
+
+    assert 6 in list(sampler)

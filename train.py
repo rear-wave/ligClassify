@@ -38,6 +38,10 @@ from distance_ordinal import (
     ordinal_distance_loss,
     select_confidence_threshold,
 )
+from training_engine import (
+    compute_conditional_distance_loss,
+    conditional_train_step,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -975,7 +979,7 @@ def save_candidate_and_maybe_promote(
 def build_arg_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--task_data", default="../train_data")
-    p.add_argument("--output", default="./weights/four_class")
+    p.add_argument("--output", default="./weights/conditional")
     p.add_argument(
         "--init_model",
         default="",
@@ -1005,8 +1009,11 @@ def build_arg_parser():
                    help="Use ordinal soft-label CE for distance")
     p.add_argument("--distance_soft_tau", type=float, default=1.0,
                    help="Tau for soft distance label")
-    p.add_argument("--model_arch", choices=["mtl_resnet", "ordinal_v2"],
-                   default="ordinal_v2")
+    p.add_argument(
+        "--model_arch",
+        choices=["mtl_resnet", "ordinal_v2", "conditional_expert_v1"],
+        default="conditional_expert_v1",
+    )
     p.add_argument("--distance_batch_size", type=int, default=128)
     p.add_argument("--type_samples_per_epoch", type=int, default=180000)
     p.add_argument("--distance_samples_per_epoch", type=int, default=60000)
@@ -1018,10 +1025,10 @@ def build_arg_parser():
     p.add_argument("--lambda_coarse", type=float, default=0.5)
     p.add_argument("--distance_batch_type_weight", type=float, default=0.1)
     p.add_argument("--distance_sampling",
-                   choices=["uniform", "hierarchical"],
-                   default="hierarchical")
-    p.add_argument("--distance_objective", choices=["ce", "ordinal"],
-                   default="ordinal")
+                   choices=["uniform", "hierarchical", "condition"],
+                   default="condition")
+    p.add_argument("--distance_objective", choices=["ce", "ordinal", "interval"],
+                   default="interval")
     p.add_argument("--distance_prediction", choices=["argmax", "expected"],
                    default="expected")
     p.add_argument("--skip_test", action="store_true",
