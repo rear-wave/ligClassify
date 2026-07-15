@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -72,6 +73,15 @@ STAGE_CONFIG_FIELDS = (
     "joint_distance_weight",
     "max_epochs",
     "patience",
+)
+FOLD_EVIDENCE_FILES = ("best.pt", "oof.csv", "fold_state.json")
+RAW_OOF_BOUND_FIELDS = (
+    "piece_key", "source_path", "piece_index", "fold", "true_type",
+    "logit_NCG", "logit_NNBE", "logit_PCG", "logit_PNBE",
+    "normalized_feature_distance", "quality_score",
+    "distance_low_km", "distance_high_km", "predicted_distance_km",
+    "oracle_distance_km", "distance_temperature", "daylight",
+    "support_status", "train_hash", "holdout_hash", "config_hash",
 )
 OOF_FIELDS = (
     "piece_key", "source_path", "piece_index", "fold", "true_type",
@@ -175,6 +185,90 @@ def _atomic_write_csv(path, rows, fieldnames):
         handle.flush()
         os.fsync(handle.fileno())
     temporary.replace(path)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fold_evidence_hashes(output_dir):
+    """Hash the canonical fold checkpoint, raw OOF, and state bytes."""
+    output_dir = Path(output_dir)
+    evidence = {}
+    for fold in range(3):
+        directory = output_dir / "folds" / f"fold_{fold}"
+        fold_evidence = {}
+        for name in FOLD_EVIDENCE_FILES:
+            path = directory / name
+            if not path.is_file():
+                raise ValueError(f"missing canonical fold evidence: fold {fold} {name}")
+            fold_evidence[name] = _sha256_file(path)
+        evidence[str(fold)] = fold_evidence
+    return evidence
+
+
+def _cuda_environment_identity():
+    """Return JSON-stable CUDA device and backend identity for exact resume."""
+    device_count = int(torch.cuda.device_count())
+    devices = []
+    for index in range(device_count):
+        devices.append({
+            "name": str(torch.cuda.get_device_name(index)),
+            "capability": [
+                int(value) for value in torch.cuda.get_device_capability(index)
+            ],
+        })
+    return {
+        "device_count": device_count,
+        "devices": devices,
+        "torch_version": str(torch.__version__),
+        "torch_cuda_version": str(torch.version.cuda),
+        "cudnn_version": torch.backends.cudnn.version(),
+        "cudnn_enabled": bool(torch.backends.cudnn.enabled),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+    }
+
+
+def _restore_resume_rng_state(resume_state, cuda):
+    """Strictly validate and restore RNG/environment for progressed latest state."""
+    try:
+        completed_epochs = int(resume_state["completed_epochs"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid latest fold completed_epochs for RNG restore") from exc
+    if completed_epochs <= 0:
+        return
+    if "torch_rng_state" not in resume_state:
+        raise ValueError("progressed latest checkpoint is missing torch_rng_state")
+    try:
+        torch.set_rng_state(resume_state["torch_rng_state"])
+    except (TypeError, RuntimeError) as exc:
+        raise ValueError("invalid latest checkpoint torch_rng_state") from exc
+    if not cuda:
+        return
+    if "cuda_rng_state_all" not in resume_state:
+        raise ValueError("progressed CUDA latest is missing cuda_rng_state_all")
+    saved_environment = resume_state.get("cuda_environment")
+    if not isinstance(saved_environment, Mapping):
+        raise ValueError("progressed CUDA latest is missing cuda_environment")
+    current_environment = _cuda_environment_identity()
+    if dict(saved_environment) != current_environment:
+        raise ValueError("progressed CUDA environment mismatch")
+    cuda_rng_state_all = resume_state["cuda_rng_state_all"]
+    if not isinstance(cuda_rng_state_all, (list, tuple)) or len(
+        cuda_rng_state_all
+    ) != int(current_environment["device_count"]):
+        raise ValueError("cuda_rng_state_all does not match CUDA device count")
+    try:
+        torch.cuda.set_rng_state_all(cuda_rng_state_all)
+    except (TypeError, RuntimeError) as exc:
+        raise ValueError("invalid latest checkpoint cuda_rng_state_all") from exc
 
 
 def _reuse_or_write_fold_manifest(path, canonical):
@@ -586,10 +680,7 @@ def train_conditional_fold(
         best_epoch = latest_best_epoch
         best_metrics = dict(resume_state.get("best_metrics", {}))
         wait = latest_wait
-        if "torch_rng_state" in resume_state:
-            torch.set_rng_state(resume_state["torch_rng_state"])
-        if cuda and "cuda_rng_state_all" in resume_state:
-            torch.cuda.set_rng_state_all(resume_state["cuda_rng_state_all"])
+        _restore_resume_rng_state(resume_state, cuda)
 
     _atomic_write_json(state_path, {
         **state_base,
@@ -661,6 +752,7 @@ def train_conditional_fold(
             }
             if cuda:
                 latest["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+                latest["cuda_environment"] = _cuda_environment_identity()
             _atomic_torch_save(latest_path, latest)
             _atomic_write_json(state_path, {
                 **state_base,
@@ -1044,11 +1136,27 @@ def _verify_saved_distance_calibration(rows, distance_calibration):
             or any(not np.isfinite(value) or value <= 0 for value in vector + fitted)
         ):
             raise ValueError(f"invalid distance calibration fold {fold}")
-        if bool(calibration.get("accepted")) and not np.allclose(
+        try:
+            safe = distance_calibration_is_safe(
+                calibration["before"], calibration["after"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid distance calibration safety: fold {fold}") from exc
+        if type(calibration.get("accepted")) is not bool:
+            raise ValueError(
+                f"distance calibration accepted must be boolean: fold {fold}"
+            )
+        accepted = calibration["accepted"]
+        if accepted != bool(safe):
+            raise ValueError(f"distance calibration safety decision mismatch: fold {fold}")
+        expected_reason = "accepted" if safe else "point_metrics_regressed"
+        if calibration.get("guard_reason") != expected_reason:
+            raise ValueError(f"distance calibration guard_reason mismatch: fold {fold}")
+        if accepted and not np.allclose(
             vector, fitted, rtol=0.0, atol=1e-12
         ):
             raise ValueError(f"accepted distance calibration changed: fold {fold}")
-        if not bool(calibration.get("accepted")) and vector != [1.0] * len(TYPE_NAMES):
+        if not accepted and vector != [1.0] * len(TYPE_NAMES):
             raise ValueError(f"unsafe distance calibration lacks ones fallback: fold {fold}")
         vectors.append(vector)
     median = np.median(np.asarray(vectors, dtype=np.float64), axis=0)
@@ -1076,8 +1184,49 @@ def _verify_saved_distance_calibration(rows, distance_calibration):
             raise ValueError(f"OOF row distance temperature mismatch: row {row_index}")
 
 
-def verify_cv_artifacts(output_dir, expected_rows, expected_hashes, config):
+def _verified_raw_fold_rows(output_dir, expected_rows, expected_hashes):
+    """Reload strict fold evidence and return raw OOF rows keyed by piece."""
+    raw_rows = {}
+    for fold in range(3):
+        fold_expected = {
+            key: value for key, value in expected_rows.items()
+            if int(value["fold"]) == fold
+        }
+        result = load_verified_fold(
+            output_dir, fold, expected_hashes[str(fold)], fold_expected
+        )
+        if not isinstance(result, FoldResult):
+            raise ValueError(f"canonical fold evidence did not verify: fold {fold}")
+        for row in read_oof_csv(result.oof_path):
+            raw_rows[str(row["piece_key"])] = row
+    if set(raw_rows) != set(expected_rows):
+        raise ValueError("raw fold OOF identities do not match expected rows")
+    return raw_rows
+
+
+def _verify_final_rows_against_raw(rows, raw_rows):
+    """Bind pooled output fields that type calibration must not rewrite."""
+    for row_index, row in enumerate(rows):
+        key = str(row["piece_key"])
+        raw = raw_rows.get(key)
+        if raw is None:
+            raise ValueError(f"final OOF row is absent from raw fold OOF: {key}")
+        for name in RAW_OOF_BOUND_FIELDS:
+            if row.get(name) != raw.get(name):
+                raise ValueError(
+                    f"raw fold OOF immutable field mismatch: row {row_index} {name}"
+                )
+
+
+def verify_cv_artifacts(
+    output_dir, expected_rows, expected_hashes, config,
+    expected_evidence_hashes=None,
+):
     """Recompute release evidence from saved OOF rows before authorization."""
+    if expected_evidence_hashes is not None:
+        current_evidence = _fold_evidence_hashes(output_dir)
+        if current_evidence != expected_evidence_hashes:
+            raise ValueError("canonical fold evidence hash mismatch after OOF evaluation")
     rows = read_oof_csv(Path(output_dir) / "oof_predictions.csv")
     validate_oof_rows(rows, expected_rows)
     metrics = evaluate_predictions(rows)
@@ -1130,6 +1279,10 @@ def verify_cv_artifacts(output_dir, expected_rows, expected_hashes, config):
         raise ValueError("saved fold hashes do not match OOF row fold hashes")
     if expected_hashes != saved.get("fold_hashes"):
         raise ValueError("fold hashes changed after OOF evaluation")
+    raw_rows = _verified_raw_fold_rows(
+        output_dir, expected_rows, expected_hashes
+    )
+    _verify_final_rows_against_raw(rows, raw_rows)
     _verify_saved_rejection_policy(
         rows, saved_policy, row_fold_hashes, rounded_metrics
     )
@@ -1217,10 +1370,6 @@ def evaluate_oof_artifacts(rows, expected, output_dir, config) -> dict:
         row["rejection_reason"] = decisions["reason"][index]
         row["confidence"] = float(decisions["confidence"][index].item())
         row["margin"] = float(decisions["margin"][index].item())
-        row["normalized_feature_distance"] = float(
-            decisions["normalized_distance"][index].item()
-        )
-        row["quality_score"] = float(decisions["quality_score"][index].item())
         for type_index, type_name in enumerate(TYPE_NAMES):
             row[f"prob_{type_name}"] = float(probabilities[index, type_index])
         final_rows.append(row)
@@ -1330,6 +1479,7 @@ def run_cross_validated_training(
         rows.extend(fold_rows)
 
     validate_oof_rows(rows, expected)
+    expected_evidence_hashes = _fold_evidence_hashes(config.output)
     oof_evaluator(
         [dict(row) for row in rows],
         {key: dict(value) for key, value in expected.items()},
@@ -1338,7 +1488,8 @@ def run_cross_validated_training(
     )
     try:
         report = verify_cv_artifacts(
-            config.output, expected, expected_fold_hashes, config
+            config.output, expected, expected_fold_hashes, config,
+            expected_evidence_hashes=expected_evidence_hashes,
         )
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise ValueError(f"OOF artifact verification failed: {exc}") from exc

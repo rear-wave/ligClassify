@@ -59,6 +59,29 @@ def config(tmp_path, resume_cv=False, stop_after_oof=True):
     )
 
 
+def _distance_calibration_fixture(fitted=None, accepted=None, *, safe=True):
+    fitted = [1.0] * 4 if fitted is None else list(fitted)
+    accepted = fitted if accepted is None else list(accepted)
+    before = {
+        "distance_file_macro_within_200": 1.0,
+        "distance_100km_interval_within_200": 1.0,
+        "distance_interval_mae_km": 0.0,
+    }
+    after = dict(before) if safe else {
+        "distance_file_macro_within_200": 0.0,
+        "distance_100km_interval_within_200": 0.0,
+        "distance_interval_mae_km": 1.0,
+    }
+    return {
+        "before": before,
+        "after": after,
+        "fitted_temperatures": fitted,
+        "accepted_temperatures": accepted,
+        "accepted": bool(safe),
+        "guard_reason": "accepted" if safe else "point_metrics_regressed",
+    }
+
+
 def fake_fold_trainer(calls):
     def train(train_entries, holdout_entries, output_dir, config, device, fold_index):
         calls.append(fold_index)
@@ -83,6 +106,31 @@ def fake_fold_trainer(calls):
                         holdout_hash=holdout_hash,
                         config_hash=config_hash,
                     ))
+        fold_hashes = {
+            "train_hash": train_hash,
+            "holdout_hash": holdout_hash,
+            "config_hash": config_hash,
+        }
+        fold_metrics = {
+            "distance_calibration": _distance_calibration_fixture()
+        }
+        checkpoint = _checkpoint_fixture(
+            fold_hashes,
+            fold_index=fold_index,
+            best_epoch=fold_index + 2,
+            metrics=fold_metrics,
+        )
+        torch.save(checkpoint, output_dir / "best.pt")
+        (output_dir / "fold_state.json").write_text(json.dumps({
+            "status": "complete",
+            "fold_index": fold_index,
+            **fold_hashes,
+            "random_initialization": True,
+            "best_epoch": checkpoint["best_epoch"],
+            "stage_config": checkpoint["stage_config"],
+            "model_config": checkpoint["model_config"],
+            "metrics": fold_metrics,
+        }), encoding="utf-8")
         return FoldResult(
             fold_index=fold_index,
             best_epoch=fold_index + 2,
@@ -91,7 +139,7 @@ def fake_fold_trainer(calls):
             config_hash=config_hash,
             checkpoint_path=str(output_dir / "best.pt"),
             oof_path=str(oof_path),
-            metrics={},
+            metrics=fold_metrics,
         )
     return train
 
@@ -110,30 +158,32 @@ def _write_fake_fold_calibrations(rows, output_dir):
             "fold_index": fold,
             **fold_hashes,
             "metrics": {
-                "distance_calibration": {
-                    "before": {"distance_interval_mae_km": 0.0},
-                    "after": {"distance_interval_mae_km": 0.0},
-                    "fitted_temperatures": [1.0] * 4,
-                    "accepted_temperatures": [1.0] * 4,
-                    "accepted": True,
-                    "guard_reason": "accepted",
-                }
+                "distance_calibration": _distance_calibration_fixture()
             },
         }), encoding="utf-8")
 
 
 def passing_oof_evaluator(rows, expected, output_dir, config):
-    _write_fake_fold_calibrations(rows, output_dir)
     return evaluate_oof_artifacts(rows, expected, output_dir, config)
 
 
 def failing_oof_evaluator(rows, expected, output_dir, config):
-    failed_rows = [dict(row) for row in rows]
-    for row in failed_rows:
-        row["predicted_distance_km"] = 5000.0
-        row["oracle_distance_km"] = 5000.0
-    _write_fake_fold_calibrations(failed_rows, output_dir)
-    return evaluate_oof_artifacts(failed_rows, expected, output_dir, config)
+    return evaluate_oof_artifacts(rows, expected, output_dir, config)
+
+
+def failing_distance_fold_trainer(calls):
+    trainer = fake_fold_trainer(calls)
+
+    def train(*args, **kwargs):
+        result = trainer(*args, **kwargs)
+        rows = read_oof_csv(result.oof_path)
+        for row in rows:
+            row["predicted_distance_km"] = 5000.0
+            row["oracle_distance_km"] = 5000.0
+        _write_oof_rows(Path(result.oof_path), rows)
+        return result
+
+    return train
 
 
 def fail_if_called(*args, **kwargs):
@@ -203,6 +253,27 @@ def test_evaluator_cannot_redefine_expected_fold_hashes(tmp_path):
     assert final_calls == []
 
 
+def test_evaluator_cannot_rewrite_canonical_fold_artifact_bytes(tmp_path):
+    final_calls = []
+
+    def malicious_evaluator(rows, expected, output_dir, fold_config):
+        passing_oof_evaluator(rows, expected, output_dir, fold_config)
+        raw_path = Path(output_dir) / "folds" / "fold_0" / "oof.csv"
+        raw_path.write_bytes(raw_path.read_bytes() + b"\r\n")
+        return {"passed": True, "reasons": []}
+
+    def final_trainer(*args, **kwargs):
+        final_calls.append(True)
+
+    with pytest.raises(ValueError, match="OOF artifact verification failed"):
+        run_cross_validated_training(
+            config(tmp_path, stop_after_oof=False), trusted_entries(tmp_path), "cpu",
+            fold_trainer=fake_fold_trainer([]), final_trainer=final_trainer,
+            oof_evaluator=malicious_evaluator,
+        )
+    assert final_calls == []
+
+
 def test_evaluator_false_return_cannot_veto_verified_artifacts(tmp_path):
     final_calls = []
 
@@ -242,23 +313,17 @@ def test_cv_runs_each_fold_once_and_validates_all_oof_rows(tmp_path):
     assert saved_manifest["fold_count"] == 3
 
 
-def test_resume_skips_only_hash_verified_complete_folds(tmp_path, monkeypatch):
+def test_resume_skips_only_hash_verified_complete_folds(tmp_path):
     entries = trusted_entries(tmp_path)
     folds = assign_exact_folds(entries, n_folds=3, seed=7)
     train_entries, holdout_entries = fold_train_holdout(folds, 0)
-    completed = fake_fold_trainer([])(
+    fake_fold_trainer([])(
         train_entries,
         holdout_entries,
         config(tmp_path).output / "folds" / "fold_0",
         config(tmp_path),
         "cpu",
         0,
-    )
-    monkeypatch.setattr(
-        "cv_pipeline.load_verified_fold",
-        lambda output_dir, fold_index, expected_hashes, expected_rows: (
-            completed if fold_index == 0 else None
-        ),
     )
     calls = []
     run_cross_validated_training(
@@ -269,11 +334,22 @@ def test_resume_skips_only_hash_verified_complete_folds(tmp_path, monkeypatch):
     assert calls == [1, 2]
 
 
-def test_resume_hash_mismatch_false_does_not_skip_fold(tmp_path, monkeypatch):
-    monkeypatch.setattr("cv_pipeline.load_verified_fold", lambda *args: False)
+def test_resume_hash_mismatch_false_does_not_skip_fold(tmp_path):
+    entries = trusted_entries(tmp_path)
+    folds = assign_exact_folds(entries, n_folds=3, seed=7)
+    train_entries, holdout_entries = fold_train_holdout(folds, 0)
+    output_dir = config(tmp_path).output / "folds" / "fold_0"
+    fake_fold_trainer([])(
+        train_entries, holdout_entries, output_dir,
+        config(tmp_path), "cpu", 0,
+    )
+    state_path = output_dir / "fold_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["config_hash"] = "mismatch"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
     calls = []
     run_cross_validated_training(
-        config(tmp_path, resume_cv=True), trusted_entries(tmp_path), "cpu",
+        config(tmp_path, resume_cv=True), entries, "cpu",
         fold_trainer=fake_fold_trainer(calls),
         oof_evaluator=passing_oof_evaluator,
     )
@@ -286,7 +362,7 @@ def test_failed_oof_gate_never_calls_final_trainer_or_replaces_model(tmp_path):
     deployed.write_bytes(b"existing")
     run_cross_validated_training(
         config(tmp_path, stop_after_oof=False), trusted_entries(tmp_path), "cpu",
-        fold_trainer=fake_fold_trainer([]), final_trainer=fail_if_called,
+        fold_trainer=failing_distance_fold_trainer([]), final_trainer=fail_if_called,
         oof_evaluator=failing_oof_evaluator,
     )
     assert deployed.read_bytes() == b"existing"
@@ -366,7 +442,9 @@ def _complete_oof_row(
     return row
 
 
-def _checkpoint_fixture(hashes=None):
+def _checkpoint_fixture(
+    hashes=None, *, fold_index=0, best_epoch=4, metrics=None
+):
     hashes = hashes or {
         "train_hash": "train", "holdout_hash": "holdout", "config_hash": "config"
     }
@@ -381,10 +459,10 @@ def _checkpoint_fixture(hashes=None):
     model = create_mtl_model(**model_config)
     return {
         "schema": "conditional_expert_cv_fold_v1",
-        "fold_index": 0,
+        "fold_index": fold_index,
         **hashes,
         "random_initialization": True,
-        "best_epoch": 4,
+        "best_epoch": best_epoch,
         "stage_config": {
             "type_focus_epochs": 1,
             "type_focus_distance_weight": 0.25,
@@ -394,7 +472,7 @@ def _checkpoint_fixture(hashes=None):
         },
         "model_config": model_config,
         "model_state": model.state_dict(),
-        "metrics": {"score": 1.0},
+        "metrics": {"score": 1.0} if metrics is None else metrics,
     }
 
 
@@ -895,6 +973,110 @@ def test_resume_already_at_patience_does_not_run_an_extra_epoch(
     assert read_oof_csv(result.oof_path)
 
 
+def test_progressed_resume_requires_cpu_torch_rng_state(tmp_path, monkeypatch):
+    import cv_pipeline
+
+    fold_config, train_entries, holdout_entries = _real_fold_case(
+        tmp_path, monkeypatch, max_epochs=3, patience=5
+    )
+    output_dir = fold_config.output / "folds" / "fold_0"
+    original_epoch = cv_pipeline.run_conditional_epoch
+
+    def interrupt_after_two_epochs(*args, **kwargs):
+        if int(args[7]) == 2:
+            raise RuntimeError("simulated interruption")
+        return original_epoch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cv_pipeline, "run_conditional_epoch", interrupt_after_two_epochs
+    )
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        cv_pipeline.train_conditional_fold(
+            train_entries, holdout_entries, output_dir, fold_config, "cpu", 0
+        )
+
+    latest_path = output_dir / "latest.pt"
+    latest = torch.load(latest_path, map_location="cpu", weights_only=False)
+    assert int(latest["completed_epochs"]) > 0
+    latest.pop("torch_rng_state")
+    torch.save(latest, latest_path)
+
+    def unexpected_epoch(*args, **kwargs):
+        raise AssertionError("resume trained without restoring CPU RNG")
+
+    monkeypatch.setattr(cv_pipeline, "run_conditional_epoch", unexpected_epoch)
+    resumed = CVConfig(**{**fold_config.__dict__, "resume_cv": True})
+    with pytest.raises(ValueError, match="torch_rng_state"):
+        cv_pipeline.train_conditional_fold(
+            train_entries, holdout_entries, output_dir, resumed, "cpu", 0
+        )
+
+
+def test_progressed_cuda_resume_requires_cuda_rng_state(monkeypatch):
+    import cv_pipeline
+
+    restore = getattr(cv_pipeline, "_restore_resume_rng_state", None)
+    assert callable(restore), "resume RNG restoration helper is required"
+    environment = {
+        "device_count": 1,
+        "devices": [{"name": "synthetic", "capability": [8, 0]}],
+        "torch_cuda_version": "synthetic",
+        "cudnn_version": 1,
+    }
+    monkeypatch.setattr(
+        cv_pipeline, "_cuda_environment_identity", lambda: environment,
+        raising=False,
+    )
+    state = {
+        "completed_epochs": 1,
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_environment": environment,
+    }
+
+    with pytest.raises(ValueError, match="cuda_rng_state_all"):
+        restore(state, cuda=True)
+
+
+def test_progressed_cuda_resume_rejects_device_environment_mismatch(monkeypatch):
+    import cv_pipeline
+
+    restore = getattr(cv_pipeline, "_restore_resume_rng_state", None)
+    assert callable(restore), "resume RNG restoration helper is required"
+    current = {
+        "device_count": 1,
+        "devices": [{"name": "current", "capability": [8, 0]}],
+        "torch_cuda_version": "synthetic",
+        "cudnn_version": 1,
+    }
+    saved = {
+        **current,
+        "device_count": 2,
+        "devices": [
+            {"name": "current", "capability": [8, 0]},
+            {"name": "second", "capability": [8, 0]},
+        ],
+    }
+    monkeypatch.setattr(
+        cv_pipeline, "_cuda_environment_identity", lambda: current,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state_all",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("CUDA RNG restored before environment validation")
+        ),
+    )
+    state = {
+        "completed_epochs": 1,
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": [torch.get_rng_state(), torch.get_rng_state()],
+        "cuda_environment": saved,
+    }
+
+    with pytest.raises(ValueError, match="CUDA environment mismatch"):
+        restore(state, cuda=True)
+
+
 def test_completed_hash_mismatch_retrains_from_random_epoch_zero(
     tmp_path, monkeypatch
 ):
@@ -971,24 +1153,32 @@ def _perfect_raw_oof(tmp_path):
         directory.mkdir(parents=True)
         fitted = [2.0 + fold] * 4
         accepted = [1.0] * 4 if fold == 1 else fitted
+        calibration = _distance_calibration_fixture(
+            fitted,
+            accepted,
+            safe=fold != 1,
+        )
+        checkpoint = _checkpoint_fixture(
+            fold_hash,
+            fold_index=fold,
+            best_epoch=fold + 2,
+            metrics={"distance_calibration": calibration},
+        )
         state = {
             "status": "complete",
+            "fold_index": fold,
             "best_epoch": fold + 2,
-            "metrics": {
-                "distance_calibration": {
-                    "before": {"distance_interval_mae_km": 0.0},
-                    "after": {"distance_interval_mae_km": 0.0},
-                    "fitted_temperatures": fitted,
-                    "accepted_temperatures": accepted,
-                    "accepted": fold != 1,
-                    "guard_reason": "accepted" if fold != 1 else "point_metrics_regressed",
-                }
-            },
+            "metrics": checkpoint["metrics"],
+            "stage_config": checkpoint["stage_config"],
+            "model_config": checkpoint["model_config"],
+            "random_initialization": True,
             **fold_hash,
         }
+        torch.save(checkpoint, directory / "best.pt")
         (directory / "fold_state.json").write_text(
             json.dumps(state), encoding="utf-8"
         )
+        fold_rows = []
         for type_index, type_name in enumerate(("NCG", "NNBE", "PCG", "PNBE")):
             source_path = f"{type_name}/day/0-100km/fold-{fold}.lig"
             piece_key = f"{source_path}#0"
@@ -1024,6 +1214,8 @@ def _perfect_raw_oof(tmp_path):
                 row[f"logit_{logit_name}"] = 8.0 if logit_index == type_index else 0.0
                 row[f"prob_{logit_name}"] = ""
             rows.append(row)
+            fold_rows.append(row)
+        _write_oof_rows(directory / "oof.csv", fold_rows)
     return rows, expected, hashes
 
 
@@ -1219,7 +1411,82 @@ def test_verify_cv_artifacts_binds_distance_vectors_to_fold_states(tmp_path):
             row["distance_temperature"] = 8.0
     _write_oof_rows(final_path, rows)
 
-    with pytest.raises(ValueError, match="fold states"):
+    with pytest.raises(ValueError, match="raw fold OOF"):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
+
+
+def _coherently_mutate_fold_zero_distance(output_dir, *, mutate_checkpoint):
+    fold_dir = Path(output_dir) / "folds" / "fold_0"
+    state_path = fold_dir / "fold_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    calibration = state["metrics"]["distance_calibration"]
+    calibration["fitted_temperatures"] = [8.0] * 4
+    calibration["accepted_temperatures"] = [8.0] * 4
+    calibration["accepted"] = True
+    calibration["guard_reason"] = "accepted"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    if mutate_checkpoint:
+        checkpoint_path = fold_dir / "best.pt"
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        checkpoint["metrics"] = json.loads(json.dumps(state["metrics"]))
+        torch.save(checkpoint, checkpoint_path)
+
+    metrics_path = Path(output_dir) / "cv_metrics.json"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    saved["distance_calibration"]["folds"]["0"] = json.loads(
+        json.dumps(calibration)
+    )
+    saved["distance_calibration"]["final_temperatures"] = [4.0] * 4
+    metrics_path.write_text(json.dumps(saved), encoding="utf-8")
+    final_path = Path(output_dir) / "oof_predictions.csv"
+    rows = read_oof_csv(final_path)
+    for row in rows:
+        if int(row["fold"]) == 0:
+            row["distance_temperature"] = 8.0
+    _write_oof_rows(final_path, rows)
+
+
+def test_verify_rejects_coherent_distance_mutation_not_in_best_checkpoint(tmp_path):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    _coherently_mutate_fold_zero_distance(
+        fold_config.output, mutate_checkpoint=False
+    )
+
+    with pytest.raises(ValueError, match="checkpoint/state metrics mismatch"):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
+
+
+def test_verify_binds_final_immutable_fields_to_raw_fold_oof(tmp_path):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    _coherently_mutate_fold_zero_distance(
+        fold_config.output, mutate_checkpoint=True
+    )
+
+    with pytest.raises(ValueError, match="raw fold OOF"):
+        verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
+
+
+def test_verify_distance_safety_requires_boolean_accepted_decision(tmp_path):
+    fold_config, expected, hashes = _evaluated_oof_case(tmp_path)
+    fold_dir = fold_config.output / "folds" / "fold_0"
+    state_path = fold_dir / "fold_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["metrics"]["distance_calibration"]["accepted"] = "True"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    checkpoint_path = fold_dir / "best.pt"
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    checkpoint["metrics"] = json.loads(json.dumps(state["metrics"]))
+    torch.save(checkpoint, checkpoint_path)
+    metrics_path = fold_config.output / "cv_metrics.json"
+    saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    saved["distance_calibration"]["folds"]["0"]["accepted"] = "True"
+    metrics_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="accepted must be boolean"):
         verify_cv_artifacts(fold_config.output, expected, hashes, fold_config)
 
 
