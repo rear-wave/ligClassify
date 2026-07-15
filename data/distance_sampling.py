@@ -73,6 +73,11 @@ class ConditionBalancedSampler(Sampler):
         self._eligible = np.flatnonzero(eligible)
         if not len(self._eligible):
             raise ValueError("No eligible waveform pieces are available")
+        file_counts = np.bincount(
+            self.file_ids[self._eligible].astype(np.int64, copy=False)
+        )
+        available = np.minimum(file_counts, self.max_samples_per_file).sum()
+        self._length = min(self.num_samples, int(available))
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
@@ -89,13 +94,7 @@ class ConditionBalancedSampler(Sampler):
         )
 
     def __len__(self):
-        by_file = defaultdict(int)
-        for position in self._eligible:
-            by_file[int(self.file_ids[position])] += 1
-        available = sum(
-            min(count, self.max_samples_per_file) for count in by_file.values()
-        )
-        return min(self.num_samples, available)
+        return self._length
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
@@ -115,7 +114,8 @@ class ConditionBalancedSampler(Sampler):
             rng.shuffle(positions)
 
         selected, cell_deck = [], []
-        while cells and len(selected) < len(self):
+        target_length = len(self)
+        while cells and len(selected) < target_length:
             cell_deck = [key for key in cell_deck if key in cells]
             if not cell_deck:
                 cell_deck = sorted(cells)

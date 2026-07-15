@@ -50,6 +50,24 @@ def test_type_stream_keeps_unlabelled_examples():
     assert 6 in list(make_sampler(distance_only=False))
 
 
+def test_sampler_does_not_recompute_target_length_per_sample(monkeypatch):
+    sampler = make_sampler()
+    original_len = ConditionBalancedSampler.__len__
+    calls = 0
+
+    def counted_len(instance):
+        nonlocal calls
+        calls += 1
+        return original_len(instance)
+
+    monkeypatch.setattr(ConditionBalancedSampler, "__len__", counted_len)
+
+    list(sampler)
+
+    # list() may request one length hint in addition to the sampler's own call.
+    assert calls <= 2
+
+
 def test_sampler_rejects_misaligned_or_empty_inputs():
     with pytest.raises(ValueError, match="same length"):
         ConditionBalancedSampler([0], [1, 0], [0], [100], [0], 1)
