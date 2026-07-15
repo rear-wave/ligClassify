@@ -4,13 +4,21 @@ import torch.nn.functional as F
 
 from distance_ordinal import (
     aggregate_coarse_probabilities,
+    decode_distance_distribution,
     decode_distance_logits,
     fit_temperature_grid,
+    interval_distance_loss,
     is_meaningful_improvement,
     make_selection_key,
     ordinal_distance_loss,
     select_confidence_threshold,
 )
+
+
+def peaked_logits(bin_index):
+    logits = torch.full((1, 30), -20.0)
+    logits[0, bin_index] = 20.0
+    return logits
 
 
 def test_coarse_probabilities_are_normalized_groups_of_three():
@@ -46,6 +54,49 @@ def test_ordinal_loss_returns_named_finite_components():
     assert set(components) == {"soft_ce", "cdf", "huber", "coarse"}
     assert all(torch.isfinite(value) for value in components.values())
     assert logits.grad is not None
+
+
+def test_interval_loss_rewards_probability_inside_broad_label():
+    near_loss, _ = interval_distance_loss(
+        peaked_logits(7), torch.tensor([600]), torch.tensor([1200])
+    )
+    far_loss, _ = interval_distance_loss(
+        peaked_logits(20), torch.tensor([600]), torch.tensor([1200])
+    )
+
+    assert near_loss < far_loss
+
+
+def test_interval_loss_exact_label_has_finite_gradient():
+    logits = torch.randn(2, 30, requires_grad=True)
+
+    loss, components = interval_distance_loss(
+        logits,
+        torch.tensor([400, 2900]),
+        torch.tensor([500, 3000]),
+    )
+    loss.backward()
+
+    assert set(components) == {"interval_nll", "ordered"}
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+
+
+def test_interval_loss_rejects_invalid_bounds():
+    with pytest.raises(ValueError, match="distance intervals"):
+        interval_distance_loss(
+            peaked_logits(4), torch.tensor([500]), torch.tensor([400])
+        )
+
+
+def test_distribution_decoder_returns_expected_and_quantile_distances():
+    decoded = decode_distance_distribution(peaked_logits(4))
+
+    assert decoded["bin_index"].item() == 4
+    assert decoded["expected_km"].item() == pytest.approx(450.0)
+    assert decoded["low_km"].item() == pytest.approx(400.0)
+    assert decoded["high_km"].item() == pytest.approx(500.0)
+    assert decoded["confidence"].item() > 0.99
 
 
 def test_decoder_returns_expected_center_interval_and_confidence():

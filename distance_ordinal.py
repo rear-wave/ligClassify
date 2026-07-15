@@ -81,6 +81,59 @@ def ordinal_distance_loss(
     return total, components
 
 
+def interval_distance_loss(
+    logits,
+    low_km,
+    high_km,
+    ordered_weight=0.2,
+):
+    """Train an ordered distribution from exact or interval distance labels."""
+    low_km = torch.as_tensor(low_km, device=logits.device)
+    high_km = torch.as_tensor(high_km, device=logits.device)
+    if (
+        logits.ndim != 2
+        or low_km.ndim != 1
+        or high_km.ndim != 1
+        or len(logits) != len(low_km)
+        or len(logits) != len(high_km)
+    ):
+        raise ValueError(
+            "logits, low_km, and high_km must have shapes [B, C], [B], [B]"
+        )
+    if len(logits) == 0:
+        raise ValueError("distance loss requires at least one interval")
+    max_distance_km = logits.shape[1] * 100
+    if torch.any(
+        (low_km < 0)
+        | (high_km > max_distance_km)
+        | (high_km <= low_km)
+    ):
+        raise ValueError("distance intervals must satisfy 0 <= low < high <= max")
+    if ordered_weight < 0:
+        raise ValueError("ordered_weight must be non-negative")
+
+    probabilities = F.softmax(logits, dim=1)
+    centers = torch.arange(
+        50,
+        max_distance_km,
+        100,
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    low = low_km.to(logits.dtype).unsqueeze(1)
+    high = high_km.to(logits.dtype).unsqueeze(1)
+    inside = (centers.unsqueeze(0) >= low) & (centers.unsqueeze(0) < high)
+    interval_mass = (probabilities * inside).sum(dim=1).clamp_min(1e-8)
+    interval_nll = -interval_mass.log().mean()
+
+    below = (low - centers.unsqueeze(0)).clamp_min(0)
+    above = (centers.unsqueeze(0) - high).clamp_min(0)
+    outside_bins = torch.maximum(below, above) / 100.0
+    ordered = (probabilities * outside_bins).sum(dim=1).mean()
+    total = interval_nll + ordered_weight * ordered
+    return total, {"interval_nll": interval_nll, "ordered": ordered}
+
+
 def decode_distance_logits(logits, temperature=1.0):
     """Decode an ordered distribution into point, interval, and confidence."""
     if temperature <= 0:
@@ -106,6 +159,39 @@ def decode_distance_logits(logits, temperature=1.0):
         "distance_km": 100.0 * (expected_bins + 0.5),
         "low_km": 100.0 * low_bins.to(logits.dtype),
         "high_km": 100.0 * (high_bins.to(logits.dtype) + 1.0),
+        "confidence": confidence,
+    }
+
+
+def decode_distance_distribution(logits, temperature=1.0):
+    """Decode expected distance, modal bin, quantiles, and local confidence."""
+    if logits.ndim != 2:
+        raise ValueError("logits must have shape [batch, bins]")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    probabilities = F.softmax(logits / temperature, dim=1)
+    num_bins = logits.shape[1]
+    centers = torch.arange(
+        50,
+        num_bins * 100,
+        100,
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    expected_km = (probabilities * centers.unsqueeze(0)).sum(dim=1)
+    bin_index = probabilities.argmax(dim=1)
+    cdf = probabilities.cumsum(dim=1)
+    low_bins = (cdf >= 0.10).to(torch.int64).argmax(dim=1)
+    high_bins = (cdf >= 0.90).to(torch.int64).argmax(dim=1)
+    integer_bins = torch.arange(num_bins, device=logits.device).unsqueeze(0)
+    within_two = (integer_bins - bin_index.unsqueeze(1)).abs() <= 2
+    confidence = (probabilities * within_two).sum(dim=1)
+    return {
+        "probabilities": probabilities,
+        "expected_km": expected_km,
+        "bin_index": bin_index,
+        "low_km": low_bins.to(logits.dtype) * 100.0,
+        "high_km": (high_bins.to(logits.dtype) + 1.0) * 100.0,
         "confidence": confidence,
     }
 
