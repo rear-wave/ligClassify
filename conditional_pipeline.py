@@ -21,6 +21,7 @@ from data.training_manifest import build_manifest, build_piece_manifest
 from distance_ordinal import decode_distance_distribution
 from evaluation import evaluate_predictions, evaluate_release, file_bootstrap_metrics
 from models import create_mtl_model
+from open_set import decode_with_rejection, fit_feature_reference, fit_rejection_policy
 from training_engine import conditional_train_step
 
 
@@ -134,6 +135,38 @@ def collect_prediction_bundle(model, loader, device, split_hash):
         "labels": torch.cat(label_parts),
         "quality": torch.cat(quality_parts),
     }
+
+
+@torch.no_grad()
+def collect_reference_features(model, loader, device):
+    """Collect a condition-balanced training subset for feature references."""
+    model.eval()
+    feature_parts, label_parts = [], []
+    for batch in loader:
+        batch = _move_batch(batch, device)
+        feature_parts.append(
+            model.extract_type_features(batch["local"], batch["global_view"]).cpu()
+        )
+        label_parts.append(batch["type_label"].cpu())
+    return torch.cat(feature_parts), torch.cat(label_parts)
+
+
+def apply_rejection_policy(bundle, policy):
+    """Attach validation-calibrated IC decisions to prediction records."""
+    decoded = decode_with_rejection(
+        bundle["logits"],
+        bundle["features"],
+        policy,
+        quality=bundle["quality"],
+    )
+    for row, record in enumerate(bundle["records"]):
+        record["accepted"] = bool(decoded["accepted"][row].item())
+        record["rejection_reason"] = decoded["reason"][row]
+        record["type_confidence"] = float(decoded["confidence"][row].item())
+        record["type_margin"] = float(decoded["margin"][row].item())
+        record["feature_distance"] = float(decoded["feature_distance"][row].item())
+        record["quality_score"] = float(decoded["quality_score"][row].item())
+    return decoded
 
 
 def _selection_key(metrics):
@@ -297,7 +330,7 @@ def run_conditional_training(args, device):
         "split_config": {"strategy": "file_isolated_condition_v1", "files_may_overlap": False},
         "split_hashes": split_manifest["split_hashes"],
         "combined_split_hash": split_manifest["combined_split_hash"],
-        "initial_model": args.init_model or None,
+        "initial_model": None if args.no_init else (args.init_model or None),
         "initialized_layers": initialized_layers,
     }
 
@@ -366,6 +399,47 @@ def run_conditional_training(args, device):
     validation_bundle = collect_prediction_bundle(
         model, val_loader, device, split_manifest["split_hashes"]["val"]
     )
+    reference_sampler = ConditionBalancedSampler(
+        train_set.type_labels,
+        train_set.daylight,
+        train_set.distance_low_km,
+        train_set.distance_high_km,
+        train_set.file_ids,
+        min(args.calibration_samples, len(train_set)),
+        max_samples_per_file=min(args.max_distance_samples_per_file, 64),
+        seed=args.seed + 991,
+        distance_only=False,
+    )
+    reference_loader = _loader(
+        train_set,
+        args.batch_size,
+        reference_sampler,
+        workers=args.num_workers,
+        cuda=cuda,
+    )
+    reference_features, reference_labels = collect_reference_features(
+        model, reference_loader, device
+    )
+    feature_reference = fit_feature_reference(reference_features, reference_labels)
+    policy = None
+    calibration_error = None
+    try:
+        policy = fit_rejection_policy(
+            validation_bundle["logits"],
+            validation_bundle["features"],
+            validation_bundle["labels"],
+            feature_reference,
+            quality=validation_bundle["quality"],
+            target_precision=args.rejection_target_precision,
+            min_coverage=args.rejection_min_coverage,
+            calibration_split_hash=split_manifest["split_hashes"]["val"],
+        )
+        apply_rejection_policy(validation_bundle, policy)
+        metadata["type_rejection"] = policy
+    except ValueError as exc:
+        calibration_error = str(exc)
+        metadata["type_rejection_error"] = calibration_error
+        LOGGER.warning("IC rejection calibration failed: %s", calibration_error)
     validation_metrics = evaluate_predictions(validation_bundle["records"])
     metadata["validation_metrics"] = validation_metrics
     evaluated_split = "val" if args.skip_test else "test"
@@ -376,19 +450,42 @@ def run_conditional_training(args, device):
         device,
         split_manifest["split_hashes"][evaluated_split],
     )
+    if policy is not None:
+        apply_rejection_policy(evaluation_bundle, policy)
     metrics = evaluate_predictions(evaluation_bundle["records"])
-    metrics.update(file_bootstrap_metrics(evaluation_bundle["records"], seed=args.seed))
+    metrics.update(file_bootstrap_metrics(
+        evaluation_bundle["records"],
+        iterations=args.bootstrap_iterations,
+        seed=args.seed,
+    ))
     _log_metrics(evaluated_split.title(), metrics)
 
-    reasons = ["precision-constrained IC rejection has not been calibrated"]
+    reasons = []
     passed = False
+    if args.skip_test:
+        reasons.append("locked test was skipped")
+    elif calibration_error is not None:
+        reasons.append(f"IC rejection calibration failed: {calibration_error}")
+    elif not args.baseline_metrics:
+        reasons.append("baseline metrics file is required for promotion")
+    elif not Path(args.baseline_metrics).is_file():
+        reasons.append(f"baseline metrics file not found: {args.baseline_metrics}")
+    else:
+        with Path(args.baseline_metrics).open("r", encoding="utf-8") as handle:
+            baseline = json.load(handle)
+        passed, reasons = evaluate_release(metrics, baseline)
     checkpoint = {**metadata, "model_state_dict": best_state}
     torch.save(checkpoint, output / "candidate.pt")
     report = {"release_passed": passed, "release_reasons": reasons, "evaluated_split": evaluated_split, **metrics}
     write_json(output / "candidate_metrics.json", report)
-    LOGGER.warning("REJECTED candidate; deployed model was not changed")
-    for reason in reasons:
-        LOGGER.warning("  release gate: %s", reason)
+    if passed:
+        torch.save(checkpoint, output / "model.pt")
+        write_json(output / "metrics.json", report)
+        LOGGER.info("PROMOTED candidate to %s", output / "model.pt")
+    else:
+        LOGGER.warning("REJECTED candidate; deployed model was not changed")
+        for reason in reasons:
+            LOGGER.warning("  release gate: %s", reason)
     for dataset in datasets.values():
         dataset.close()
     return report

@@ -154,6 +154,10 @@ def test_conditional_training_arguments_have_reliable_defaults():
     assert args.init_model == ""
     assert args.resume == ""
     assert args.no_amp is False
+    assert args.calibration_samples == 20000
+    assert args.bootstrap_iterations == 1000
+    assert args.rejection_target_precision == 0.95
+    assert args.rejection_min_coverage == 0.80
     assert args.no_init is False
     assert args.min_type_precision == 0.85
     assert args.min_type_recall == 0.70

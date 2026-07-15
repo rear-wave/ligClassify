@@ -1000,6 +1000,10 @@ def build_arg_parser():
         action="store_true",
         help="Disable CUDA mixed precision (enabled by default)",
     )
+    p.add_argument("--calibration_samples", type=int, default=20000)
+    p.add_argument("--bootstrap_iterations", type=int, default=1000)
+    p.add_argument("--rejection_target_precision", type=float, default=0.95)
+    p.add_argument("--rejection_min_coverage", type=float, default=0.80)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=0.0003)

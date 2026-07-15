@@ -37,20 +37,40 @@ def _distance_summary(records, prediction_key="predicted_distance_km", exact_onl
         low = record.get("distance_low_km")
         high = record.get("distance_high_km")
         prediction = record.get(prediction_key)
-        if low is None or high is None or prediction is None:
+        if low is None or high is None:
             continue
         if not (0 <= float(low) < float(high) <= 3000):
             continue
         if exact_only and float(high) - float(low) != 100:
             continue
-        selected.append((float(prediction), float(low), float(high)))
+        if prediction_key == "predicted_distance_km" and not record.get("accepted", True):
+            prediction = None
+        selected.append((
+            np.nan if prediction is None else float(prediction),
+            float(low),
+            float(high),
+        ))
     if not selected:
-        return {"count": 0, "mae_km": 0.0, "within_100": 0.0, "within_200": 0.0}
+        return {
+            "count": 0,
+            "prediction_count": 0,
+            "coverage": 0.0,
+            "mae_km": 0.0,
+            "within_100": 0.0,
+            "within_200": 0.0,
+        }
     values = np.asarray(selected, dtype=np.float64)
-    errors = interval_distance_errors(values[:, 0], values[:, 1], values[:, 2])
+    covered = np.isfinite(values[:, 0])
+    errors = np.full(len(values), np.inf, dtype=np.float64)
+    if covered.any():
+        errors[covered] = interval_distance_errors(
+            values[covered, 0], values[covered, 1], values[covered, 2]
+        )
     return {
         "count": int(len(errors)),
-        "mae_km": float(errors.mean()),
+        "prediction_count": int(covered.sum()),
+        "coverage": float(covered.mean()),
+        "mae_km": float(errors[covered].mean()) if covered.any() else 0.0,
         "within_100": float(np.mean(errors <= 100)),
         "within_200": float(np.mean(errors <= 200)),
     }
@@ -89,10 +109,7 @@ def evaluate_predictions(records):
     interval_summary = _distance_summary(records)
     exact_summary = _distance_summary(records, exact_only=True)
     oracle_summary = _distance_summary(records, prediction_key="oracle_distance_km")
-    accepted_records = [
-        record for record, keep in zip(records, accepted) if keep
-    ]
-    routed_summary = _distance_summary(accepted_records)
+    routed_summary = _distance_summary(records)
 
     per_type_exact = []
     for lightning_type in range(len(TYPE_NAMES)):
@@ -142,6 +159,7 @@ def evaluate_predictions(records):
         "type_recall": recall,
         "type_macro_recall": float(np.mean(recall)),
         "distance_interval_count": interval_summary["count"],
+        "distance_coverage": interval_summary["coverage"],
         "distance_interval_mae_km": interval_summary["mae_km"],
         "distance_oracle_mae_km": oracle_summary["mae_km"],
         "distance_routed_mae_km": routed_summary["mae_km"],

@@ -79,3 +79,57 @@ def test_fit_policy_fails_when_a_type_has_no_correct_prediction():
 
     with pytest.raises(ValueError, match="type 1"):
         fit_rejection_policy(logits, features, labels, reference)
+
+
+def test_low_quality_piece_is_rejected_after_confident_prediction():
+    policy = {
+        "version": 2,
+        "temperature": 1.0,
+        "centroids": [[0.0, 0.0]] * 4,
+        "scales": [[1.0, 1.0]] * 4,
+        "probability_thresholds": [0.40] * 4,
+        "margin_thresholds": [0.20] * 4,
+        "distance_thresholds": [2.0] * 4,
+        "quality_thresholds": [0.40] * 4,
+        "calibration_split_hash": "validation-hash",
+    }
+
+    decoded = decode_with_rejection(
+        torch.tensor([[5.0, 0.0, 0.0, 0.0]]),
+        torch.tensor([[0.0, 0.0]]),
+        policy,
+        quality=torch.tensor([0.10]),
+    )
+
+    assert decoded["accepted"].tolist() == [False]
+    assert decoded["final_type"].tolist() == [-1]
+    assert decoded["reason"] == ["low_quality"]
+
+
+def test_fit_policy_stores_quality_thresholds_and_calibration_split_hash():
+    labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+    logits = torch.full((8, 4), -4.0)
+    logits[torch.arange(8), labels] = 4.0
+    features = torch.stack([
+        torch.tensor([float(label * 10), float(label * 10)])
+        for label in labels
+    ])
+    quality = torch.tensor([[10.0, 0.0, 0.0]] * 8)
+    reference = fit_feature_reference(features, labels)
+
+    policy = fit_rejection_policy(
+        logits,
+        features,
+        labels,
+        reference,
+        quality=quality,
+        target_precision=0.95,
+        min_coverage=0.80,
+        calibration_split_hash="validation-hash",
+    )
+
+    assert policy["version"] == 2
+    assert len(policy["quality_thresholds"]) == 4
+    assert policy["calibration_split_hash"] == "validation-hash"
+    assert min(policy["validation_precision"]) >= 0.95
+    assert policy["validation_coverage"] >= 0.80

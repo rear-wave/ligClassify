@@ -69,6 +69,18 @@ def test_rejection_metrics_count_unaccepted_true_types_in_recall():
     assert metrics["type_recall"][0] == pytest.approx(0.5)
 
 
+def test_rejected_distance_counts_as_uncovered_and_release_failure():
+    records = [
+        make_record("a", 0, 0, predicted_distance=50, accepted=True),
+        make_record("b", 0, 0, predicted_distance=50, accepted=False),
+    ]
+
+    metrics = evaluate_predictions(records)
+
+    assert metrics["distance_coverage"] == pytest.approx(0.5)
+    assert metrics["distance_exact_within_200"] == pytest.approx(0.5)
+
+
 def test_file_bootstrap_is_reproducible_and_returns_intervals():
     records = [
         make_record("a", 0, 0),
