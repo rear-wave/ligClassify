@@ -6,9 +6,13 @@ import hashlib
 import json
 import os
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
+from data.cross_validation import fold_train_holdout
 from data.group_split import coarse_distance_band
+from data.training_manifest import ManifestEntry
 
 
 def _relative_path(path, root):
@@ -37,6 +41,51 @@ def split_hash(entries, root):
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def stable_json_hash(payload: Any) -> str:
+    """Hash a JSON-safe payload with deterministic key and separator rules."""
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def make_fold_manifest(
+    folds: Mapping[int, Sequence[ManifestEntry]],
+    root: str | os.PathLike[str],
+    seed: int,
+) -> dict[str, Any]:
+    """Build the canonical exact-interval fold ownership artifact."""
+    holdout_hashes = {
+        str(index): split_hash(entries, root)
+        for index, entries in sorted(folds.items())
+    }
+    train_hashes = {
+        str(index): split_hash(fold_train_holdout(folds, index)[0], root)
+        for index in sorted(folds)
+    }
+    combined = stable_json_hash({
+        "schema": "file_isolated_exact_interval_cv_v1",
+        "seed": int(seed),
+        "holdout_hashes": holdout_hashes,
+        "train_hashes": train_hashes,
+    })
+    return {
+        "schema": "file_isolated_exact_interval_cv_v1",
+        "fold_count": len(folds),
+        "seed": int(seed),
+        "holdout_hashes": holdout_hashes,
+        "train_hashes": train_hashes,
+        "combined_hash": combined,
+        "folds": {
+            str(index): sorted(
+                (serialize_manifest_entry(entry, root) for entry in rows),
+                key=lambda row: row["path"],
+            )
+            for index, rows in sorted(folds.items())
+        },
+    }
 
 
 def make_split_manifest(splits, root, seed, val_fraction, test_fraction):
