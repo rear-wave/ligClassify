@@ -868,12 +868,18 @@ def test_train_conditional_fold_writes_resumable_checkpoint_and_raw_oof(
         .read_text(encoding="utf-8")
     )
     rows = read_oof_csv(result.oof_path)
+    latest = torch.load(
+        fold_config.output / "folds" / "fold_0" / "latest.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
     assert result.best_epoch == 2
     assert checkpoint["schema"] == "conditional_expert_cv_fold_v1"
     assert checkpoint["random_initialization"] is True
     assert checkpoint["best_epoch"] == 2
     assert state["status"] == "complete"
     assert len(rows) == 4
+    assert latest["execution_device_type"] == "cpu"
     assert set(OOF_FIELDS).issubset(rows[0])
     assert all(row["source_path"].endswith("file-2.lig") for row in rows)
 
@@ -1029,12 +1035,22 @@ def test_progressed_cuda_resume_requires_cuda_rng_state(monkeypatch):
     )
     state = {
         "completed_epochs": 1,
+        "execution_device_type": "cuda",
         "torch_rng_state": torch.get_rng_state(),
         "cuda_environment": environment,
     }
+    setter_calls = []
+    monkeypatch.setattr(
+        torch, "set_rng_state", lambda *args: setter_calls.append("cpu")
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state_all",
+        lambda *args: setter_calls.append("cuda"),
+    )
 
     with pytest.raises(ValueError, match="cuda_rng_state_all"):
         restore(state, cuda=True)
+    assert setter_calls == []
 
 
 def test_progressed_cuda_resume_rejects_device_environment_mismatch(monkeypatch):
@@ -1068,6 +1084,7 @@ def test_progressed_cuda_resume_rejects_device_environment_mismatch(monkeypatch)
     )
     state = {
         "completed_epochs": 1,
+        "execution_device_type": "cuda",
         "torch_rng_state": torch.get_rng_state(),
         "cuda_rng_state_all": [torch.get_rng_state(), torch.get_rng_state()],
         "cuda_environment": saved,
@@ -1075,6 +1092,136 @@ def test_progressed_cuda_resume_rejects_device_environment_mismatch(monkeypatch)
 
     with pytest.raises(ValueError, match="CUDA environment mismatch"):
         restore(state, cuda=True)
+
+
+@pytest.mark.parametrize(
+    ("saved_mode", "current_cuda"),
+    [("cuda", False), ("cpu", True)],
+)
+def test_progressed_resume_rejects_execution_mode_change_before_rng_setters(
+    monkeypatch, saved_mode, current_cuda
+):
+    import cv_pipeline
+
+    state = {
+        "completed_epochs": 1,
+        "execution_device_type": saved_mode,
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if saved_mode == "cuda":
+        state.update({
+            "cuda_rng_state_all": [torch.get_rng_state()],
+            "cuda_environment": {"device_count": 1},
+        })
+    setter_calls = []
+    monkeypatch.setattr(
+        torch, "set_rng_state", lambda *args: setter_calls.append("cpu")
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state_all",
+        lambda *args: setter_calls.append("cuda"),
+    )
+
+    with pytest.raises(ValueError, match="execution device mismatch"):
+        cv_pipeline._restore_resume_rng_state(state, cuda=current_cuda)
+    assert setter_calls == []
+
+
+def test_progressed_resume_requires_execution_device_type_before_rng_setters(
+    monkeypatch
+):
+    import cv_pipeline
+
+    state = {
+        "completed_epochs": 1,
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    setter_calls = []
+    monkeypatch.setattr(
+        torch, "set_rng_state", lambda *args: setter_calls.append("cpu")
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state_all",
+        lambda *args: setter_calls.append("cuda"),
+    )
+
+    with pytest.raises(ValueError, match="execution_device_type"):
+        cv_pipeline._restore_resume_rng_state(state, cuda=False)
+    assert setter_calls == []
+
+
+def test_progressed_cpu_resume_rejects_contradictory_cuda_metadata(monkeypatch):
+    import cv_pipeline
+
+    state = {
+        "completed_epochs": 1,
+        "execution_device_type": "cpu",
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": [torch.get_rng_state()],
+        "cuda_environment": {"device_count": 1},
+    }
+    setter_calls = []
+    monkeypatch.setattr(
+        torch, "set_rng_state", lambda *args: setter_calls.append("cpu")
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state_all",
+        lambda *args: setter_calls.append("cuda"),
+    )
+
+    with pytest.raises(ValueError, match="CPU latest contains CUDA metadata"):
+        cv_pipeline._restore_resume_rng_state(state, cuda=False)
+    assert setter_calls == []
+
+
+def test_empty_initial_rng_state_needs_no_execution_mode_or_setters(monkeypatch):
+    import cv_pipeline
+
+    setter_calls = []
+    monkeypatch.setattr(
+        torch, "set_rng_state", lambda *args: setter_calls.append("cpu")
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state_all",
+        lambda *args: setter_calls.append("cuda"),
+    )
+
+    cv_pipeline._restore_resume_rng_state({"completed_epochs": 0}, cuda=False)
+    assert setter_calls == []
+
+
+@pytest.mark.parametrize("current_cuda", [False, True])
+def test_progressed_resume_validates_all_rng_tensors_before_setters(
+    monkeypatch, current_cuda
+):
+    import cv_pipeline
+
+    environment = {"device_count": 1}
+    monkeypatch.setattr(
+        cv_pipeline, "_cuda_environment_identity", lambda: environment
+    )
+    state = {
+        "completed_epochs": 1,
+        "execution_device_type": "cuda" if current_cuda else "cpu",
+        "torch_rng_state": torch.get_rng_state() if current_cuda else "invalid",
+    }
+    if current_cuda:
+        state.update({
+            "cuda_rng_state_all": ["invalid"],
+            "cuda_environment": environment,
+        })
+    setter_calls = []
+    monkeypatch.setattr(
+        torch, "set_rng_state", lambda *args: setter_calls.append("cpu")
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state_all",
+        lambda *args: setter_calls.append("cuda"),
+    )
+
+    with pytest.raises(ValueError, match="RNG state tensor"):
+        cv_pipeline._restore_resume_rng_state(state, cuda=current_cuda)
+    assert setter_calls == []
 
 
 def test_completed_hash_mismatch_retrains_from_random_epoch_zero(

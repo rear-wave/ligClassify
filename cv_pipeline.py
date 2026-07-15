@@ -236,6 +236,17 @@ def _cuda_environment_identity():
     }
 
 
+def _validate_rng_state_tensor(value, name):
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.dtype != torch.uint8
+        or value.device.type != "cpu"
+        or value.ndim != 1
+        or value.numel() <= 0
+    ):
+        raise ValueError(f"{name} RNG state tensor is invalid")
+
+
 def _restore_resume_rng_state(resume_state, cuda):
     """Strictly validate and restore RNG/environment for progressed latest state."""
     try:
@@ -244,13 +255,31 @@ def _restore_resume_rng_state(resume_state, cuda):
         raise ValueError("invalid latest fold completed_epochs for RNG restore") from exc
     if completed_epochs <= 0:
         return
+    saved_mode = resume_state.get("execution_device_type")
+    if saved_mode not in {"cpu", "cuda"}:
+        raise ValueError(
+            "progressed latest execution_device_type must be 'cpu' or 'cuda'"
+        )
+    current_mode = "cuda" if cuda else "cpu"
+    if saved_mode != current_mode:
+        raise ValueError(
+            "progressed latest execution device mismatch: "
+            f"saved={saved_mode} current={current_mode}"
+        )
     if "torch_rng_state" not in resume_state:
         raise ValueError("progressed latest checkpoint is missing torch_rng_state")
-    try:
-        torch.set_rng_state(resume_state["torch_rng_state"])
-    except (TypeError, RuntimeError) as exc:
-        raise ValueError("invalid latest checkpoint torch_rng_state") from exc
+    torch_rng_state = resume_state["torch_rng_state"]
+    _validate_rng_state_tensor(torch_rng_state, "CPU")
     if not cuda:
+        if (
+            "cuda_rng_state_all" in resume_state
+            or "cuda_environment" in resume_state
+        ):
+            raise ValueError("progressed CPU latest contains CUDA metadata")
+        try:
+            torch.set_rng_state(torch_rng_state)
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError("invalid latest checkpoint torch_rng_state") from exc
         return
     if "cuda_rng_state_all" not in resume_state:
         raise ValueError("progressed CUDA latest is missing cuda_rng_state_all")
@@ -265,6 +294,12 @@ def _restore_resume_rng_state(resume_state, cuda):
         cuda_rng_state_all
     ) != int(current_environment["device_count"]):
         raise ValueError("cuda_rng_state_all does not match CUDA device count")
+    for index, rng_state in enumerate(cuda_rng_state_all):
+        _validate_rng_state_tensor(rng_state, f"CUDA device {index}")
+    try:
+        torch.set_rng_state(torch_rng_state)
+    except (TypeError, RuntimeError) as exc:
+        raise ValueError("invalid latest checkpoint torch_rng_state") from exc
     try:
         torch.cuda.set_rng_state_all(cuda_rng_state_all)
     except (TypeError, RuntimeError) as exc:
@@ -738,6 +773,7 @@ def train_conditional_fold(
                 "schema": "conditional_expert_cv_fold_state_v1",
                 **state_base,
                 "completed_epochs": epoch + 1,
+                "execution_device_type": "cuda" if cuda else "cpu",
                 "model_config": model_config,
                 "model_state": _clone_state(model),
                 "optimizer_state": optimizer.state_dict(),
