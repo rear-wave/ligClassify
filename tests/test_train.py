@@ -17,13 +17,11 @@ def test_conditional_training_arguments_have_reliable_defaults():
 
     assert args.task_data == "../train_data"
     assert args.output == "./weights/conditional"
-    assert args.model_arch == "conditional_expert_v1"
-    assert args.init_model == args.resume == ""
+    assert args.init_model == ""
     assert args.no_init is False
     assert args.no_amp is False
-    assert args.calibration_samples == 20000
     assert args.bootstrap_iterations == 1000
-    assert args.rejection_target_precision == 0.95
+    assert args.rejection_target_precision == 0.96
     assert args.rejection_min_coverage == 0.80
     assert args.samples_per_epoch == 120000
     assert args.max_samples_per_file == 512
@@ -31,27 +29,39 @@ def test_conditional_training_arguments_have_reliable_defaults():
     assert args.type_focus_distance_weight == 0.25
     assert args.joint_distance_weight == 1.0
     assert args.time_context == "daylight"
-    assert args.baseline_metrics == ""
-    assert args.baseline_model_name == "old"
+    assert args.folds == 3
+    assert args.max_epochs == 50
+    assert args.resume_cv is False
+    assert args.stop_after_oof is False
+    assert args.verify_only is False
+    assert not hasattr(args, "resume")
+    assert not hasattr(args, "baseline_metrics")
+    assert not hasattr(args, "baseline_model_name")
     assert not hasattr(args, "target_ic_fraction")
     assert not hasattr(args, "type_samples_per_epoch")
     assert not hasattr(args, "distance_samples_per_epoch")
     assert not hasattr(args, "distance_batch_size")
     assert not hasattr(args, "distance_batch_type_weight")
+    for obsolete in (
+        "model_arch", "batch_size", "base", "dist_mlp_dim", "dist_dropout",
+        "lr", "wd", "lambda_coarse", "val_fraction", "test_fraction",
+        "deterministic", "calibration_samples",
+    ):
+        assert not hasattr(args, obsolete)
 
 
-def test_resume_and_warm_start_are_mutually_exclusive():
+def test_cv_rejects_warm_start():
     args = train.build_arg_parser().parse_args([
-        "--resume", "latest.pt", "--init_model", "encoder.pt"
+        "--init_model", "encoder.pt"
     ])
 
-    with pytest.raises(ValueError, match="mutually exclusive"):
+    with pytest.raises(ValueError, match="random initialization"):
         train._validate_args(args)
 
 
 def test_training_requires_at_least_one_joint_epoch():
     args = train.build_arg_parser().parse_args([
-        "--epochs", "3", "--type_focus_epochs", "3"
+        "--max_epochs", "3", "--type_focus_epochs", "3"
     ])
 
     with pytest.raises(ValueError, match="joint-stage epoch"):
@@ -145,3 +155,102 @@ def test_cuda_backend_defaults_to_fast_tf32_mode():
         torch.backends.cudnn.benchmark = old[0]
         torch.backends.cudnn.deterministic = old[1]
         torch.backends.cudnn.allow_tf32 = old[2]
+
+
+def test_main_builds_trusted_manifest_and_cv_config(tmp_path, monkeypatch):
+    from tests.test_cv_pipeline import trusted_entries
+
+    captured = {}
+    monkeypatch.setattr(
+        train,
+        "build_manifest",
+        lambda task_data, names: (trusted_entries(tmp_path), {"valid_files": 12}),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        train,
+        "run_cross_validated_training",
+        lambda config, entries, device: captured.update({
+            "config": config, "entries": entries, "device": device
+        }) or {"passed": True},
+    )
+
+    report = train.main([
+        "--task_data", str(tmp_path / "train"),
+        "--output", str(tmp_path / "weights"),
+        "--samples_per_epoch", "24",
+        "--max_epochs", "4",
+        "--type_focus_epochs", "1",
+        "--stop_after_oof",
+    ])
+
+    assert report == {"passed": True}
+    assert captured["device"] == "cpu"
+    assert captured["config"].no_init is True
+    assert captured["config"].init_model == ""
+    assert captured["config"].samples_per_epoch == 24
+    assert captured["config"].stop_after_oof is True
+    assert {entry.type_idx for entry in captured["entries"]} == {0, 1, 2, 3}
+
+
+def test_verify_only_never_queries_cuda_or_starts_training(tmp_path, monkeypatch):
+    from tests.test_cv_pipeline import trusted_entries
+
+    captured = {}
+    monkeypatch.setattr(
+        train,
+        "build_manifest",
+        lambda task_data, names: (trusted_entries(tmp_path), {"valid_files": 12}),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_available",
+        lambda: (_ for _ in ()).throw(AssertionError("CUDA must not be queried")),
+    )
+    monkeypatch.setattr(
+        train,
+        "run_cross_validated_training",
+        lambda *args: (_ for _ in ()).throw(AssertionError("training must not start")),
+    )
+    monkeypatch.setattr(
+        train,
+        "verify_cv_artifacts",
+        lambda output, expected, hashes, config: captured.update({
+            "output": output,
+            "expected": expected,
+            "hashes": hashes,
+            "config": config,
+        }) or {"passed": False, "reasons": ["gate"]},
+    )
+
+    report = train.main([
+        "--task_data", str(tmp_path / "train"),
+        "--output", str(tmp_path / "weights"),
+        "--verify_only",
+    ])
+
+    assert report == {"passed": False, "reasons": ["gate"]}
+    assert len(captured["expected"]) == 24
+    assert set(captured["hashes"]) == {"0", "1", "2"}
+
+
+def test_main_rejects_any_non_research_manifest_type_before_cuda(
+    tmp_path, monkeypatch
+):
+    from tests.test_cv_pipeline import trusted_entries
+
+    entries = trusted_entries(tmp_path)
+    entries[0] = SimpleNamespace(**{**entries[0].__dict__, "type_idx": 4})
+    monkeypatch.setattr(
+        train, "build_manifest", lambda *args: (entries, {"valid_files": 12})
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_available",
+        lambda: (_ for _ in ()).throw(AssertionError("CUDA must not be queried")),
+    )
+    with pytest.raises(ValueError, match="zero IC"):
+        train.main([
+            "--task_data", str(tmp_path / "train"),
+            "--output", str(tmp_path / "weights"),
+        ])
