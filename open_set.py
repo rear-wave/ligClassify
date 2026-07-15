@@ -360,10 +360,7 @@ def fit_oof_rejection_policy(
     if any(not np.isfinite(value) or value <= 0 for _, value in temperature_items):
         raise ValueError("fold temperatures must be positive and finite")
     fold_temperatures = dict(temperature_items)
-    fold_hashes = {} if fold_hashes is None else {
-        str(index): str(value)
-        for index, value in sorted(fold_hashes.items(), key=lambda item: str(item[0]))
-    }
+    fold_hashes = {} if fold_hashes is None else dict(fold_hashes)
     piece_keys = list(signals.get(
         "piece_key", [str(index) for index in range(length)]
     ))
@@ -544,12 +541,18 @@ def decode_with_rejection(logits, features, policy, quality=None):
     )
     probability_thresholds = _as_float_tensor(policy["probability_thresholds"])
     margin_thresholds = _as_float_tensor(policy["margin_thresholds"])
-    distance_thresholds = _as_float_tensor(
-        policy.get(
-            "normalized_distance_thresholds",
-            policy.get("distance_thresholds"),
+    policy_version = int(policy.get("version", 1))
+    if policy_version >= 3:
+        if "normalized_distance_thresholds" not in policy:
+            raise ValueError(
+                f"policy version {policy_version} requires "
+                "normalized_distance_thresholds"
+            )
+        distance_thresholds = _as_float_tensor(
+            policy["normalized_distance_thresholds"]
         )
-    )
+    else:
+        distance_thresholds = _as_float_tensor(policy["distance_thresholds"])
     quality_thresholds = _as_float_tensor(
         policy.get("quality_thresholds", [0.0] * len(probability_thresholds))
     )

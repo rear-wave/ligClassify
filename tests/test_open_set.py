@@ -174,6 +174,78 @@ def test_version_three_policy_decodes_with_normalized_distance_thresholds():
     assert decoded["reason"] == ["feature_distance"]
 
 
+def test_legacy_policy_ignores_conflicting_normalized_distance_thresholds():
+    policy = {
+        "version": 2,
+        "temperature": 1.0,
+        "centroids": [[0.0, 0.0]] * 4,
+        "scales": [[1.0, 1.0]] * 4,
+        "probability_thresholds": [0.40] * 4,
+        "margin_thresholds": [0.20] * 4,
+        "distance_thresholds": [30.0] * 4,
+        "normalized_distance_thresholds": [2.0] * 4,
+        "quality_thresholds": [0.0] * 4,
+    }
+
+    decoded = decode_with_rejection(
+        torch.tensor([[5.0, 0.0, 0.0, 0.0]]),
+        torch.tensor([[20.0, 20.0]]),
+        policy,
+    )
+
+    assert decoded["accepted"].tolist() == [True]
+
+
+def test_version_three_policy_cannot_fall_back_to_legacy_distance_thresholds():
+    policy = {
+        "version": 3,
+        "temperature": 1.0,
+        "centroids": [[0.0, 0.0]] * 4,
+        "scales": [[1.0, 1.0]] * 4,
+        "probability_thresholds": [0.40] * 4,
+        "margin_thresholds": [0.20] * 4,
+        "distance_thresholds": [30.0] * 4,
+        "quality_thresholds": [0.0] * 4,
+    }
+
+    with pytest.raises(
+        ValueError, match="version 3.*normalized_distance_thresholds"
+    ):
+        decode_with_rejection(
+            torch.tensor([[5.0, 0.0, 0.0, 0.0]]),
+            torch.tensor([[20.0, 20.0]]),
+            policy,
+        )
+
+
+def test_oof_policy_preserves_integer_fold_hashes_in_policy_and_hash():
+    signals = separable_oof_signals()
+    fold_hashes = {2: 202, 0: 100}
+
+    policy, decisions = fit_oof_rejection_policy(signals, fold_hashes=fold_hashes)
+
+    assert policy["fold_hashes"] == fold_hashes
+    expected_hash = stable_json_hash({
+        "fold_hashes": fold_hashes,
+        "piece_keys": [str(index) for index in range(104)],
+        "accepted": [bool(value) for value in decisions["accepted"]],
+        "probability_thresholds": [
+            round(float(value), 12) for value in policy["probability_thresholds"]
+        ],
+        "margin_thresholds": [
+            round(float(value), 12) for value in policy["margin_thresholds"]
+        ],
+        "normalized_distance_thresholds": [
+            round(float(value), 12)
+            for value in policy["normalized_distance_thresholds"]
+        ],
+        "quality_thresholds": [
+            round(float(value), 12) for value in policy["quality_thresholds"]
+        ],
+    })
+    assert policy["calibration_hash"] == expected_hash
+
+
 def test_feature_reference_uses_per_type_center_and_scale():
     features = torch.tensor([
         [0.0, 0.0], [2.0, 2.0],
