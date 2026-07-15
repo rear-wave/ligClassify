@@ -3,7 +3,7 @@ from datetime import datetime
 import numpy as np
 
 from data.lig_parser import LigFileIndex
-from data.training_dataset import LightningPieceDataset
+from data.training_dataset import LightningPieceDataset, collate_training_batch
 from data.training_manifest import PieceManifestEntry
 from tests.test_training_manifest import write_lig
 
@@ -37,6 +37,7 @@ def test_training_dataset_returns_multiscale_interval_and_audit_fields(tmp_path)
         split="train",
         lig_index=index,
         use_filter=False,
+        data_root=tmp_path,
     )
     item = dataset[1]
 
@@ -49,10 +50,33 @@ def test_training_dataset_returns_multiscale_interval_and_audit_fields(tmp_path)
     assert item["distance_low_km"].item() == 1500
     assert item["distance_high_km"].item() == 3000
     assert item["file_id"].item() == 0
+    assert item["source_path"] == "NNBE/night/1500-3000km/sample.lig"
+    assert item["piece_index"] == 1
+    assert item["piece_key"] == "NNBE/night/1500-3000km/sample.lig#1"
     assert item["timestamp"] == entries[1].timestamp
     assert np.isfinite(item["local"].numpy()).all()
     assert dataset.distance_labelled.tolist() == [True, True]
     assert dataset.file_ids.tolist() == [0, 0]
+    assert dataset.source_paths.tolist() == [
+        "NNBE/night/1500-3000km/sample.lig",
+        "NNBE/night/1500-3000km/sample.lig",
+    ]
+    assert dataset.piece_indices.tolist() == [0, 1]
+    assert dataset.piece_keys.tolist() == [
+        "NNBE/night/1500-3000km/sample.lig#0",
+        "NNBE/night/1500-3000km/sample.lig#1",
+    ]
+
+    batch = collate_training_batch([dataset[0], dataset[1]])
+    assert batch["source_path"] == [
+        "NNBE/night/1500-3000km/sample.lig",
+        "NNBE/night/1500-3000km/sample.lig",
+    ]
+    assert batch["piece_index"] == [0, 1]
+    assert batch["piece_key"] == [
+        "NNBE/night/1500-3000km/sample.lig#0",
+        "NNBE/night/1500-3000km/sample.lig#1",
+    ]
 
     dataset.close()
     assert index.read_piece(0).shape == (16000,)
@@ -76,5 +100,8 @@ def test_training_dataset_marks_missing_distance_without_losing_type_label(tmp_p
     assert item["type_label"].item() == 0
     assert item["distance_low_km"].item() == -1
     assert item["distance_high_km"].item() == -1
+    assert item["source_path"] == "unlabelled.lig"
+    assert item["piece_index"] == 0
+    assert item["piece_key"] == "unlabelled.lig#0"
     assert dataset.distance_labelled.tolist() == [False]
     dataset.close()

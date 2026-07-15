@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from data.lig_parser import LigFileIndex
+from data.oof_manifest import oof_row_id
 from data.preprocessing import preprocess_multiscale_batch
 from data.signal_context import time_context_batch
 from data.waveform_quality import waveform_quality_batch
@@ -23,11 +25,24 @@ class LightningPieceDataset(Dataset):
         split="train",
         lig_index=None,
         use_filter=True,
+        data_root=None,
     ):
         self.entries = list(entries)
         self.split = str(split)
         self.use_filter = bool(use_filter)
         paths = sorted({entry.filepath for entry in self.entries})
+        absolute_paths = [os.path.abspath(path) for path in paths]
+        if data_root is not None:
+            root = os.path.abspath(os.fspath(data_root))
+        elif absolute_paths:
+            root = os.path.commonpath(absolute_paths)
+            if len(absolute_paths) == 1 and os.path.normcase(root) == os.path.normcase(
+                absolute_paths[0]
+            ):
+                root = os.path.dirname(root)
+        else:
+            root = os.getcwd()
+        self.data_root = root
         self._owns_lig_index = lig_index is None
         self.lig = lig_index or LigFileIndex(paths, validate=False)
         path_to_file = {
@@ -41,6 +56,9 @@ class LightningPieceDataset(Dataset):
         distance_high_km = []
         daylight = []
         file_ids = []
+        source_paths = []
+        piece_indices = []
+        piece_keys = []
         timestamps = []
         for entry in self.entries:
             path_key = os.path.normcase(os.path.abspath(entry.filepath))
@@ -65,6 +83,12 @@ class LightningPieceDataset(Dataset):
             distance_high_km.append(high)
             daylight.append(int(is_daytime))
             file_ids.append(file_id)
+            source_path = Path(
+                os.path.relpath(os.path.abspath(entry.filepath), root)
+            ).as_posix()
+            source_paths.append(source_path)
+            piece_indices.append(int(entry.piece_index))
+            piece_keys.append(oof_row_id(source_path, entry.piece_index))
             timestamps.append(entry.timestamp)
 
         self.global_indices = np.asarray(global_indices, dtype=np.int64)
@@ -77,6 +101,9 @@ class LightningPieceDataset(Dataset):
         )
         self.daylight = np.asarray(daylight, dtype=np.int8)
         self.file_ids = np.asarray(file_ids, dtype=np.int32)
+        self.source_paths = np.asarray(source_paths, dtype=object)
+        self.piece_indices = np.asarray(piece_indices, dtype=np.int64)
+        self.piece_keys = np.asarray(piece_keys, dtype=object)
         self.timestamps = timestamps
         self.context = time_context_batch(self.timestamps, self.daylight)
 
@@ -111,6 +138,9 @@ class LightningPieceDataset(Dataset):
                 "file_id": torch.tensor(
                     int(self.file_ids[position]), dtype=torch.long
                 ),
+                "source_path": str(self.source_paths[position]),
+                "piece_index": int(self.piece_indices[position]),
+                "piece_key": str(self.piece_keys[position]),
                 "timestamp": self.timestamps[position],
             })
         return items
@@ -142,5 +172,8 @@ def collate_training_batch(batch):
         "file_id",
     )
     result = {key: torch.stack([item[key] for item in batch]) for key in keys}
+    result["source_path"] = [item["source_path"] for item in batch]
+    result["piece_index"] = [int(item["piece_index"]) for item in batch]
+    result["piece_key"] = [item["piece_key"] for item in batch]
     result["timestamp"] = [item["timestamp"] for item in batch]
     return result

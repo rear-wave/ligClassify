@@ -99,7 +99,7 @@ def _warm_start(model, path):
 
 
 @torch.no_grad()
-def collect_prediction_bundle(model, loader, device, split_hash):
+def collect_prediction_bundle(model, loader, device, split_hash, fold_index=None):
     """Collect records and calibration tensors from one bounded loader."""
     model.eval()
     records = []
@@ -128,8 +128,13 @@ def collect_prediction_bundle(model, loader, device, split_hash):
         high_parts.append(batch["distance_high_km"].cpu())
         file_id_parts.append(batch["file_id"].cpu())
         for row in range(len(predicted)):
+            source_path = str(batch["source_path"][row])
             records.append({
-                "file_id": int(batch["file_id"][row].item()),
+                "file_id": source_path,
+                "source_path": source_path,
+                "piece_index": int(batch["piece_index"][row]),
+                "piece_key": str(batch["piece_key"][row]),
+                "fold": None if fold_index is None else int(fold_index),
                 "true_type": int(batch["type_label"][row].item()),
                 "predicted_type": int(predicted[row].item()),
                 "accepted": True,
@@ -303,7 +308,7 @@ def run_conditional_training(args, device):
         name: build_piece_manifest(entries) for name, entries in file_splits.items()
     }
     datasets = {
-        name: LightningPieceDataset(entries, split=name)
+        name: LightningPieceDataset(entries, split=name, data_root=args.task_data)
         for name, entries in piece_splits.items()
     }
     train_set, val_set, test_set = (
