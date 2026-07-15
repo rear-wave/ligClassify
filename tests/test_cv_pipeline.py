@@ -1,28 +1,37 @@
 import csv
+import copy
+import dataclasses
 import json
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+import numpy as np
 import torch
 
 from cv_pipeline import (
     CVConfig,
+    FINAL_CHECKPOINT_FIELDS,
     FoldResult,
     OOF_FIELDS,
+    atomic_promote_checkpoint,
     evaluate_oof_artifacts,
     load_verified_fold,
+    make_final_training_request,
     read_oof_csv,
     run_cross_validated_training,
+    train_final_model,
     training_config_hash,
+    validate_final_checkpoint,
     validate_fold_checkpoint,
     verify_cv_artifacts,
 )
-from data.cross_validation import assign_exact_folds, fold_train_holdout
+from data.cross_validation import assign_exact_folds, build_support_map, fold_train_holdout
 from data.oof_manifest import oof_row_id
-from data.split_artifacts import make_fold_manifest, split_hash
+from data.split_artifacts import make_fold_manifest, split_hash, stable_json_hash
 from data.training_manifest import ManifestEntry
 from data.training_manifest import build_manifest
+from conditional_pipeline import select_final_reference_positions
 from models import create_mtl_model
 from tests.test_training_manifest import write_lig
 
@@ -190,6 +199,613 @@ def fail_if_called(*args, **kwargs):
     raise AssertionError("final trainer must not be called")
 
 
+def fold_result(index, best_epoch):
+    return FoldResult(
+        fold_index=index,
+        best_epoch=best_epoch,
+        train_hash=f"train-{index}",
+        holdout_hash=f"holdout-{index}",
+        config_hash="config",
+        checkpoint_path=f"fold-{index}/best.pt",
+        oof_path=f"fold-{index}/oof.csv",
+        metrics={},
+    )
+
+
+def test_final_request_uses_all_files_random_init_and_median_epoch(tmp_path):
+    entries = trusted_entries(tmp_path)
+
+    request = make_final_training_request(
+        entries,
+        [fold_result(0, 8), fold_result(1, 11), fold_result(2, 20)],
+    )
+
+    assert request.epochs == 11
+    assert len(request.entries) == len(entries)
+    assert request.init_model is None
+
+
+def test_final_request_requires_exactly_complete_fold_results(tmp_path):
+    with pytest.raises(ValueError, match="complete folds 0, 1, and 2"):
+        make_final_training_request(
+            trusted_entries(tmp_path),
+            [fold_result(0, 8), fold_result(1, 11), fold_result(1, 20)],
+        )
+
+
+def test_final_request_rejects_any_nonpositive_best_epoch(tmp_path):
+    with pytest.raises(ValueError, match="best epochs must be positive"):
+        make_final_training_request(
+            trusted_entries(tmp_path),
+            [fold_result(0, 0), fold_result(1, 11), fold_result(2, 20)],
+        )
+
+
+def test_atomic_validation_failure_preserves_existing_model(tmp_path, monkeypatch):
+    candidate = tmp_path / "final_candidate.pt"
+    existing = tmp_path / "model.pt"
+    existing.write_bytes(b"deployed")
+
+    def reject(_checkpoint):
+        raise ValueError("checkpoint validation failed")
+
+    monkeypatch.setattr("cv_pipeline.validate_final_checkpoint", reject)
+    with pytest.raises(ValueError, match="checkpoint validation"):
+        atomic_promote_checkpoint(
+            {"schema": "four_class_cv_v3"}, candidate, existing
+        )
+
+    assert existing.read_bytes() == b"deployed"
+    assert not candidate.exists()
+
+
+def test_final_training_random_inits_and_runs_exact_fixed_epochs(
+    tmp_path, monkeypatch
+):
+    import cv_pipeline
+
+    calls = {"epochs": [], "model_configs": [], "datasets": []}
+
+    class FakeDataset:
+        def __init__(self, pieces, **kwargs):
+            self.type_labels = [0, 1, 2, 3]
+            self.daylight = [1, 1, 1, 1]
+            self.distance_low_km = [0, 0, 0, 0]
+            self.distance_high_km = [100, 100, 100, 100]
+            self.file_ids = [0, 1, 2, 3]
+            self.closed = False
+            calls["datasets"].append(kwargs)
+
+        def __len__(self):
+            return 4
+
+        def close(self):
+            self.closed = True
+
+    class FakeSampler:
+        def __init__(self, *args, **kwargs):
+            self.epochs = []
+
+        def set_epoch(self, epoch):
+            self.epochs.append(epoch)
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+        def load_state_dict(self, *args, **kwargs):
+            raise AssertionError("fresh final training must not load any model state")
+
+    def create_model(**model_config):
+        calls["model_configs"].append(model_config)
+        return TinyModel()
+
+    def run_epoch(*args, **kwargs):
+        calls["epochs"].append(args[7])
+        args[3].zero_grad()
+        args[3].step()
+        return "joint", 1.0, {}
+
+    monkeypatch.setattr(cv_pipeline, "build_piece_manifest", lambda entries: list(entries))
+    monkeypatch.setattr(cv_pipeline, "LightningPieceDataset", FakeDataset)
+    monkeypatch.setattr(cv_pipeline, "JointConditionSampler", FakeSampler)
+    monkeypatch.setattr(cv_pipeline, "_loader", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cv_pipeline, "create_mtl_model", create_model)
+    monkeypatch.setattr(cv_pipeline, "run_conditional_epoch", run_epoch)
+    monkeypatch.setattr(
+        cv_pipeline,
+        "_build_final_checkpoint",
+        lambda model, dataset, request, cfg, device: {"trained": True},
+        raising=False,
+    )
+    final_config = CVConfig(
+        task_data=tmp_path / "train",
+        output=tmp_path / "weights",
+        samples_per_epoch=8,
+        max_samples_per_file=2,
+        type_focus_epochs=1,
+        max_epochs=99,
+        patience=1,
+        num_workers=0,
+        no_amp=True,
+    )
+    request = make_final_training_request(
+        trusted_entries(tmp_path),
+        [fold_result(0, 2), fold_result(1, 3), fold_result(2, 4)],
+    )
+
+    checkpoint = train_final_model(request, final_config, "cpu")
+
+    assert checkpoint == {"trained": True}
+    assert calls["epochs"] == [0, 1, 2]
+    assert calls["model_configs"] == [{
+        **cv_pipeline.FOLD_MODEL_CONFIG,
+        "context_dim": 1,
+    }]
+    assert calls["datasets"][0]["split"] == "train"
+    assert calls["datasets"][0]["augmentation"] is not None
+    assert (final_config.output / "final_latest.pt").is_file()
+
+
+def test_final_training_rejects_non_daylight_context_before_model_creation(
+    tmp_path, monkeypatch
+):
+    model_calls = []
+    final_config = CVConfig(
+        task_data=tmp_path / "train",
+        output=tmp_path / "weights",
+        time_context="cyclic",
+    )
+    request = make_final_training_request(
+        trusted_entries(tmp_path),
+        [fold_result(0, 2), fold_result(1, 3), fold_result(2, 4)],
+    )
+    monkeypatch.setattr(
+        "cv_pipeline.create_mtl_model",
+        lambda **kwargs: model_calls.append(kwargs),
+    )
+
+    with pytest.raises(ValueError, match="daylight context"):
+        train_final_model(request, final_config, "cpu")
+
+    assert model_calls == []
+
+
+def test_final_training_resume_exactly_continues_matching_latest(
+    tmp_path, monkeypatch
+):
+    import cv_pipeline
+
+    final_config, train_entries, holdout_entries = _real_fold_case(
+        tmp_path, monkeypatch, max_epochs=4
+    )
+    final_config = CVConfig(**{**final_config.__dict__, "resume_cv": True})
+    request = make_final_training_request(
+        [*train_entries, *holdout_entries],
+        [fold_result(0, 2), fold_result(1, 3), fold_result(2, 4)],
+    )
+    monkeypatch.setattr(
+        cv_pipeline,
+        "_build_final_checkpoint",
+        lambda model, dataset, request, cfg, device: {"complete": True},
+    )
+    original_epoch = cv_pipeline.run_conditional_epoch
+    first_epochs = []
+
+    def interrupt_on_third(*args, **kwargs):
+        first_epochs.append(int(args[7]))
+        if int(args[7]) == 2:
+            raise RuntimeError("simulated final interruption")
+        return original_epoch(*args, **kwargs)
+
+    monkeypatch.setattr(cv_pipeline, "run_conditional_epoch", interrupt_on_third)
+    with pytest.raises(RuntimeError, match="simulated final interruption"):
+        train_final_model(request, final_config, "cpu")
+
+    resumed_epochs = []
+
+    def resumed_epoch(*args, **kwargs):
+        resumed_epochs.append(int(args[7]))
+        return original_epoch(*args, **kwargs)
+
+    monkeypatch.setattr(cv_pipeline, "run_conditional_epoch", resumed_epoch)
+    checkpoint = train_final_model(request, final_config, "cpu")
+
+    latest = torch.load(
+        final_config.output / "final_latest.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert first_epochs == [0, 1, 2]
+    assert resumed_epochs == [2]
+    assert latest["completed_epochs"] == 3
+    assert checkpoint == {"complete": True}
+
+
+def test_final_reference_selection_is_bounded_hierarchical_and_deterministic():
+    rows = []
+    for type_index in range(4):
+        for daylight in (0, 1):
+            for file_index in range(2):
+                for piece_index in range(3):
+                    rows.append((
+                        type_index,
+                        daylight,
+                        type_index * 100,
+                        type_index * 100 + 100,
+                        f"type-{type_index}/day-{daylight}/file-{file_index}.lig",
+                        piece_index,
+                    ))
+    rows.reverse()
+
+    class ReferenceDataset:
+        type_labels = np.asarray([row[0] for row in rows])
+        daylight = np.asarray([row[1] for row in rows])
+        distance_low_km = np.asarray([row[2] for row in rows])
+        distance_high_km = np.asarray([row[3] for row in rows])
+        source_paths = np.asarray([row[4] for row in rows], dtype=object)
+        piece_indices = np.asarray([row[5] for row in rows])
+
+        def __len__(self):
+            return len(rows)
+
+    dataset = ReferenceDataset()
+
+    selected = select_final_reference_positions(dataset, limit=16)
+
+    assert selected == select_final_reference_positions(dataset, limit=16)
+    assert len(selected) == len(set(selected)) == 16
+    selected_rows = [rows[index] for index in selected]
+    assert {row[0] for row in selected_rows} == {0, 1, 2, 3}
+    assert {
+        (row[0], row[1]) for row in selected_rows
+    } == {(type_index, daylight) for type_index in range(4) for daylight in (0, 1)}
+    assert all(row[5] == 0 for row in selected_rows)
+
+
+def _good_release_metrics():
+    return {
+        "type_file_equal_precision": [0.96, 0.97, 0.98, 0.99],
+        "type_coverage": 0.82,
+        "type_file_equal_recall_mean": 0.91,
+        "distance_100km_interval_within_200": 0.88,
+        "distance_per_type_100km_interval_within_200": [0.80, 0.85, 0.90, 0.95],
+        "distance_conditions_100km": {},
+    }
+
+
+def _valid_final_checkpoint():
+    model_config = {
+        "base_channels": 1,
+        "architecture": "conditional_expert_v1",
+        "num_types": 4,
+        "context_dim": 1,
+        "dist_mlp_dim": 2,
+        "dist_dropout": 0.0,
+    }
+    model = create_mtl_model(**model_config)
+    metrics = _good_release_metrics()
+    fold_hashes = {
+        str(index): {
+            "train_hash": f"{index + 1}" * 64,
+            "holdout_hash": f"{index + 4}" * 64,
+            "config_hash": "a" * 64,
+        }
+        for index in range(3)
+    }
+    support_map = {
+        f"{type_name}/day/0-100km": {
+            "file_count": 3,
+            "piece_count": 6,
+            "type_index": type_index,
+            "daylight": True,
+            "low_km": 0,
+            "high_km": 100,
+            "status": "supported",
+        }
+        for type_index, type_name in enumerate(("NCG", "NNBE", "PCG", "PNBE"))
+    }
+    return {
+        "schema": "four_class_cv_v3",
+        "model_version": "conditional-expert-cv-v3",
+        "architecture": "conditional_expert_v1",
+        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
+        "context_dim": 1,
+        "model_config": model_config,
+        "model_state": model.state_dict(),
+        "preprocessing": {
+            "name": "signed_local_global_v1",
+            "normalize_mode": "robust_signed_99_5",
+            "filter": "butterworth_120khz_order2",
+            "target_length": 8000,
+        },
+        "augmentation": {
+            "max_shift_samples": 64,
+            "gain_min": 0.9,
+            "gain_max": 1.1,
+            "baseline_drift_fraction": 0.01,
+            "noise_fraction": 0.01,
+            "synchronized_views": True,
+            "polarity_inversion": False,
+            "time_reversal": False,
+        },
+        "fold_manifest_hash": "b" * 64,
+        "fold_hashes": fold_hashes,
+        "full_data_hash": "c" * 64,
+        "final_epochs": 3,
+        "random_initialization": True,
+        "initialization_source": None,
+        "oof_metrics": metrics,
+        "oof_metrics_hash": stable_json_hash(metrics),
+        "rejection_policy": {
+            "version": 3,
+            "temperature": 1.25,
+            "fold_temperatures": {"0": 1.0, "1": 1.25, "2": 1.5},
+            "probability_thresholds": [0.5] * 4,
+            "margin_thresholds": [0.2] * 4,
+            "normalized_distance_thresholds": [2.0] * 4,
+            "quality_thresholds": [0.1] * 4,
+            "target_precision": 0.96,
+            "minimum_coverage": 0.80,
+            "oof_metrics": {
+                "type_file_equal_precision": [0.96, 0.97, 0.98, 0.99],
+                "type_coverage": 0.82,
+            },
+            "fold_hashes": fold_hashes,
+            "calibration_hash": "d" * 64,
+            "centroids": [[0.0] * 4] * 4,
+            "scales": [[1.0] * 4] * 4,
+        },
+        "distance_temperatures": [1.0, 1.1, 1.2, 1.3],
+        "support_map": support_map,
+        "support_map_hash": stable_json_hash(support_map),
+        "feature_reference_selection_hash": "e" * 64,
+    }
+
+
+def _checkpoint_with_disk_evidence(request, final_config):
+    checkpoint = _valid_final_checkpoint()
+    saved = json.loads(
+        (final_config.output / "cv_metrics.json").read_text(encoding="utf-8")
+    )
+    manifest = json.loads(
+        (final_config.output / "fold_manifest.json").read_text(encoding="utf-8")
+    )
+    support_map = build_support_map(
+        request.entries, ("NCG", "NNBE", "PCG", "PNBE")
+    )
+    policy = copy.deepcopy(saved["type_rejection"])
+    policy["centroids"] = [[0.0] * 4] * 4
+    policy["scales"] = [[1.0] * 4] * 4
+    checkpoint.update({
+        "fold_manifest_hash": manifest["combined_hash"],
+        "fold_hashes": saved["fold_hashes"],
+        "full_data_hash": split_hash(request.entries, final_config.task_data),
+        "final_epochs": request.epochs,
+        "oof_metrics": saved["metrics"],
+        "oof_metrics_hash": saved["recomputed_metrics_hash"],
+        "rejection_policy": policy,
+        "distance_temperatures": saved["distance_calibration"]["final_temperatures"],
+        "support_map": support_map,
+        "support_map_hash": stable_json_hash(support_map),
+    })
+    return checkpoint
+
+
+def test_validate_final_checkpoint_accepts_complete_strict_v3():
+    validate_final_checkpoint(_valid_final_checkpoint())
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (lambda item: item.pop("full_data_hash"), "missing"),
+        (lambda item: item.__setitem__("extra", True), "unexpected"),
+        (lambda item: item.__setitem__("context_dim", 3), "context_dim"),
+        (lambda item: item.__setitem__("random_initialization", False), "random-init"),
+        (lambda item: item.__setitem__("initialization_source", "old.pt"), "source"),
+        (lambda item: item.__setitem__("full_data_hash", "not-a-hash"), "full_data_hash"),
+        (
+            lambda item: item["rejection_policy"].__setitem__("version", 2),
+            "policy is not v3",
+        ),
+        (
+            lambda item: item["rejection_policy"].__setitem__(
+                "fold_hashes", {"0": {}}
+            ),
+            "calibration fold hashes",
+        ),
+        (lambda item: item["oof_metrics"].__setitem__("type_coverage", 0.0), "metric hash"),
+        (lambda item: item.__setitem__("distance_temperatures", [1.0, 0.0]), "temperatures"),
+        (lambda item: item["model_state"].pop(next(iter(item["model_state"]))), "model configuration/state"),
+        (
+            lambda item: item["preprocessing"].__setitem__(
+                "old_model_path", "weights/old/model.pt"
+            ),
+            "old initialization path",
+        ),
+        (
+            lambda item: item["preprocessing"].__setitem__(
+                "filter", "weights/old/model.pt"
+            ),
+            "old initialization path",
+        ),
+        (
+            lambda item: item["augmentation"].__setitem__("gain_min", -1.0),
+            "augmentation",
+        ),
+    ],
+)
+def test_validate_final_checkpoint_rejects_invalid_release_evidence(mutation, match):
+    checkpoint = copy.deepcopy(_valid_final_checkpoint())
+    mutation(checkpoint)
+
+    with pytest.raises(ValueError, match=match):
+        validate_final_checkpoint(checkpoint)
+
+
+def test_validate_final_checkpoint_rejects_semantically_mismatched_support_key():
+    checkpoint = _valid_final_checkpoint()
+    row = checkpoint["support_map"].pop("NCG/day/0-100km")
+    checkpoint["support_map"]["NCG/night/900-1000km"] = row
+    checkpoint["support_map_hash"] = stable_json_hash(checkpoint["support_map"])
+
+    with pytest.raises(ValueError, match="invalid support map"):
+        validate_final_checkpoint(checkpoint)
+
+
+def test_atomic_second_validation_failure_preserves_existing_model(
+    tmp_path, monkeypatch
+):
+    candidate = tmp_path / "final_candidate.pt"
+    deployed = tmp_path / "model.pt"
+    deployed.write_bytes(b"deployed")
+    calls = []
+
+    def fail_second(checkpoint):
+        calls.append(checkpoint["schema"])
+        if len(calls) == 2:
+            raise ValueError("checkpoint validation failed at model stage")
+
+    monkeypatch.setattr("cv_pipeline.validate_final_checkpoint", fail_second)
+
+    with pytest.raises(ValueError, match="model stage"):
+        atomic_promote_checkpoint(_valid_final_checkpoint(), candidate, deployed)
+
+    assert calls == ["four_class_cv_v3", "four_class_cv_v3"]
+    assert candidate.is_file()
+    assert deployed.read_bytes() == b"deployed"
+    assert not (tmp_path / "final_candidate.pt.tmp").exists()
+    assert not (tmp_path / "model.pt.tmp").exists()
+
+
+def test_final_checkpoint_binds_verified_disk_evidence_and_final_features(
+    tmp_path, monkeypatch
+):
+    import cv_pipeline
+
+    entries = trusted_entries(tmp_path)
+    final_config = config(tmp_path, resume_cv=False, stop_after_oof=False)
+    folds = assign_exact_folds(entries, n_folds=3, seed=final_config.seed)
+    manifest = make_fold_manifest(folds, final_config.task_data, final_config.seed)
+    final_config.output.mkdir(parents=True)
+    (final_config.output / "fold_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    fold_hashes = {
+        str(index): {
+            "train_hash": manifest["train_hashes"][str(index)],
+            "holdout_hash": manifest["holdout_hashes"][str(index)],
+            "config_hash": training_config_hash(final_config),
+        }
+        for index in range(3)
+    }
+    metrics = _good_release_metrics()
+    policy = {
+        "version": 3,
+        "temperature": 1.25,
+        "fold_temperatures": {"0": 1.0, "1": 1.25, "2": 1.5},
+        "probability_thresholds": [0.5] * 4,
+        "margin_thresholds": [0.2] * 4,
+        "normalized_distance_thresholds": [2.0] * 4,
+        "quality_thresholds": [0.1] * 4,
+        "target_precision": 0.96,
+        "minimum_coverage": 0.80,
+        "oof_metrics": metrics,
+        "fold_hashes": fold_hashes,
+        "calibration_hash": stable_json_hash({"calibration": "verified"}),
+        "fold_centroids": [[999.0] * 4] * 4,
+    }
+    saved = {
+        "schema": "conditional_expert_cv_metrics_v1",
+        "rounding_decimals": 12,
+        "fold_hashes": fold_hashes,
+        "type_rejection": policy,
+        "distance_calibration": {"final_temperatures": [1.0, 1.1, 1.2, 1.3]},
+        "metrics": metrics,
+        "recomputed_metrics_hash": stable_json_hash(metrics),
+        "verified_release": {
+            "passed": True,
+            "reasons": [],
+            "source": "verify_cv_artifacts_v1",
+        },
+    }
+    (final_config.output / "cv_metrics.json").write_text(
+        json.dumps(saved), encoding="utf-8"
+    )
+
+    class ReferenceDataset:
+        type_labels = np.asarray([0, 0, 1, 1, 2, 2, 3, 3])
+        daylight = np.asarray([0, 1] * 4)
+        distance_low_km = np.asarray([0] * 8)
+        distance_high_km = np.asarray([100] * 8)
+        source_paths = np.asarray(
+            [f"type-{index // 2}/file-{index}.lig" for index in range(8)],
+            dtype=object,
+        )
+        piece_indices = np.asarray([0] * 8)
+        piece_keys = np.asarray(
+            [f"type-{index // 2}/file-{index}.lig#0" for index in range(8)],
+            dtype=object,
+        )
+
+        def __len__(self):
+            return 8
+
+    dataset = ReferenceDataset()
+    selected = []
+
+    def reference_loader(dataset, batch_size, sampler=None, **kwargs):
+        selected.extend(list(sampler))
+        return object()
+
+    def collect_features(model, loader, device):
+        labels = torch.as_tensor(dataset.type_labels[selected], dtype=torch.long)
+        features = torch.tensor([
+            [float(label), 1.0, 2.0, 3.0] for label in labels
+        ])
+        return features, labels
+
+    monkeypatch.setattr(cv_pipeline, "_loader", reference_loader)
+    monkeypatch.setattr(cv_pipeline, "collect_reference_features", collect_features)
+    monkeypatch.setattr(cv_pipeline, "FOLD_MODEL_CONFIG", {
+        "base_channels": 1,
+        "architecture": "conditional_expert_v1",
+        "num_types": 4,
+        "context_dim": 1,
+        "dist_mlp_dim": 2,
+        "dist_dropout": 0.0,
+    })
+    model = create_mtl_model(**cv_pipeline.FOLD_MODEL_CONFIG)
+    request = make_final_training_request(
+        entries,
+        [fold_result(0, 2), fold_result(1, 3), fold_result(2, 4)],
+    )
+
+    checkpoint = cv_pipeline._build_final_checkpoint(
+        model, dataset, request, final_config, "cpu"
+    )
+
+    assert set(checkpoint) == FINAL_CHECKPOINT_FIELDS
+    assert checkpoint["schema"] == "four_class_cv_v3"
+    assert checkpoint["fold_manifest_hash"] == manifest["combined_hash"]
+    assert checkpoint["fold_hashes"] == fold_hashes
+    assert checkpoint["full_data_hash"] == split_hash(entries, final_config.task_data)
+    assert checkpoint["final_epochs"] == 3
+    assert checkpoint["random_initialization"] is True
+    assert checkpoint["initialization_source"] is None
+    assert checkpoint["oof_metrics"] == metrics
+    assert checkpoint["oof_metrics_hash"] == stable_json_hash(metrics)
+    assert checkpoint["distance_temperatures"] == [1.0, 1.1, 1.2, 1.3]
+    assert checkpoint["rejection_policy"]["centroids"] != policy["fold_centroids"]
+    assert "fold_centroids" not in checkpoint["rejection_policy"]
+    assert checkpoint["feature_reference_selection_hash"] == stable_json_hash(
+        [str(dataset.piece_keys[index]) for index in selected]
+    )
+    assert 0 < len(selected) <= 20000
+
+
 def test_evaluator_true_without_artifacts_cannot_authorize_final_training(tmp_path):
     final_calls = []
 
@@ -274,16 +890,26 @@ def test_evaluator_cannot_rewrite_canonical_fold_artifact_bytes(tmp_path):
     assert final_calls == []
 
 
-def test_evaluator_false_return_cannot_veto_verified_artifacts(tmp_path):
+def test_evaluator_false_return_cannot_veto_verified_artifacts(
+    tmp_path, monkeypatch
+):
     final_calls = []
+    promotions = []
 
     def lying_evaluator(rows, expected, output_dir, fold_config):
         passing_oof_evaluator(rows, expected, output_dir, fold_config)
         return {"passed": False, "reasons": ["fabricated"]}
 
-    def final_trainer(*args, **kwargs):
-        final_calls.append(True)
-        return {"trained": True}
+    def final_trainer(request, final_config, device):
+        final_calls.append((request, final_config, device))
+        return _checkpoint_with_disk_evidence(request, final_config)
+
+    monkeypatch.setattr(
+        "cv_pipeline.atomic_promote_checkpoint",
+        lambda checkpoint, candidate, model: promotions.append(
+            (checkpoint, Path(candidate), Path(model))
+        ),
+    )
 
     report = run_cross_validated_training(
         config(tmp_path, stop_after_oof=False), trusted_entries(tmp_path), "cpu",
@@ -292,8 +918,69 @@ def test_evaluator_false_return_cannot_veto_verified_artifacts(tmp_path):
     )
 
     assert report["passed"] is True
-    assert report["final_result"] == {"trained": True}
-    assert final_calls == [True]
+    assert report["final_model"] == str(config(tmp_path).output / "model.pt")
+    assert len(final_calls) == 1
+    request, called_config, called_device = final_calls[0]
+    assert request.epochs == 3
+    assert request.entries == tuple(trusted_entries(tmp_path))
+    assert request.init_model is None
+    assert called_config == config(tmp_path, stop_after_oof=False)
+    assert called_device == "cpu"
+    assert len(promotions) == 1
+    assert promotions[0][0]["schema"] == "four_class_cv_v3"
+    assert promotions[0][1:] == (
+        config(tmp_path).output / "final_candidate.pt",
+        config(tmp_path).output / "model.pt",
+    )
+
+
+def test_verified_pass_uses_default_final_trainer_and_one_promotion(
+    tmp_path, monkeypatch
+):
+    trainer_calls = []
+    promotion_calls = []
+
+    def default_trainer(request, final_config, device):
+        trainer_calls.append((request.epochs, device))
+        return _checkpoint_with_disk_evidence(request, final_config)
+
+    monkeypatch.setattr("cv_pipeline.train_final_model", default_trainer)
+    monkeypatch.setattr(
+        "cv_pipeline.atomic_promote_checkpoint",
+        lambda checkpoint, candidate, model: promotion_calls.append(checkpoint),
+    )
+
+    report = run_cross_validated_training(
+        config(tmp_path, stop_after_oof=False),
+        trusted_entries(tmp_path),
+        "cpu",
+        fold_trainer=fake_fold_trainer([]),
+        oof_evaluator=passing_oof_evaluator,
+    )
+
+    assert trainer_calls == [(3, "cpu")]
+    assert len(promotion_calls) == 1
+    assert promotion_calls[0]["schema"] == "four_class_cv_v3"
+    assert report["final_model"].endswith("model.pt")
+
+
+def test_injected_final_trainer_cannot_replace_verified_release_evidence(tmp_path):
+    deployed = config(tmp_path, stop_after_oof=False).output / "model.pt"
+    deployed.parent.mkdir(parents=True)
+    deployed.write_bytes(b"existing")
+
+    with pytest.raises(ValueError, match="verified disk evidence"):
+        run_cross_validated_training(
+            config(tmp_path, stop_after_oof=False),
+            trusted_entries(tmp_path),
+            "cpu",
+            fold_trainer=fake_fold_trainer([]),
+            final_trainer=lambda request, cfg, device: _valid_final_checkpoint(),
+            oof_evaluator=passing_oof_evaluator,
+        )
+
+    assert deployed.read_bytes() == b"existing"
+    assert not (deployed.parent / "final_candidate.pt").exists()
 
 
 def test_cv_runs_each_fold_once_and_validates_all_oof_rows(tmp_path):
@@ -380,6 +1067,20 @@ def test_training_config_hash_excludes_paths_and_run_control_flags(tmp_path):
         }
     )
     assert training_config_hash(first) == training_config_hash(second)
+
+
+def test_training_config_hash_binds_shared_augmentation_contract(tmp_path):
+    import cv_pipeline
+
+    final_config = config(tmp_path)
+    payload = dataclasses.asdict(final_config)
+    for key in ("task_data", "output", "resume_cv", "stop_after_oof"):
+        payload.pop(key)
+    payload["augmentation"] = dataclasses.asdict(
+        cv_pipeline.TRAINING_AUGMENTATION_CONFIG
+    )
+
+    assert training_config_hash(final_config) == stable_json_hash(payload)
 
 
 def test_cv_requires_exactly_three_folds(tmp_path):
@@ -847,11 +1548,20 @@ def _real_fold_case(tmp_path, monkeypatch, *, max_epochs=2, patience=1):
 def test_train_conditional_fold_writes_resumable_checkpoint_and_raw_oof(
     tmp_path, monkeypatch
 ):
+    import cv_pipeline
     from cv_pipeline import train_conditional_fold
 
     fold_config, train_entries, holdout_entries = _real_fold_case(
         tmp_path, monkeypatch
     )
+    original_dataset = cv_pipeline.LightningPieceDataset
+    dataset_arguments = []
+
+    def recording_dataset(*args, **kwargs):
+        dataset_arguments.append(dict(kwargs))
+        return original_dataset(*args, **kwargs)
+
+    monkeypatch.setattr(cv_pipeline, "LightningPieceDataset", recording_dataset)
 
     result = train_conditional_fold(
         train_entries,
@@ -882,6 +1592,8 @@ def test_train_conditional_fold_writes_resumable_checkpoint_and_raw_oof(
     assert latest["execution_device_type"] == "cpu"
     assert set(OOF_FIELDS).issubset(rows[0])
     assert all(row["source_path"].endswith("file-2.lig") for row in rows)
+    assert dataset_arguments[0]["augmentation"] is not None
+    assert dataset_arguments[1].get("augmentation") is None
 
 
 def test_resume_with_progress_but_missing_latest_checkpoint_fails(

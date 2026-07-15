@@ -25,6 +25,59 @@ LOGGER = logging.getLogger(__name__)
 TYPE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
 
 
+def select_final_reference_positions(dataset, limit=20000):
+    """Select unique pieces by type/day/interval/file/piece round-robin."""
+    limit = int(limit)
+    if limit <= 0:
+        raise ValueError("final feature reference limit must be positive")
+    fields = (
+        dataset.type_labels,
+        dataset.daylight,
+        dataset.distance_low_km,
+        dataset.distance_high_km,
+        dataset.source_paths,
+        dataset.piece_indices,
+    )
+    if any(len(field) != len(dataset) for field in fields):
+        raise ValueError("final feature reference metadata is not aligned")
+    hierarchy = {}
+    for position in range(len(dataset)):
+        type_index = int(dataset.type_labels[position])
+        daylight = int(dataset.daylight[position])
+        interval = (
+            int(dataset.distance_low_km[position]),
+            int(dataset.distance_high_km[position]),
+        )
+        source_path = str(dataset.source_paths[position])
+        piece_index = int(dataset.piece_indices[position])
+        hierarchy.setdefault(type_index, {}).setdefault(daylight, {}).setdefault(
+            interval, {}
+        ).setdefault(source_path, []).append((piece_index, position))
+
+    def traverse(node):
+        if isinstance(node, list):
+            for _, position in sorted(node):
+                yield position
+            return
+        active = [iter(traverse(node[key])) for key in sorted(node)]
+        while active:
+            remaining = []
+            for iterator in active:
+                try:
+                    yield next(iterator)
+                    remaining.append(iterator)
+                except StopIteration:
+                    pass
+            active = remaining
+
+    selected = []
+    for position in traverse(hierarchy):
+        selected.append(int(position))
+        if len(selected) >= min(limit, len(dataset)):
+            break
+    return selected
+
+
 def _joint_checkpoint_improved(
     stage: str,
     score: tuple[float, ...],

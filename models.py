@@ -361,3 +361,15 @@ def create_mtl_model(
     n = sum(p.numel() for p in model.parameters())
     print(f"  MTL-ResNet ({architecture}): {n:,} params")
     return model
+
+
+def load_strict_mtl_model(model_config, model_state):
+    """Construct the declared MTL model and strictly load its entire state."""
+    if not isinstance(model_config, dict) or not isinstance(model_state, dict):
+        raise ValueError("model configuration/state must be mappings")
+    try:
+        model = create_mtl_model(**model_config)
+        model.load_state_dict(model_state, strict=True)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"model configuration/state is invalid: {exc}") from exc
+    return model

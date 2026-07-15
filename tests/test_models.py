@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from models import ConditionalExpertNet, MultiTaskResNet, create_mtl_model
+from models import (
+    ConditionalExpertNet,
+    MultiTaskResNet,
+    create_mtl_model,
+    load_strict_mtl_model,
+)
 
 
 def test_ordinal_v2_output_shapes():
@@ -159,3 +164,24 @@ def test_conditional_factory_keeps_legacy_context_default_and_accepts_explicit_d
 
     assert legacy.context_dim == 3
     assert daylight.context_dim == 1
+
+
+def test_strict_mtl_loader_accepts_exact_state_and_rejects_missing_key():
+    model_config = {
+        "base_channels": 1,
+        "architecture": "conditional_expert_v1",
+        "num_types": 4,
+        "context_dim": 1,
+        "dist_mlp_dim": 2,
+        "dist_dropout": 0.0,
+    }
+    source = create_mtl_model(**model_config)
+    state = source.state_dict()
+
+    loaded = load_strict_mtl_model(model_config, state)
+
+    assert set(loaded.state_dict()) == set(state)
+    tampered = dict(state)
+    tampered.pop(next(iter(tampered)))
+    with pytest.raises(ValueError, match="model configuration/state"):
+        load_strict_mtl_model(model_config, tampered)

@@ -7,6 +7,8 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
+import statistics
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +23,7 @@ from data.cross_validation import (
     fold_train_holdout,
     validate_fold_assignment,
 )
+from data.augmentation import WaveformAugmentationConfig
 from data.oof_manifest import expected_oof_rows, oof_row_id, validate_oof_rows
 from data.split_artifacts import make_fold_manifest, split_hash, stable_json_hash
 from data.training_manifest import ManifestEntry
@@ -36,6 +39,7 @@ from conditional_pipeline import (
     collect_reference_features,
     fit_distance_temperatures,
     run_conditional_epoch,
+    select_final_reference_positions,
 )
 from evaluation import (
     checkpoint_selection_key,
@@ -45,9 +49,10 @@ from evaluation import (
     file_bootstrap_metrics,
     round_metrics,
 )
-from models import create_mtl_model
+from models import create_mtl_model, load_strict_mtl_model
 from open_set import (
     _fit_temperature,
+    attach_final_feature_reference,
     fit_feature_reference,
     fit_oof_rejection_policy,
     rejection_signals,
@@ -55,6 +60,14 @@ from open_set import (
 
 
 TYPE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
+FINAL_CHECKPOINT_FIELDS = {
+    "schema", "model_version", "architecture", "type_names", "context_dim",
+    "model_config", "model_state", "preprocessing", "augmentation",
+    "fold_manifest_hash", "fold_hashes", "full_data_hash", "final_epochs",
+    "random_initialization", "initialization_source", "oof_metrics",
+    "oof_metrics_hash", "rejection_policy", "distance_temperatures",
+    "support_map", "support_map_hash", "feature_reference_selection_hash",
+}
 FOLD_BATCH_SIZE = 128
 FOLD_MODEL_CONFIG = {
     "base_channels": 64,
@@ -67,6 +80,7 @@ FOLD_MODEL_CONFIG = {
 FOLD_LEARNING_RATE = 3e-4
 FOLD_WEIGHT_DECAY = 5e-4
 FOLD_COARSE_WEIGHT = 0.5
+TRAINING_AUGMENTATION_CONFIG = WaveformAugmentationConfig()
 STAGE_CONFIG_FIELDS = (
     "type_focus_epochs",
     "type_focus_distance_weight",
@@ -138,6 +152,7 @@ def training_config_hash(config: CVConfig) -> str:
     payload = dataclasses.asdict(config)
     for key in ("task_data", "output", "resume_cv", "stop_after_oof"):
         payload.pop(key, None)
+    payload["augmentation"] = dataclasses.asdict(TRAINING_AUGMENTATION_CONFIG)
     return stable_json_hash(payload)
 
 
@@ -153,6 +168,542 @@ class FoldResult:
     checkpoint_path: str
     oof_path: str
     metrics: dict
+
+
+@dataclass(frozen=True)
+class FinalTrainingRequest:
+    """Immutable full-data training contract derived only from CV evidence."""
+
+    entries: tuple[ManifestEntry, ...]
+    epochs: int
+    init_model: str | None = None
+
+
+def make_final_training_request(entries, fold_results):
+    """Bind every trusted file to the median positive one-based fold epoch."""
+    results = sorted(fold_results, key=lambda result: result.fold_index)
+    if [result.fold_index for result in results] != [0, 1, 2]:
+        raise ValueError("final training requires complete folds 0, 1, and 2")
+    best_epochs = [int(result.best_epoch) for result in results]
+    if any(epoch <= 0 for epoch in best_epochs):
+        raise ValueError("fold best epochs must be positive")
+    return FinalTrainingRequest(
+        entries=tuple(entries),
+        epochs=int(statistics.median(best_epochs)),
+        init_model=None,
+    )
+
+
+def validate_final_checkpoint(checkpoint):
+    """Validate a final checkpoint before it can replace an artifact."""
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("checkpoint validation failed: expected a mapping")
+    missing = sorted(FINAL_CHECKPOINT_FIELDS - set(checkpoint))
+    if missing:
+        raise ValueError(f"checkpoint validation failed: missing {missing}")
+    unexpected = sorted(set(checkpoint) - FINAL_CHECKPOINT_FIELDS)
+    if unexpected:
+        raise ValueError(f"checkpoint validation failed: unexpected {unexpected}")
+    if checkpoint["schema"] != "four_class_cv_v3":
+        raise ValueError("checkpoint validation failed: wrong schema")
+    if checkpoint["model_version"] != "conditional-expert-cv-v3":
+        raise ValueError("checkpoint validation failed: wrong model_version")
+    if checkpoint["architecture"] != "conditional_expert_v1":
+        raise ValueError("checkpoint validation failed: wrong architecture")
+    if checkpoint["type_names"] != list(TYPE_NAMES):
+        raise ValueError("checkpoint validation failed: wrong type order")
+    if checkpoint["context_dim"] != 1:
+        raise ValueError("checkpoint validation failed: context_dim must be 1")
+    if checkpoint["random_initialization"] is not True:
+        raise ValueError("checkpoint validation failed: model was not random-init")
+    if checkpoint["initialization_source"] is not None:
+        raise ValueError("checkpoint validation failed: initialization source exists")
+
+    def contains_old_initialization_path(value):
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                normalized = str(key).lower()
+                if any(token in normalized for token in (
+                    "old_model", "init_model", "warm_start", "initial_checkpoint",
+                )):
+                    return True
+                if contains_old_initialization_path(nested):
+                    return True
+        elif isinstance(value, (list, tuple)):
+            return any(contains_old_initialization_path(item) for item in value)
+        elif isinstance(value, str) and value.lower().endswith((".pt", ".pth")):
+            return True
+        return False
+
+    if contains_old_initialization_path(checkpoint):
+        raise ValueError("checkpoint validation failed: old initialization path exists")
+
+    def is_sha256(value):
+        value = str(value)
+        return len(value) == 64 and all(
+            character in "0123456789abcdef" for character in value
+        )
+
+    for key in (
+        "fold_manifest_hash", "full_data_hash", "oof_metrics_hash",
+        "support_map_hash", "feature_reference_selection_hash",
+    ):
+        if not is_sha256(checkpoint[key]):
+            raise ValueError(f"checkpoint validation failed: invalid {key}")
+
+    fold_hashes = checkpoint["fold_hashes"]
+    if not isinstance(fold_hashes, Mapping) or set(fold_hashes) != {"0", "1", "2"}:
+        raise ValueError("checkpoint validation failed: incomplete fold hashes")
+    config_hashes = set()
+    for fold_index in ("0", "1", "2"):
+        hashes = fold_hashes[fold_index]
+        if not isinstance(hashes, Mapping) or set(hashes) != {
+            "train_hash", "holdout_hash", "config_hash",
+        }:
+            raise ValueError("checkpoint validation failed: invalid fold hashes")
+        if any(not is_sha256(hashes[key]) for key in hashes):
+            raise ValueError("checkpoint validation failed: invalid fold hash value")
+        config_hashes.add(str(hashes["config_hash"]))
+    if len(config_hashes) != 1:
+        raise ValueError("checkpoint validation failed: inconsistent fold config hashes")
+
+    policy = checkpoint["rejection_policy"]
+    if not isinstance(policy, Mapping) or policy.get("version") != 3:
+        raise ValueError("checkpoint validation failed: rejection policy is not v3")
+    if policy.get("fold_hashes") != fold_hashes:
+        raise ValueError("checkpoint validation failed: calibration fold hashes")
+    if not is_sha256(policy.get("calibration_hash", "")):
+        raise ValueError("checkpoint validation failed: calibration hash")
+    try:
+        if not np.isfinite(float(policy["temperature"])) or float(
+            policy["temperature"]
+        ) <= 0:
+            raise ValueError
+        fold_temperatures = policy["fold_temperatures"]
+        if not isinstance(fold_temperatures, Mapping) or set(
+            fold_temperatures
+        ) != {"0", "1", "2"}:
+            raise ValueError
+        if any(
+            not np.isfinite(float(value)) or float(value) <= 0
+            for value in fold_temperatures.values()
+        ):
+            raise ValueError
+        for name in (
+            "probability_thresholds", "margin_thresholds",
+            "normalized_distance_thresholds", "quality_thresholds",
+        ):
+            values = np.asarray(policy[name], dtype=np.float64)
+            if values.shape != (4,) or not np.isfinite(values).all():
+                raise ValueError
+        centroids = np.asarray(policy["centroids"], dtype=np.float64)
+        scales = np.asarray(policy["scales"], dtype=np.float64)
+        if (
+            centroids.ndim != 2
+            or centroids.shape[0] != 4
+            or centroids.shape != scales.shape
+            or centroids.shape[1] <= 0
+            or not np.isfinite(centroids).all()
+            or not np.isfinite(scales).all()
+            or np.any(scales <= 0)
+        ):
+            raise ValueError
+        if float(policy["target_precision"]) < 0.96:
+            raise ValueError
+        if float(policy["minimum_coverage"]) < 0.80:
+            raise ValueError
+        if not isinstance(policy["oof_metrics"], Mapping):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ValueError("checkpoint validation failed: invalid rejection policy")
+
+    oof_metrics = checkpoint["oof_metrics"]
+    if not isinstance(oof_metrics, Mapping):
+        raise ValueError("checkpoint validation failed: invalid OOF metrics")
+    if stable_json_hash(round_metrics(oof_metrics)) != checkpoint["oof_metrics_hash"]:
+        raise ValueError("checkpoint validation failed: OOF metric hash mismatch")
+    try:
+        passed, reasons = evaluate_release(oof_metrics)
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"checkpoint validation failed: invalid OOF gates: {exc}") from exc
+    if not passed:
+        raise ValueError(f"checkpoint validation failed: OOF gates: {reasons}")
+
+    try:
+        temperatures = np.asarray(
+            checkpoint["distance_temperatures"], dtype=np.float64
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("checkpoint validation failed: distance temperatures") from exc
+    if (
+        temperatures.shape != (4,)
+        or not np.isfinite(temperatures).all()
+        or np.any(temperatures <= 0)
+    ):
+        raise ValueError("checkpoint validation failed: distance temperatures")
+
+    support_map = checkpoint["support_map"]
+    if not isinstance(support_map, dict) or not support_map:
+        raise ValueError("checkpoint validation failed: invalid support map")
+    if stable_json_hash(support_map) != checkpoint["support_map_hash"]:
+        raise ValueError("checkpoint validation failed: support map hash mismatch")
+    represented_types = set()
+    for name, row in support_map.items():
+        if not isinstance(name, str) or not isinstance(row, Mapping):
+            raise ValueError("checkpoint validation failed: invalid support map")
+        try:
+            type_index = int(row["type_index"])
+            file_count = int(row["file_count"])
+            piece_count = int(row["piece_count"])
+            low_km = int(row["low_km"])
+            high_km = int(row["high_km"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("checkpoint validation failed: invalid support map") from exc
+        if (
+            type_index not in range(4)
+            or type(row.get("daylight")) is not bool
+            or file_count <= 0
+            or piece_count <= 0
+            or high_km - low_km != 100
+            or low_km % 100 != 0
+            or not 0 <= low_km < high_km <= 3000
+            or row.get("status") != (
+                "supported" if file_count >= 3 else "insufficient_support"
+            )
+        ):
+            raise ValueError("checkpoint validation failed: invalid support map")
+        expected_name = (
+            f"{TYPE_NAMES[type_index]}/"
+            f"{'day' if row['daylight'] else 'night'}/"
+            f"{low_km}-{high_km}km"
+        )
+        if name != expected_name:
+            raise ValueError("checkpoint validation failed: invalid support map")
+        represented_types.add(type_index)
+    if represented_types != {0, 1, 2, 3}:
+        raise ValueError("checkpoint validation failed: incomplete support map types")
+
+    try:
+        final_epochs = int(checkpoint["final_epochs"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checkpoint validation failed: invalid final_epochs") from exc
+    if final_epochs <= 0:
+        raise ValueError("checkpoint validation failed: invalid final_epochs")
+    preprocessing = checkpoint["preprocessing"]
+    if not isinstance(preprocessing, Mapping) or set(preprocessing) != {
+        "name", "normalize_mode", "filter", "target_length",
+    }:
+        raise ValueError("checkpoint validation failed: invalid preprocessing")
+    if (
+        preprocessing["name"] != "signed_local_global_v1"
+        or preprocessing["normalize_mode"] != "robust_signed_99_5"
+        or preprocessing["filter"] != "butterworth_120khz_order2"
+        or int(preprocessing["target_length"]) != 8000
+    ):
+        raise ValueError("checkpoint validation failed: invalid preprocessing")
+    augmentation = checkpoint["augmentation"]
+    expected_augmentation = dataclasses.asdict(TRAINING_AUGMENTATION_CONFIG)
+    expected_augmentation.update({
+        "synchronized_views": True,
+        "polarity_inversion": False,
+        "time_reversal": False,
+    })
+    if not isinstance(augmentation, Mapping) or dict(
+        augmentation
+    ) != expected_augmentation:
+        raise ValueError("checkpoint validation failed: invalid augmentation")
+    model_config = checkpoint["model_config"]
+    if not isinstance(model_config, dict) or (
+        model_config.get("architecture") != checkpoint["architecture"]
+        or model_config.get("context_dim") != checkpoint["context_dim"]
+        or model_config.get("num_types") != 4
+    ):
+        raise ValueError("checkpoint validation failed: invalid model_config")
+    try:
+        load_strict_mtl_model(model_config, checkpoint["model_state"])
+    except ValueError as exc:
+        raise ValueError(f"checkpoint validation failed: {exc}") from exc
+
+
+def atomic_promote_checkpoint(checkpoint, candidate_path, model_path):
+    """Validate staged bytes before atomically replacing candidate and model."""
+    candidate_path = Path(candidate_path)
+    model_path = Path(model_path)
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_temp = candidate_path.with_name(candidate_path.name + ".tmp")
+    model_temp = model_path.with_name(model_path.name + ".tmp")
+    try:
+        torch.save(checkpoint, candidate_temp)
+        validate_final_checkpoint(torch.load(
+            candidate_temp, map_location="cpu", weights_only=False
+        ))
+        os.replace(candidate_temp, candidate_path)
+        shutil.copy2(candidate_path, model_temp)
+        validate_final_checkpoint(torch.load(
+            model_temp, map_location="cpu", weights_only=False
+        ))
+        os.replace(model_temp, model_path)
+    finally:
+        candidate_temp.unlink(missing_ok=True)
+        model_temp.unlink(missing_ok=True)
+
+
+def _build_final_checkpoint(model, dataset, request, config, device):
+    """Construct final release metadata after fixed-epoch fitting."""
+    manifest_path = Path(config.output) / "fold_manifest.json"
+    metrics_path = Path(config.output) / "cv_metrics.json"
+    try:
+        fold_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"verified final evidence is unavailable: {exc}") from exc
+    canonical_folds = assign_exact_folds(
+        request.entries, n_folds=3, seed=config.seed
+    )
+    canonical_manifest = make_fold_manifest(
+        canonical_folds, config.task_data, config.seed
+    )
+    if fold_manifest != canonical_manifest:
+        raise ValueError("final fold manifest does not match full-data entries")
+    if saved.get("schema") != "conditional_expert_cv_metrics_v1":
+        raise ValueError("final training requires verified CV metrics schema")
+    verified_release = saved.get("verified_release")
+    if verified_release != {
+        "passed": True,
+        "reasons": [],
+        "source": "verify_cv_artifacts_v1",
+    }:
+        raise ValueError("final training requires a passing verified disk report")
+    fold_hashes = saved.get("fold_hashes")
+    if not isinstance(fold_hashes, Mapping) or set(fold_hashes) != {"0", "1", "2"}:
+        raise ValueError("final training requires complete saved fold hashes")
+    config_hash = training_config_hash(config)
+    for fold_index in range(3):
+        expected = {
+            "train_hash": canonical_manifest["train_hashes"][str(fold_index)],
+            "holdout_hash": canonical_manifest["holdout_hashes"][str(fold_index)],
+            "config_hash": config_hash,
+        }
+        if fold_hashes.get(str(fold_index)) != expected:
+            raise ValueError("saved fold hashes do not match final fold manifest")
+    metrics = saved.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError("verified final OOF metrics are invalid")
+    oof_metrics = round_metrics(metrics)
+    oof_metrics_hash = stable_json_hash(oof_metrics)
+    if oof_metrics_hash != saved.get("recomputed_metrics_hash"):
+        raise ValueError("verified final OOF metric hash mismatch")
+    policy = saved.get("type_rejection")
+    if not isinstance(policy, Mapping):
+        raise ValueError("verified final rejection policy is invalid")
+    distance_calibration = saved.get("distance_calibration")
+    if not isinstance(distance_calibration, Mapping):
+        raise ValueError("verified final distance calibration is invalid")
+    distance_temperatures = distance_calibration.get("final_temperatures")
+
+    reference_positions = select_final_reference_positions(dataset, limit=20000)
+    if not reference_positions:
+        raise ValueError("final feature reference selection is empty")
+    cuda = str(device).startswith("cuda")
+    reference_loader = _loader(
+        dataset,
+        FOLD_BATCH_SIZE,
+        sampler=reference_positions,
+        workers=config.num_workers,
+        cuda=cuda,
+    )
+    features, labels = collect_reference_features(model, reference_loader, device)
+    rejection_policy = attach_final_feature_reference(policy, features, labels)
+    support_map = build_support_map(request.entries, TYPE_NAMES)
+    model_config = dict(FOLD_MODEL_CONFIG)
+    model_config["context_dim"] = 1
+    augmentation = dataclasses.asdict(TRAINING_AUGMENTATION_CONFIG)
+    augmentation.update({
+        "synchronized_views": True,
+        "polarity_inversion": False,
+        "time_reversal": False,
+    })
+    return {
+        "schema": "four_class_cv_v3",
+        "model_version": "conditional-expert-cv-v3",
+        "architecture": "conditional_expert_v1",
+        "type_names": list(TYPE_NAMES),
+        "context_dim": 1,
+        "model_config": model_config,
+        "model_state": _clone_state(model),
+        "preprocessing": {
+            "name": "signed_local_global_v1",
+            "normalize_mode": "robust_signed_99_5",
+            "filter": "butterworth_120khz_order2",
+            "target_length": 8000,
+        },
+        "augmentation": augmentation,
+        "fold_manifest_hash": canonical_manifest["combined_hash"],
+        "fold_hashes": dict(fold_hashes),
+        "full_data_hash": split_hash(request.entries, config.task_data),
+        "final_epochs": int(request.epochs),
+        "random_initialization": True,
+        "initialization_source": None,
+        "oof_metrics": oof_metrics,
+        "oof_metrics_hash": oof_metrics_hash,
+        "rejection_policy": rejection_policy,
+        "distance_temperatures": distance_temperatures,
+        "support_map": support_map,
+        "support_map_hash": stable_json_hash(support_map),
+        "feature_reference_selection_hash": stable_json_hash([
+            str(dataset.piece_keys[position]) for position in reference_positions
+        ]),
+    }
+
+
+def train_final_model(request, config, device):
+    """Train one random-init model on all trusted files for a fixed epoch count."""
+    if request.init_model is not None or config.init_model or not config.no_init:
+        raise ValueError("final training requires random initialization")
+    if int(request.epochs) <= 0:
+        raise ValueError("final training epochs must be positive")
+    if config.time_context != "daylight":
+        raise ValueError("final training requires daylight context")
+    pieces = build_piece_manifest(request.entries)
+    if not pieces:
+        raise RuntimeError("final training has no trusted waveform pieces")
+    augmentation = TRAINING_AUGMENTATION_CONFIG
+    dataset = LightningPieceDataset(
+        pieces,
+        split="train",
+        data_root=config.task_data,
+        augmentation=augmentation,
+        time_context_mode=config.time_context,
+    )
+    try:
+        sampler = JointConditionSampler(
+            dataset.type_labels,
+            dataset.daylight,
+            dataset.distance_low_km,
+            dataset.distance_high_km,
+            dataset.file_ids,
+            config.samples_per_epoch,
+            max_samples_per_file=config.max_samples_per_file,
+            seed=config.seed,
+        )
+        cuda = str(device).startswith("cuda")
+        loader = _loader(
+            dataset,
+            FOLD_BATCH_SIZE,
+            sampler,
+            workers=config.num_workers,
+            cuda=cuda,
+        )
+        model_config = dict(FOLD_MODEL_CONFIG)
+        model_config["context_dim"] = (
+            1 if config.time_context == "daylight" else 3
+        )
+        torch.manual_seed(int(config.seed))
+        if cuda:
+            torch.cuda.manual_seed_all(int(config.seed))
+        model = create_mtl_model(**model_config).to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=FOLD_LEARNING_RATE,
+            weight_decay=FOLD_WEIGHT_DECAY,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=int(request.epochs)
+        )
+        amp_enabled = cuda and not config.no_amp
+        try:
+            scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+        except (AttributeError, TypeError):
+            scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+        criterion = nn.CrossEntropyLoss()
+        latest_path = Path(config.output) / "final_latest.pt"
+        full_data_hash = split_hash(request.entries, config.task_data)
+        stage_config = {
+            "type_focus_epochs": int(config.type_focus_epochs),
+            "type_focus_distance_weight": float(
+                config.type_focus_distance_weight
+            ),
+            "joint_distance_weight": float(config.joint_distance_weight),
+            "final_epochs": int(request.epochs),
+        }
+        start_epoch = 0
+        if config.resume_cv and latest_path.is_file():
+            try:
+                resume_state = torch.load(
+                    latest_path, map_location="cpu", weights_only=False
+                )
+            except (OSError, RuntimeError, EOFError) as exc:
+                raise ValueError(f"invalid final_latest.pt: {exc}") from exc
+            if not isinstance(resume_state, Mapping):
+                raise ValueError("invalid final_latest.pt: expected a mapping")
+            if resume_state.get("schema") != "conditional_expert_cv_final_state_v1":
+                raise ValueError("invalid final_latest.pt schema")
+            expected_resume = {
+                "full_data_hash": full_data_hash,
+                "config_hash": training_config_hash(config),
+                "random_initialization": True,
+                "initialization_source": None,
+                "stage_config": stage_config,
+                "model_config": model_config,
+            }
+            for key, value in expected_resume.items():
+                if resume_state.get(key) != value:
+                    raise ValueError(f"final_latest.pt {key} mismatch")
+            try:
+                start_epoch = int(resume_state["completed_epochs"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid final_latest.pt completed_epochs") from exc
+            if not 0 <= start_epoch <= int(request.epochs):
+                raise ValueError("invalid final_latest.pt completed_epochs")
+            try:
+                model.load_state_dict(resume_state["model_state"], strict=True)
+                optimizer.load_state_dict(resume_state["optimizer_state"])
+                scheduler.load_state_dict(resume_state["scheduler_state"])
+                scaler.load_state_dict(resume_state.get("scaler_state", {}))
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                raise ValueError(f"invalid final_latest.pt training state: {exc}") from exc
+            _restore_resume_rng_state(resume_state, cuda)
+        for epoch in range(start_epoch, int(request.epochs)):
+            run_conditional_epoch(
+                model,
+                loader,
+                sampler,
+                optimizer,
+                criterion,
+                scaler,
+                device,
+                epoch,
+                config.type_focus_epochs,
+                config.type_focus_distance_weight,
+                config.joint_distance_weight,
+                lambda_coarse=FOLD_COARSE_WEIGHT,
+                no_amp=config.no_amp,
+            )
+            scheduler.step()
+            latest = {
+                "schema": "conditional_expert_cv_final_state_v1",
+                "full_data_hash": full_data_hash,
+                "config_hash": training_config_hash(config),
+                "random_initialization": True,
+                "initialization_source": None,
+                "stage_config": stage_config,
+                "completed_epochs": epoch + 1,
+                "execution_device_type": "cuda" if cuda else "cpu",
+                "model_config": model_config,
+                "model_state": _clone_state(model),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "scaler_state": scaler.state_dict(),
+                "torch_rng_state": torch.get_rng_state(),
+            }
+            if cuda:
+                latest["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+                latest["cuda_environment"] = _cuda_environment_identity()
+            _atomic_torch_save(latest_path, latest)
+        return _build_final_checkpoint(model, dataset, request, config, device)
+    finally:
+        dataset.close()
 
 
 def _atomic_write_json(path, payload):
@@ -597,6 +1148,7 @@ def train_conditional_fold(
         train_pieces,
         split="train",
         data_root=config.task_data,
+        augmentation=TRAINING_AUGMENTATION_CONFIG,
         time_context_mode=config.time_context,
     )
     holdout_set = LightningPieceDataset(
@@ -1440,6 +1992,55 @@ def evaluate_oof_artifacts(rows, expected, output_dir, config) -> dict:
     }
 
 
+def _validate_final_evidence_snapshot(
+    checkpoint, request, config, fold_manifest, saved, verification,
+):
+    """Bind an injected trainer result to the already-verified disk evidence."""
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("final checkpoint does not match verified disk evidence: mapping")
+    support_map = build_support_map(request.entries, TYPE_NAMES)
+    expected = {
+        "fold_manifest_hash": fold_manifest["combined_hash"],
+        "fold_hashes": saved["fold_hashes"],
+        "full_data_hash": split_hash(request.entries, config.task_data),
+        "final_epochs": int(request.epochs),
+        "oof_metrics": round_metrics(verification["metrics"]),
+        "oof_metrics_hash": saved["recomputed_metrics_hash"],
+        "distance_temperatures": saved["distance_calibration"][
+            "final_temperatures"
+        ],
+        "support_map": support_map,
+        "support_map_hash": stable_json_hash(support_map),
+    }
+    for key, value in expected.items():
+        if checkpoint.get(key) != value:
+            raise ValueError(
+                "final checkpoint does not match verified disk evidence: " + key
+            )
+    policy = checkpoint.get("rejection_policy")
+    saved_policy = saved.get("type_rejection")
+    if not isinstance(policy, Mapping) or not isinstance(saved_policy, Mapping):
+        raise ValueError(
+            "final checkpoint does not match verified disk evidence: rejection_policy"
+        )
+    transferable = (
+        "version", "temperature", "fold_temperatures",
+        "probability_thresholds", "margin_thresholds",
+        "normalized_distance_thresholds", "quality_thresholds",
+        "target_precision", "minimum_coverage", "oof_metrics",
+        "fold_hashes", "calibration_hash",
+    )
+    if set(policy) != set(transferable) | {"centroids", "scales"}:
+        raise ValueError(
+            "final checkpoint does not match verified disk evidence: policy fields"
+        )
+    for key in transferable:
+        if policy.get(key) != saved_policy.get(key):
+            raise ValueError(
+                "final checkpoint does not match verified disk evidence: policy " + key
+            )
+
+
 def run_cross_validated_training(
     config: CVConfig,
     entries: list[ManifestEntry],
@@ -1544,10 +2145,17 @@ def run_cross_validated_training(
     report["median_best_epoch"] = int(np.median([
         int(result.best_epoch) for result in results
     ]))
-    if (
-        report.get("passed")
-        and not config.stop_after_oof
-        and final_trainer is not None
-    ):
-        report["final_result"] = final_trainer(entries, config, device, results)
-    return report
+    if not report["passed"] or config.stop_after_oof:
+        return report
+    request = make_final_training_request(entries, results)
+    trainer = final_trainer or train_final_model
+    checkpoint = trainer(request, config, device)
+    _validate_final_evidence_snapshot(
+        checkpoint, request, config, fold_manifest, saved, report
+    )
+    atomic_promote_checkpoint(
+        checkpoint,
+        Path(config.output) / "final_candidate.pt",
+        Path(config.output) / "model.pt",
+    )
+    return {**report, "final_model": str(Path(config.output) / "model.pt")}
