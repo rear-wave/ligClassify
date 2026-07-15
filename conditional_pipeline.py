@@ -227,11 +227,23 @@ def apply_distance_temperatures(bundle, temperatures):
 
 
 def _selection_key(metrics):
+    """Protect type quality first, then optimize worst/file-macro distance."""
+    type_file_accuracy = float(metrics["type_file_macro_accuracy"])
+    minimum_type_recall = min(float(value) for value in metrics["type_recall"])
+    type_ready = type_file_accuracy >= 0.90 and minimum_type_recall >= 0.85
+    per_type_distance = metrics["distance_per_type_exact_within_200"]
+    if type_ready:
+        primary = float(metrics["distance_file_macro_within_200"])
+        secondary = min(float(value) for value in per_type_distance)
+    else:
+        primary = minimum_type_recall
+        secondary = type_file_accuracy
     return (
-        float(metrics["type_file_macro_accuracy"]),
-        float(metrics["type_piece_accuracy"]),
-        float(metrics["distance_file_macro_within_200"]),
+        float(type_ready),
+        primary,
+        secondary,
         float(metrics["distance_exact_within_200"]),
+        float(metrics["type_piece_accuracy"]),
         -float(metrics["distance_interval_mae_km"]),
     )
 
