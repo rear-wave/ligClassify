@@ -193,7 +193,7 @@ def evaluate_checkpoint(
     model, checkpoint = classify.load_mtl_checkpoint(model_path, device)
     pieces = build_piece_manifest(file_entries)
     schema = classify.checkpoint_schema(checkpoint)
-    if schema == "four_class_rejection_v2":
+    if schema in {"four_class_rejection_v2", "four_class_cv_v3"}:
         dataset = LightningPieceDataset(
             pieces,
             split="benchmark",
@@ -210,12 +210,17 @@ def evaluate_checkpoint(
             persistent_workers=workers > 0,
         )
         bundle = collect_prediction_bundle(model, loader, device, locked_hash)
-        temperatures = checkpoint.get("distance_calibration", {}).get(
-            "temperatures", [1.0] * 4
-        )
+        if schema == "four_class_cv_v3":
+            temperatures = checkpoint.get("distance_temperatures", [1.0] * 4)
+            policy = checkpoint.get("rejection_policy")
+        else:
+            temperatures = checkpoint.get("distance_calibration", {}).get(
+                "temperatures", [1.0] * 4
+            )
+            policy = checkpoint.get("type_rejection")
         apply_distance_temperatures(bundle, temperatures)
-        if checkpoint.get("type_rejection"):
-            apply_rejection_policy(bundle, checkpoint["type_rejection"])
+        if policy:
+            apply_rejection_policy(bundle, policy)
         records = bundle["records"]
     else:
         dataset = LegacyBenchmarkDataset(

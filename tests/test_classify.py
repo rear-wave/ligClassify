@@ -442,6 +442,72 @@ def test_forward_type_bypasses_ordinal_distance_projection():
     assert logits.shape == (2, 5)
 
 
+def test_distance_support_status_marks_insufficient_from_support_map():
+    checkpoint = {
+        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
+        "support_map": {
+            "NCG/day/400-500km": {
+                "file_count": 2, "status": "insufficient_support"
+            }
+        },
+    }
+    status, file_count, condition = classify.distance_support_status(
+        checkpoint, 0, True, 400
+    )
+    assert status == "insufficient_support"
+    assert file_count == 2
+    assert condition == "NCG/day/400-500km"
+
+
+def test_old_checkpoint_without_support_map_reports_unknown():
+    status, file_count, condition = classify.distance_support_status(
+        {"type_names": ["NCG", "NNBE", "PCG", "PNBE"]}, 0, True, 400
+    )
+    assert status == "unknown"
+    assert file_count is None
+    assert condition is None
+
+
+def test_annotate_distance_support_preserves_accepted_distance(tmp_path):
+    checkpoint = {
+        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
+        "support_map": {
+            "NCG/day/400-500km": {
+                "file_count": 5, "status": "supported"
+            }
+        },
+    }
+    prediction = classify.annotate_distance_support({
+        "type_index": 0,
+        "class_name": "NCG_400-500km",
+        "expected_distance_km": 450.0,
+        "modal_distance_bin": 4,
+        "daylight": True,
+        "type_only": False,
+    }, checkpoint)
+    assert prediction["expected_distance_km"] == pytest.approx(450.0)
+    assert prediction["support_status"] == "supported"
+    assert prediction["support_file_count"] == 5
+    assert prediction["class_name"] == "NCG_400-500km"
+
+
+def test_annotate_ic_reports_not_applicable():
+    result = classify.annotate_distance_support({
+        "class_name": "IC", "type_only": False,
+    }, {})
+    assert result["support_status"] == "not_applicable"
+    assert result["support_file_count"] is None
+    assert result["support_condition"] is None
+
+
+def test_annotate_type_only_reports_not_evaluated():
+    result = classify.annotate_distance_support({
+        "class_name": "NCG_0-100km",
+        "type_only": True,
+    }, {})
+    assert result["support_status"] == "not_evaluated"
+
+
 def test_prediction_csv_writer_has_reliability_columns(tmp_path):
     output = tmp_path / "predictions.csv"
     with classify.PredictionCsvWriter(output) as writer:

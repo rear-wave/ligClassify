@@ -50,6 +50,12 @@ PREDICTION_FIELDS = [
     "quality_score",
     "model_version",
     "split_hash",
+    "support_status",
+    "support_file_count",
+    "support_condition",
+    "fold_manifest_hash",
+    "full_data_hash",
+    "calibration_hash",
 ]
 
 
@@ -77,20 +83,24 @@ class PredictionCsvWriter:
 
 
 def load_mtl_checkpoint(path, device):
-    """Load either the legacy or ordinal-v2 structured checkpoint."""
+    """Load legacy, v2, or v3 structured checkpoint."""
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    if "model_state_dict" not in checkpoint:
+    if "model_config" in checkpoint and "model_state" in checkpoint:
+        model = create_mtl_model(**checkpoint["model_config"]).to(device)
+        model.load_state_dict(checkpoint["model_state"])
+    elif "model_state_dict" in checkpoint:
+        architecture = checkpoint.get("model_name", "mtl_resnet")
+        model = create_mtl_model(
+            base_channels=checkpoint.get("base_channels", 64),
+            architecture=architecture,
+            num_types=len(checkpoint.get("type_names", [])) or 5,
+            dist_mlp_dim=checkpoint.get("dist_mlp_dim", 128),
+            dist_dropout=checkpoint.get("dist_dropout", 0.2),
+            context_dim=checkpoint.get("context_dim", 3),
+        ).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
         raise ValueError("Inference requires a structured MTL checkpoint")
-    architecture = checkpoint.get("model_name", "mtl_resnet")
-    model = create_mtl_model(
-        base_channels=checkpoint.get("base_channels", 64),
-        architecture=architecture,
-        num_types=len(checkpoint.get("type_names", [])) or 5,
-        dist_mlp_dim=checkpoint.get("dist_mlp_dim", 128),
-        dist_dropout=checkpoint.get("dist_dropout", 0.2),
-        context_dim=checkpoint.get("context_dim", 3),
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint
 
@@ -107,6 +117,8 @@ def checkpoint_time_context_mode(checkpoint):
 
 def checkpoint_schema(checkpoint):
     """Return an explicit supported type-label contract."""
+    if checkpoint.get("schema") == "four_class_cv_v3":
+        return "four_class_cv_v3"
     if (
         checkpoint.get("task_schema") == "four_class_rejection_v2"
         and checkpoint.get("model_name") == "conditional_expert_v1"
@@ -119,6 +131,69 @@ def checkpoint_schema(checkpoint):
     raise ValueError("Unsupported checkpoint type schema")
 
 
+def distance_support_status(checkpoint, type_index, daylight, bin_start_km):
+    """Return (status, file_count, condition) from a v3 support map."""
+    if bin_start_km is None:
+        return "not_applicable", None, None
+    support_map = checkpoint.get("support_map")
+    if not support_map:
+        return "unknown", None, None
+    type_name = checkpoint["type_names"][int(type_index)]
+    condition = (
+        f"{type_name}/{'day' if daylight else 'night'}"
+        f"/{int(bin_start_km)}-{int(bin_start_km) + 100}km"
+    )
+    support = support_map.get(condition)
+    if support is None:
+        return "insufficient_support", 0, condition
+    return support["status"], int(support["file_count"]), condition
+
+
+def annotate_distance_support(prediction, checkpoint):
+    """Add support_status/condition/status to an inference prediction."""
+    result = dict(prediction)
+    if result.get("class_name") == "IC":
+        status, file_count, condition = "not_applicable", None, None
+    elif result.get("type_only", False):
+        status, file_count, condition = "not_evaluated", None, None
+    else:
+        modal_bin = result.get("modal_distance_bin")
+        if modal_bin is not None:
+            bin_start = int(modal_bin) * 100
+        else:
+            bin_start = result.get("bin_start_km")
+        status, file_count, condition = distance_support_status(
+            checkpoint,
+            result["type_index"],
+            result.get("daylight", True),
+            bin_start,
+        )
+    result.update({
+        "support_status": status,
+        "support_file_count": file_count,
+        "support_condition": condition,
+    })
+    return result
+
+
+def _checkpoint_policy(checkpoint):
+    """Return rejection policy from v2 or v3 checkpoint structure."""
+    schema = checkpoint_schema(checkpoint)
+    if schema == "four_class_cv_v3":
+        return checkpoint.get("rejection_policy")
+    return checkpoint.get("type_rejection")
+
+
+def _checkpoint_distance_temperatures(checkpoint):
+    """Return four distance temperatures from v2 or v3 checkpoint structure."""
+    schema = checkpoint_schema(checkpoint)
+    if schema == "four_class_cv_v3":
+        return checkpoint.get("distance_temperatures", [1.0] * 4)
+    return checkpoint.get("distance_calibration", {}).get(
+        "temperatures", [1.0] * 4
+    )
+
+
 def decode_conditional_batch(
     type_logits,
     features,
@@ -129,11 +204,12 @@ def decode_conditional_batch(
     type_only=False,
 ):
     """Decode a conditional batch while preserving raw four-type evidence."""
-    if checkpoint_schema(checkpoint) != "four_class_rejection_v2":
-        raise ValueError("conditional decoding requires a v2 checkpoint")
-    policy = checkpoint.get("type_rejection")
+    schema = checkpoint_schema(checkpoint)
+    if schema not in {"four_class_rejection_v2", "four_class_cv_v3"}:
+        raise ValueError("conditional decoding requires a v2 or v3 checkpoint")
+    policy = _checkpoint_policy(checkpoint)
     if not policy:
-        raise ValueError("conditional checkpoint has no calibrated type_rejection policy")
+        raise ValueError("conditional checkpoint has no calibrated rejection policy")
     decoded_types = decode_with_rejection(
         type_logits,
         features,
@@ -143,9 +219,7 @@ def decode_conditional_batch(
     probabilities = torch.softmax(
         type_logits.detach().cpu() / float(policy["temperature"]), dim=1
     )
-    temperatures = checkpoint.get("distance_calibration", {}).get(
-        "temperatures", [1.0] * 4
-    )
+    temperatures = _checkpoint_distance_temperatures(checkpoint)
     type_names = checkpoint["type_names"]
     rejected_name = checkpoint.get("rejected_type_name", "IC")
     predictions = []
@@ -158,6 +232,7 @@ def decode_conditional_batch(
             for index, name in enumerate(type_names)
         }
         prediction = {
+            "type_index": type_index,
             "type": final_type,
             "raw_type": raw_type,
             "final_type": final_type,
@@ -189,6 +264,7 @@ def decode_conditional_batch(
             ),
             "split_hash": checkpoint.get("combined_split_hash", ""),
         }
+        modal_bin = None
         if accepted and not type_only:
             distance = decode_distance_distribution(
                 distance_logits[type_index][row].detach().cpu().unsqueeze(0),
@@ -200,6 +276,7 @@ def decode_conditional_batch(
             distance_high = float(distance["high_km"].item())
             prediction.update({
                 "class_name": f"{raw_type}_{modal_bin * 100}-{(modal_bin + 1) * 100}km",
+                "modal_distance_bin": modal_bin,
                 "distance_km": expected_km,
                 "expected_distance_km": expected_km,
                 "bin_start_km": modal_bin * 100,
@@ -209,6 +286,7 @@ def decode_conditional_batch(
                 "distance_high_km": distance_high,
                 "confidence": float(distance["confidence"].item()),
             })
+        prediction = annotate_distance_support(prediction, checkpoint)
         predictions.append(prediction)
     return predictions
 
@@ -570,7 +648,7 @@ def main():
         if args.type_only:
             validate_type_only_options(type_ckpt, args.min_type_confidence)
         elif checkpoint_schema(type_ckpt) not in {
-            "four_class_rejection_v1", "four_class_rejection_v2"
+            "four_class_rejection_v1", "four_class_rejection_v2", "four_class_cv_v3"
         }:
             raise ValueError("full single-model inference requires a four-class checkpoint")
         inference_ckpt = type_ckpt
@@ -610,7 +688,7 @@ def main():
                 if not batch_wf:
                     continue
                 schema = checkpoint_schema(inference_ckpt)
-                if schema == "four_class_rejection_v2":
+                if schema in {"four_class_rejection_v2", "four_class_cv_v3"}:
                     local_np, global_np, context_np, quality_np = (
                         conditional_batch_inputs(
                             batch_wf,
@@ -637,7 +715,7 @@ def main():
                     )
                     x = torch.from_numpy(wf_pp).unsqueeze(1).to(dev)
                 with torch.no_grad():
-                    if not args.legacy_hybrid and schema == "four_class_rejection_v2":
+                    if not args.legacy_hybrid and schema in {"four_class_rejection_v2", "four_class_cv_v3"}:
                         (
                             features,
                             type_logits,
@@ -750,6 +828,12 @@ def main():
                         "quality_score": prediction.get("quality_score"),
                         "model_version": prediction.get("model_version"),
                         "split_hash": prediction.get("split_hash"),
+                        "support_status": prediction.get("support_status"),
+                        "support_file_count": prediction.get("support_file_count"),
+                        "support_condition": prediction.get("support_condition"),
+                        "fold_manifest_hash": inference_ckpt.get("fold_manifest_hash", ""),
+                        "full_data_hash": inference_ckpt.get("full_data_hash", ""),
+                        "calibration_hash": inference_ckpt.get("rejection_policy", {}).get("calibration_hash") or inference_ckpt.get("type_rejection", {}).get("calibration_hash", ""),
                     })
 
                     if cls_out not in cache:
