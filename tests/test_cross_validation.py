@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+import data.cross_validation as cross_validation
 from data.cross_validation import (
     assign_exact_folds,
     build_support_map,
@@ -53,12 +54,35 @@ def test_exact_bins_are_distinct_and_three_file_cells_cover_every_fold():
         ] == [1, 1, 1]
 
 
+def test_support_contract_uses_one_hundred_total_pieces_not_file_count():
+    assert getattr(cross_validation, "MINIMUM_SUPPORTED_PIECES", None) == 100
+
+    one_file_supported = make_entries(
+        lows=(300,), files_per_condition=1, pieces=(100,)
+    )
+    many_files_sparse = make_entries(
+        lows=(400,), files_per_condition=3, pieces=(33, 33, 33)
+    )
+    support = build_support_map(
+        [*one_file_supported, *many_files_sparse], TYPE_NAMES
+    )
+
+    assert support["NCG/day/300-400km"]["file_count"] == 1
+    assert support["NCG/day/300-400km"]["piece_count"] == 100
+    assert support["NCG/day/300-400km"]["status"] == "supported"
+    assert support["NCG/day/400-500km"]["file_count"] == 3
+    assert support["NCG/day/400-500km"]["piece_count"] == 99
+    assert support["NCG/day/400-500km"]["status"] == "insufficient_support"
+
+
 def test_sparse_condition_is_reported_without_splitting_a_file():
-    entries = make_entries(lows=(300,), files_per_condition=2)
+    entries = make_entries(
+        lows=(300,), files_per_condition=2, pieces=(49, 50)
+    )
     folds = assign_exact_folds(entries, n_folds=3, seed=7)
-    support = build_support_map(entries, TYPE_NAMES, minimum_files=3)
+    support = build_support_map(entries, TYPE_NAMES)
     assert sum(len(rows) for rows in folds.values()) == 2
-    assert support["NCG/day/300-400km"]["file_count"] == 2
+    assert support["NCG/day/300-400km"]["piece_count"] == 99
     assert support["NCG/day/300-400km"]["status"] == "insufficient_support"
 
 

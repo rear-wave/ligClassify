@@ -12,6 +12,7 @@ from data.training_manifest import ManifestEntry
 
 
 FOLD_COUNT = 3
+MINIMUM_SUPPORTED_PIECES = 100
 
 
 def exact_condition_key(entry: ManifestEntry) -> tuple[int, bool, int, int]:
@@ -152,9 +153,9 @@ def validate_fold_assignment(
 def build_support_map(
     entries: Iterable[ManifestEntry],
     type_names: Sequence[str],
-    minimum_files: int = 3,
+    minimum_pieces: int = MINIMUM_SUPPORTED_PIECES,
 ) -> dict[str, dict[str, int | bool | str]]:
-    """Aggregate exact condition support and flag cells below the file floor."""
+    """Aggregate exact condition support using total waveform pieces."""
     support = defaultdict(lambda: {"file_count": 0, "piece_count": 0})
     seen = set()
     for entry in entries:
@@ -181,7 +182,7 @@ def build_support_map(
     for name, row in sorted(support.items()):
         row["status"] = (
             "supported"
-            if row["file_count"] >= int(minimum_files)
+            if row["piece_count"] >= int(minimum_pieces)
             else "insufficient_support"
         )
         result[name] = dict(row)

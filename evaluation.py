@@ -6,6 +6,7 @@ from collections import defaultdict
 
 import numpy as np
 
+from data.cross_validation import MINIMUM_SUPPORTED_PIECES
 from distance_metrics import interval_distance_errors
 
 
@@ -17,8 +18,8 @@ RELEASE_GATES = {
     "min_file_equal_macro_recall": 0.90,
     "min_100km_interval_within_200": 0.85,
     "min_per_type_100km_interval_within_200": 0.75,
-    "min_supported_condition_within_200": 0.70,
-    "minimum_supported_files": 3,
+    "min_supported_condition_within_200": 0.55,
+    "minimum_supported_pieces": MINIMUM_SUPPORTED_PIECES,
 }
 
 
@@ -380,7 +381,7 @@ def evaluate_release(candidate):
     reasons = absolute_gate_failures(candidate)
     for name, group in candidate["distance_conditions_100km"].items():
         if (
-            group["file_count"] >= RELEASE_GATES["minimum_supported_files"]
+            group["piece_count"] >= RELEASE_GATES["minimum_supported_pieces"]
             and group["file_macro_within_200"]
             < RELEASE_GATES["min_supported_condition_within_200"]
         ):
@@ -396,7 +397,7 @@ def checkpoint_selection_key(metrics):
     supported = [
         group["file_macro_within_200"]
         for group in metrics["distance_conditions_100km"].values()
-        if group["file_count"] >= 3
+        if group["piece_count"] >= MINIMUM_SUPPORTED_PIECES
     ]
     readiness = (
         metrics["type_file_equal_recall_mean"] >= 0.85

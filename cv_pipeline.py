@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 
 from data.cross_validation import (
+    MINIMUM_SUPPORTED_PIECES,
     assign_exact_folds,
     build_support_map,
     fold_train_holdout,
@@ -368,7 +369,9 @@ def validate_final_checkpoint(checkpoint):
             or low_km % 100 != 0
             or not 0 <= low_km < high_km <= 3000
             or row.get("status") != (
-                "supported" if file_count >= 3 else "insufficient_support"
+                "supported"
+                if piece_count >= MINIMUM_SUPPORTED_PIECES
+                else "insufficient_support"
             )
         ):
             raise ValueError("checkpoint validation failed: invalid support map")

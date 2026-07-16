@@ -52,23 +52,19 @@ def test_audit_writes_requested_report_and_sibling_fold_artifacts(tmp_path):
 
 
 def test_audit_reports_insufficient_support_cell_names(tmp_path):
-    for type_name in ("NCG", "NNBE", "PCG", "PNBE"):
-        file_count = 2 if type_name == "NCG" else 3
-        for index in range(file_count):
-            write_lig(
-                tmp_path / type_name / "day" / "300-400km" / f"{index}.lig",
-                pieces=index + 1,
-            )
+    totals = {"NCG": 99, "NNBE": 100, "PCG": 100, "PNBE": 100}
+    for type_name, pieces in totals.items():
+        write_lig(
+            tmp_path / type_name / "day" / "300-400km" / "only.lig",
+            pieces=pieces,
+        )
 
     result = audit_dataset(tmp_path, seed=9)
 
-    assert result["data_audit"]["insufficient_support_cell_count"] == 1
     assert result["data_audit"]["insufficient_support_cells"] == [
         "NCG/day/300-400km"
     ]
-    assert result["support_map"]["NCG/day/300-400km"]["status"] == (
-        "insufficient_support"
-    )
+    assert result["support_map"]["NNBE/day/300-400km"]["status"] == "supported"
 
 
 def test_audit_marks_legacy_split_fractions_inactive(tmp_path):

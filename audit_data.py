@@ -7,6 +7,7 @@ from pathlib import Path
 
 from data.cross_validation import (
     FOLD_COUNT,
+    MINIMUM_SUPPORTED_PIECES,
     assign_exact_folds,
     build_support_map,
     validate_fold_assignment,
@@ -69,7 +70,7 @@ def audit_dataset(
             "cross-validation fold totals do not match the trusted manifest"
         )
 
-    support_map = build_support_map(entries, TYPE_NAMES, minimum_files=FOLD_COUNT)
+    support_map = build_support_map(entries, TYPE_NAMES)
     insufficient_support_cells = sorted(
         name
         for name, row in support_map.items()
@@ -152,7 +153,10 @@ def main():
     for name, summary in audit["splits"].items():
         print(f"  {name}: {summary['files']} files, {summary['pieces']} pieces")
     if audit["insufficient_support_cells"]:
-        print("Insufficient-support cells (fewer than three source files):")
+        print(
+            "Insufficient-support cells "
+            f"(fewer than {MINIMUM_SUPPORTED_PIECES} waveform pieces):"
+        )
         for condition in audit["insufficient_support_cells"]:
             print(f"  {condition}")
 

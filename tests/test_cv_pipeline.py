@@ -496,8 +496,8 @@ def _valid_final_checkpoint():
     }
     support_map = {
         f"{type_name}/day/0-100km": {
-            "file_count": 3,
-            "piece_count": 6,
+            "file_count": 1,
+            "piece_count": 100,
             "type_index": type_index,
             "daylight": True,
             "low_km": 0,
@@ -595,6 +595,16 @@ def _checkpoint_with_disk_evidence(request, final_config):
 
 def test_validate_final_checkpoint_accepts_complete_strict_v3():
     validate_final_checkpoint(_valid_final_checkpoint())
+
+
+def test_validate_final_checkpoint_rejects_piece_status_mismatch():
+    checkpoint = _valid_final_checkpoint()
+    row = checkpoint["support_map"]["NCG/day/0-100km"]
+    row["piece_count"] = 99
+    checkpoint["support_map_hash"] = stable_json_hash(checkpoint["support_map"])
+
+    with pytest.raises(ValueError, match="invalid support map"):
+        validate_final_checkpoint(checkpoint)
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import evaluation
+from data.cross_validation import MINIMUM_SUPPORTED_PIECES
 from evaluation import (
     distance_calibration_is_safe,
     evaluate_predictions,
@@ -195,17 +196,25 @@ def test_only_supported_subgroups_are_hard_gates():
     passing = good_release_metrics()
     passing["distance_conditions_100km"] = {
         "PNBE/night/300-400km": {
-            "file_count": 2,
+            "piece_count": 50,
             "file_macro_within_200": 0.10,
         }
     }
     assert evaluate_release(passing)[0]
 
-    passing["distance_conditions_100km"]["PNBE/night/300-400km"]["file_count"] = 3
+    passing["distance_conditions_100km"]["PNBE/night/300-400km"]["piece_count"] = 100
     passed, reasons = evaluate_release(passing)
 
     assert not passed
     assert any("supported subgroup" in reason for reason in reasons)
+
+
+def test_release_gate_uses_canonical_piece_support_floor():
+    assert MINIMUM_SUPPORTED_PIECES == 100
+    assert (
+        evaluation.RELEASE_GATES["minimum_supported_pieces"]
+        == MINIMUM_SUPPORTED_PIECES
+    )
 
 
 def test_release_uses_only_fixed_absolute_file_equal_gates():
@@ -245,8 +254,8 @@ def test_checkpoint_selection_key_uses_supported_condition_and_readiness_floor()
         "type_file_equal_recall_mean": 0.86,
         "type_file_equal_recall": [0.75, 0.80, 0.90, 1.0],
         "distance_conditions_100km": {
-            "supported": {"file_count": 3, "file_macro_within_200": 0.71},
-            "sparse": {"file_count": 2, "file_macro_within_200": 0.10},
+            "supported": {"piece_count": 150, "file_macro_within_200": 0.71},
+            "sparse": {"piece_count": 50, "file_macro_within_200": 0.10},
         },
         "distance_file_macro_within_200": 0.80,
         "distance_per_type_100km_interval_within_200": [0.75, 0.80, 0.85, 0.90],
@@ -272,7 +281,7 @@ def test_checkpoint_selection_key_defaults_unsupported_condition_score_to_zero()
         "type_file_equal_recall_mean": 0.90,
         "type_file_equal_recall": [0.80, 0.80, 0.80, 0.80],
         "distance_conditions_100km": {
-            "sparse": {"file_count": 2, "file_macro_within_200": 0.99},
+            "sparse": {"piece_count": 50, "file_count": 2, "file_macro_within_200": 0.99},
         },
         "distance_file_macro_within_200": 0.85,
         "distance_per_type_100km_interval_within_200": [0.80] * 4,
