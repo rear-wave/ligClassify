@@ -18,7 +18,7 @@ RELEASE_GATES = {
     "min_file_equal_macro_recall": 0.90,
     "min_100km_interval_within_200": 0.85,
     "min_per_type_100km_interval_within_200": 0.75,
-    "min_supported_condition_within_200": 0.55,
+    "min_supported_condition_within_200": 0.70,
     "minimum_supported_pieces": MINIMUM_SUPPORTED_PIECES,
 }
 

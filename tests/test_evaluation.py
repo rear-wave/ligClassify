@@ -217,6 +217,21 @@ def test_release_gate_uses_canonical_piece_support_floor():
     )
 
 
+def test_supported_subgroup_at_sixty_percent_still_fails_release():
+    candidate = good_release_metrics()
+    candidate["distance_conditions_100km"] = {
+        "NCG/day/300-400km": {
+            "piece_count": MINIMUM_SUPPORTED_PIECES,
+            "file_macro_within_200": 0.60,
+        }
+    }
+
+    passed, reasons = evaluate_release(candidate)
+
+    assert passed is False
+    assert any("supported subgroup" in reason for reason in reasons)
+
+
 def test_release_uses_only_fixed_absolute_file_equal_gates():
     candidate = good_release_metrics()
 
