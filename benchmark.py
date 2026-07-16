@@ -28,6 +28,42 @@ from evaluation import evaluate_predictions, file_bootstrap_metrics
 
 TYPE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
 
+
+def annotate_v3_benchmark_records(
+    bundle: dict, checkpoint: dict
+) -> list[dict]:
+    """Retain V3 support and identity evidence on benchmark records."""
+    records = bundle["records"]
+    distance_logits = bundle["distance_logits"]
+    for row_index, record in enumerate(records):
+        type_index = int(record["predicted_type"])
+        modal_bin = int(distance_logits[row_index, type_index].argmax().item())
+        class_name = (
+            checkpoint.get("rejected_type_name", "IC")
+            if not record.get("accepted", True)
+            else f"{checkpoint['type_names'][type_index]}_"
+                 f"{modal_bin * 100}-{(modal_bin + 1) * 100}km"
+        )
+        support = classify.annotate_distance_support({
+            "type_index": type_index,
+            "class_name": class_name,
+            "modal_distance_bin": modal_bin,
+            "daylight": bool(record["daylight"]),
+            "type_only": False,
+        }, checkpoint)
+        record.update({
+            "support_status": support["support_status"],
+            "support_file_count": support["support_file_count"],
+            "support_condition": support["support_condition"],
+            "fold_manifest_hash": checkpoint.get("fold_manifest_hash", ""),
+            "full_data_hash": checkpoint.get("full_data_hash", ""),
+            "calibration_hash": checkpoint.get(
+                "rejection_policy", {}
+            ).get("calibration_hash", ""),
+        })
+    return records
+
+
 def _file_entries(split_manifest, split_name, task_data):
     rows = split_manifest["splits"][split_name]
     entries = []
@@ -221,6 +257,8 @@ def evaluate_checkpoint(
         apply_distance_temperatures(bundle, temperatures)
         if policy:
             apply_rejection_policy(bundle, policy)
+        if schema == "four_class_cv_v3":
+            annotate_v3_benchmark_records(bundle, checkpoint)
         records = bundle["records"]
     else:
         dataset = LegacyBenchmarkDataset(

@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import torch
 
 import evaluation
 from data.cross_validation import MINIMUM_SUPPORTED_PIECES
@@ -348,6 +349,59 @@ def test_round_metrics_sorts_keys_normalizes_sequences_and_rejects_non_finite():
     for value in (float("nan"), float("inf"), np.float64("-inf")):
         with pytest.raises(ValueError, match="non-finite"):
             evaluation.round_metrics(value)
+
+
+def test_v3_benchmark_records_retain_support_and_hash_evidence():
+    import benchmark
+
+    distance_logits = torch.zeros(2, 4, 30)
+    distance_logits[0, 0, 4] = 5.0
+    distance_logits[1, 0, 4] = 5.0
+    records = [
+        {
+            "true_type": 0,
+            "predicted_type": 0,
+            "accepted": True,
+            "daylight": True,
+            "predicted_distance_km": 450.0,
+        },
+        {
+            "true_type": 0,
+            "predicted_type": 0,
+            "accepted": False,
+            "daylight": True,
+            "predicted_distance_km": 450.0,
+        },
+    ]
+    bundle = {"records": records, "distance_logits": distance_logits}
+    checkpoint = {
+        "schema": "four_class_cv_v3",
+        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
+        "support_map": {
+            "NCG/day/400-500km": {
+                "file_count": 1,
+                "piece_count": 100,
+                "status": "supported",
+            }
+        },
+        "fold_manifest_hash": "fold-hash",
+        "full_data_hash": "full-hash",
+        "rejection_policy": {"calibration_hash": "calibration-hash"},
+    }
+
+    assert hasattr(benchmark, "annotate_v3_benchmark_records")
+    annotated = benchmark.annotate_v3_benchmark_records(bundle, checkpoint)
+
+    assert annotated is records
+    assert annotated[0]["support_status"] == "supported"
+    assert annotated[0]["support_file_count"] == 1
+    assert annotated[0]["support_condition"] == "NCG/day/400-500km"
+    assert annotated[1]["support_status"] == "not_applicable"
+    assert annotated[0]["fold_manifest_hash"] == "fold-hash"
+    assert annotated[0]["full_data_hash"] == "full-hash"
+    assert annotated[0]["calibration_hash"] == "calibration-hash"
+    assert [row["accepted"] for row in annotated] == [True, False]
+    assert [row["predicted_distance_km"] for row in annotated] == [450.0, 450.0]
 
 
 def test_historical_benchmark_output_is_reference_only(monkeypatch, tmp_path):
