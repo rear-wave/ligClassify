@@ -25,16 +25,21 @@ Run the standard workflow:
 
 ```powershell
 python audit_data.py --task_data ..\train_data --output .\weights\conditional_cv\data_audit.json
-python train.py --task_data ..\train_data --output .\weights\cv_smoke --max_epochs 1 --patience 1 --samples_per_epoch 2048 --bootstrap_iterations 50 --num_workers 0 --no_init
+python train.py --task_data ..\train_data --output .\weights\cv_smoke --max_epochs 1 --type_focus_epochs 0 --patience 1 --samples_per_epoch 2048 --bootstrap_iterations 50 --num_workers 0 --no_init
 python train.py --task_data ..\train_data --output .\weights\conditional_cv --max_epochs 50 --patience 10 --samples_per_epoch 120000 --max_samples_per_file 512 --bootstrap_iterations 1000 --num_workers 2 --no_init
 python train.py --task_data ..\train_data --output .\weights\conditional_cv --resume_cv --num_workers 2 --no_init
-python train.py --task_data ..\train_data --output .\weights\conditional_cv --verify_only --no_init
+python train.py --task_data ..\train_data --output .\weights\conditional_cv --verify_only --num_workers 2 --no_init
 python classify.py --input_dir <lig-dir> --output_dir .\classified --model .\weights\conditional_cv\model.pt
 python -m pytest -q
 python -m compileall -q .
 ```
 
-Random initialization is the default. Use `--init_model` only for an explicit warm start and `--resume .\weights\conditional\latest.pt` only for exact continuation. Source files are never shared across train, validation, and test; splits balance type, daylight, and coarse distance without forcing year boundaries. Promotion requires calibrated rejection, all release gates, and same-split baseline metrics.
+Cross-validated training and final training always use random initialization;
+non-empty `--init_model` values are rejected. Use `--resume_cv` for exact fold
+or final-training continuation. Source files are never shared across folds;
+fold assignment balances type, daylight, and exact 100-km intervals. Promotion
+requires calibrated rejection and every absolute OOF release gate. Historical
+model metrics are reference-only and never authorize promotion.
 
 ## Coding Style & Testing
 

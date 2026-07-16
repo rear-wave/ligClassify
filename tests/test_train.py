@@ -68,6 +68,16 @@ def test_training_requires_at_least_one_joint_epoch():
         train._validate_args(args)
 
 
+def test_one_epoch_smoke_uses_joint_stage_from_epoch_zero():
+    args = train.build_arg_parser().parse_args([
+        "--max_epochs", "1",
+        "--type_focus_epochs", "0",
+        "--patience", "1",
+    ])
+
+    train._validate_args(args)
+
+
 def test_first_joint_epoch_is_selected_after_legacy_resume():
     better_historical_score = (1.0, 1.0)
     current_score = (0.0, 0.0)

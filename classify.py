@@ -331,7 +331,9 @@ def validate_type_only_options(checkpoint, min_type_confidence=0.0):
     """Prevent legacy confidence overrides on calibrated four-class models."""
     if (
         checkpoint_schema(checkpoint) in {
-            "four_class_rejection_v1", "four_class_rejection_v2"
+            "four_class_rejection_v1",
+            "four_class_rejection_v2",
+            "four_class_cv_v3",
         }
         and float(min_type_confidence) != 0.0
     ):

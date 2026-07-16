@@ -425,6 +425,18 @@ def test_four_class_checkpoint_rejects_legacy_confidence_override():
         )
 
 
+def test_v3_checkpoint_rejects_legacy_confidence_override():
+    checkpoint = {
+        "schema": "four_class_cv_v3",
+        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
+    }
+
+    with pytest.raises(ValueError, match="min_type_confidence"):
+        classify.validate_type_only_options(
+            checkpoint, min_type_confidence=0.85
+        )
+
+
 def test_forward_type_bypasses_ordinal_distance_projection():
     model = create_mtl_model(
         base_channels=8, architecture="ordinal_v2", dist_mlp_dim=8, dist_dropout=0.0
