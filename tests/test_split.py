@@ -202,10 +202,9 @@ def test_write_split_json_writes_the_compact_artifact(
     tmp_path, single_stratum_table
 ):
     assignment = assign_piece_splits(single_stratum_table, seed=42)
+    artifact = split_artifact(single_stratum_table, assignment)
     output = tmp_path / "run" / "split.json"
 
-    write_split_json(output, single_stratum_table, assignment)
+    write_split_json(output, artifact)
 
-    assert json.loads(output.read_text(encoding="utf-8")) == split_artifact(
-        single_stratum_table, assignment
-    )
+    assert json.loads(output.read_text(encoding="utf-8")) == artifact

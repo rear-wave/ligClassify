@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -185,14 +186,12 @@ def split_artifact(
 
 def write_split_json(
     path: str | os.PathLike[str],
-    table: PieceTable,
-    assignment: SplitAssignment,
+    artifact: Mapping[str, object],
 ) -> None:
     """Write a compact deterministic split artifact as UTF-8 JSON."""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(split_artifact(table, assignment), indent=2, sort_keys=True)
-        + "\n",
+        json.dumps(dict(artifact), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
