@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import random
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -21,6 +22,32 @@ from training import (
     train_epoch,
 )
 from tests.test_lig import make_piece, write_source
+
+
+def test_runtime_modules_stay_within_approved_line_limit():
+    runtime_paths = (
+        "train.py",
+        "classify.py",
+        "audit_data.py",
+        "models.py",
+        "training.py",
+        "evaluation.py",
+        "checkpoints.py",
+        "data/__init__.py",
+        "data/lig.py",
+        "data/manifest.py",
+        "data/preprocess.py",
+        "data/dataset.py",
+        "data/sampling.py",
+        "data/split.py",
+    )
+
+    line_counts = {
+        path: len(Path(path).read_text(encoding="utf-8").splitlines())
+        for path in runtime_paths
+    }
+
+    assert max(line_counts.values()) <= 600, line_counts
 
 
 def test_training_defaults_match_five_class_contract():

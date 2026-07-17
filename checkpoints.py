@@ -338,6 +338,229 @@ def save_model_checkpoint(
             temporary.unlink()
 
 
+def _same_number(saved: object, current: object) -> bool:
+    return (
+        not isinstance(saved, bool)
+        and isinstance(saved, Real)
+        and not isinstance(current, bool)
+        and isinstance(current, Real)
+        and math.isfinite(float(saved))
+        and math.isclose(
+            float(saved), float(current), rel_tol=1e-12, abs_tol=1e-15
+        )
+    )
+
+
+def validate_optimizer_resume_state(
+    value: object,
+    membership: object,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scheduler_state: Mapping[str, Any],
+    epoch: int,
+) -> dict[str, Any]:
+    """Validate optimizer state before exact same-run restoration."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "state",
+        "param_groups",
+    }:
+        raise ValueError("resume configuration mismatch: optimizer state")
+    saved_state = value["state"]
+    saved_groups = value["param_groups"]
+    current_state = optimizer.state_dict()
+    current_groups = current_state["param_groups"]
+    if not isinstance(saved_state, Mapping) or not isinstance(saved_groups, list):
+        raise ValueError("resume configuration mismatch: optimizer structure")
+    if len(saved_groups) != len(current_groups):
+        raise ValueError("resume configuration mismatch: optimizer groups")
+
+    scheduler_base_lrs = scheduler_state["base_lrs"]
+    scheduler_last_lrs = scheduler_state["_last_lr"]
+    all_parameter_ids: list[int] = []
+    parameter_by_id: dict[int, torch.Tensor] = {}
+    amsgrad_by_id: dict[int, bool] = {}
+    step_dtype_by_id: dict[int, torch.dtype] = {}
+    step_device_by_id: dict[int, torch.device] = {}
+    immutable_fields = (
+        "weight_decay",
+        "betas",
+        "eps",
+        "amsgrad",
+        "maximize",
+        "foreach",
+        "capturable",
+        "differentiable",
+        "fused",
+    )
+    for index, (saved_group, current_group) in enumerate(
+        zip(saved_groups, current_groups)
+    ):
+        if not isinstance(saved_group, Mapping):
+            raise ValueError(
+                "resume configuration mismatch: optimizer group structure"
+            )
+        if set(saved_group) != set(current_group):
+            raise ValueError("resume configuration mismatch: optimizer group keys")
+        saved_parameters = saved_group.get("params")
+        current_parameters = current_group["params"]
+        if (
+            not isinstance(saved_parameters, list)
+            or saved_parameters != current_parameters
+            or any(type(parameter_id) is not int for parameter_id in saved_parameters)
+        ):
+            raise ValueError(
+                "resume configuration mismatch: optimizer parameter membership"
+            )
+        all_parameter_ids.extend(saved_parameters)
+        live_parameters = optimizer.param_groups[index]["params"]
+        if len(live_parameters) != len(saved_parameters):
+            raise ValueError(
+                "resume configuration mismatch: optimizer parameter count"
+            )
+        parameter_by_id.update(zip(saved_parameters, live_parameters))
+        amsgrad_by_id.update(
+            (parameter_id, bool(current_group["amsgrad"]))
+            for parameter_id in saved_parameters
+        )
+        fused = bool(current_group.get("fused", False))
+        step_dtype = (
+            torch.float64
+            if torch.get_default_dtype() == torch.float64 and not fused
+            else torch.float32
+        )
+        for parameter_id in saved_parameters:
+            step_dtype_by_id[parameter_id] = step_dtype
+            step_device_by_id[parameter_id] = torch.device("cpu")
+
+        for field in immutable_fields:
+            if field not in current_group:
+                continue
+            saved_option = saved_group[field]
+            current_option = current_group[field]
+            if isinstance(current_option, bool):
+                same_option = (
+                    type(saved_option) is bool and saved_option == current_option
+                )
+            elif current_option is None:
+                same_option = saved_option is None
+            else:
+                same_option = saved_option == current_option
+            if not same_option:
+                raise ValueError(
+                    f"resume configuration mismatch: optimizer {field}"
+                )
+        betas = saved_group["betas"]
+        if (
+            not isinstance(betas, (list, tuple))
+            or len(betas) != 2
+            or not all(
+                _same_number(saved, current)
+                for saved, current in zip(betas, current_group["betas"])
+            )
+        ):
+            raise ValueError("resume configuration mismatch: optimizer betas")
+        for field in ("weight_decay", "eps"):
+            if not _same_number(saved_group[field], current_group[field]):
+                raise ValueError(
+                    f"resume configuration mismatch: optimizer {field}"
+                )
+
+        if "initial_lr" in current_group:
+            if (
+                "initial_lr" not in saved_group
+                or not _same_number(
+                    saved_group["initial_lr"], current_group["initial_lr"]
+                )
+                or not _same_number(
+                    saved_group["initial_lr"], scheduler_base_lrs[index]
+                )
+            ):
+                raise ValueError(
+                    "resume configuration mismatch: optimizer initial lr"
+                )
+        saved_lr = saved_group.get("lr")
+        if (
+            not _same_number(saved_lr, scheduler_last_lrs[index])
+            or float(saved_lr) < 0.0
+        ):
+            raise ValueError("resume configuration mismatch: optimizer current lr")
+
+        if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+            base_lr = float(scheduler_base_lrs[index])
+            eta_min = float(scheduler_state["eta_min"])
+            t_max = int(scheduler_state["T_max"])
+            expected_lr = eta_min + (base_lr - eta_min) * (
+                1.0 + math.cos(math.pi * epoch / t_max)
+            ) / 2.0
+            if not math.isclose(
+                float(saved_lr), expected_lr, rel_tol=1e-10, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    "resume configuration mismatch: cosine learning rate"
+                )
+
+    if len(set(all_parameter_ids)) != len(all_parameter_ids):
+        raise ValueError("resume configuration mismatch: optimizer parameters")
+    parameter_id_set = set(all_parameter_ids)
+    if (
+        not isinstance(membership, list)
+        or any(type(parameter_id) is not int for parameter_id in membership)
+        or len(set(membership)) != len(membership)
+        or not set(membership).issubset(parameter_id_set)
+    ):
+        raise ValueError(
+            "resume configuration mismatch: optimizer state membership manifest"
+        )
+    if set(saved_state) != set(membership):
+        raise ValueError(
+            "resume configuration mismatch: optimizer state membership"
+        )
+    for parameter_id, state in saved_state.items():
+        if type(parameter_id) is not int or parameter_id not in parameter_id_set:
+            raise ValueError(
+                "resume configuration mismatch: optimizer state membership"
+            )
+        if not isinstance(state, Mapping):
+            raise ValueError(
+                "resume configuration mismatch: optimizer parameter state"
+            )
+        expected_keys = {"step", "exp_avg", "exp_avg_sq"}
+        if amsgrad_by_id[parameter_id]:
+            expected_keys.add("max_exp_avg_sq")
+        if set(state) != expected_keys:
+            raise ValueError(
+                "resume configuration mismatch: optimizer parameter state keys"
+            )
+        step = state["step"]
+        if (
+            not isinstance(step, torch.Tensor)
+            or step.shape != torch.Size([])
+            or step.dtype != step_dtype_by_id[parameter_id]
+            or step.device != step_device_by_id[parameter_id]
+            or not bool(torch.isfinite(step).item())
+            or float(step.item()) < 1.0
+        ):
+            raise ValueError(
+                "resume configuration mismatch: optimizer step state"
+            )
+        parameter = parameter_by_id[parameter_id]
+        moment_names = {"exp_avg", "exp_avg_sq"}
+        if amsgrad_by_id[parameter_id]:
+            moment_names.add("max_exp_avg_sq")
+        for name in moment_names:
+            moment = state[name]
+            if (
+                not isinstance(moment, torch.Tensor)
+                or moment.shape != parameter.shape
+                or moment.dtype != parameter.dtype
+                or not bool(torch.isfinite(moment).all().item())
+            ):
+                raise ValueError(
+                    f"resume configuration mismatch: optimizer {name} state"
+                )
+    return {"state": dict(saved_state), "param_groups": list(saved_groups)}
+
+
 def model_sha256(path: os.PathLike[str] | str) -> str:
     """Return a streaming SHA-256 digest of a checkpoint file."""
 
