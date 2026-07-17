@@ -1,4 +1,4 @@
-"""ligClassify data — .lig parsing & preprocessing."""
+"""ligClassify data — LIG parsing, piece metadata, and preprocessing."""
 
-from .lig_parser import LigFileIndex, LigFormatError
+from .lig import LigFileIndex, LigFormatError
 from .preprocessing import preprocess_waveform, preprocess_batch
