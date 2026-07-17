@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Iterable, Mapping
+import os
+from pathlib import Path
+import random
+from typing import Any, Iterable, Mapping
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from checkpoints import TRAINING_STATE_SCHEMA
 from models import DISTANCE_BIN_COUNT, DISTANCE_EXPERT_COUNT, ModelOutput, TYPE_COUNT
 
 
@@ -196,3 +201,208 @@ class EarlyStoppingState:
             return True
         self.wait += 1
         return False
+
+
+def _cpu_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in model.state_dict().items()
+    }
+
+
+def save_last_state(
+    path: str | os.PathLike[str],
+    *,
+    epoch: int,
+    sampler_epoch: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.amp.GradScaler,
+    early_stopping: EarlyStoppingState,
+    split_hash: str,
+    config_hash: str,
+) -> None:
+    """Atomically save an exact same-run training continuation state."""
+    completed_epoch = int(epoch)
+    current_sampler_epoch = int(sampler_epoch)
+    if completed_epoch < 0 or current_sampler_epoch < 0:
+        raise ValueError("resume epochs must be non-negative")
+    if not split_hash or not config_hash:
+        raise ValueError("resume hashes must be non-empty")
+    if early_stopping.best_state is None:
+        raise ValueError("resume state requires an in-memory best model")
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(f"{destination}.tmp")
+    payload: dict[str, Any] = {
+        "schema": TRAINING_STATE_SCHEMA,
+        "epoch": completed_epoch,
+        "sampler_epoch": current_sampler_epoch,
+        "model_state": _cpu_state_dict(model),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "scaler_state": scaler.state_dict(),
+        "early_stopping": {
+            "best_score": float(early_stopping.best_score),
+            "best_epoch": int(early_stopping.best_epoch),
+            "wait": int(early_stopping.wait),
+            "best_state": {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in early_stopping.best_state.items()
+            },
+        },
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": (
+            [state.cpu() for state in torch.cuda.get_rng_state_all()]
+            if torch.cuda.is_available()
+            else None
+        ),
+        "split_hash": str(split_hash),
+        "config_hash": str(config_hash),
+    }
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _load_training_payload(
+    path: str | os.PathLike[str], device: torch.device | str
+) -> dict[str, Any]:
+    try:
+        payload = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:  # pragma: no cover - compatibility with older PyTorch
+        payload = torch.load(path, map_location=device)
+    if not isinstance(payload, Mapping):
+        raise ValueError("resume checkpoint payload must be a mapping")
+    return dict(payload)
+
+
+def load_last_state(
+    path: str | os.PathLike[str],
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.amp.GradScaler,
+    early_stopping: EarlyStoppingState,
+    expected_split_hash: str,
+    expected_config_hash: str,
+    device: torch.device | str = "cpu",
+) -> dict[str, int | str]:
+    """Validate and restore an exact resumable training checkpoint."""
+    payload = _load_training_payload(path, device)
+    required = {
+        "schema",
+        "epoch",
+        "sampler_epoch",
+        "model_state",
+        "optimizer_state",
+        "scheduler_state",
+        "scaler_state",
+        "early_stopping",
+        "python_rng_state",
+        "numpy_rng_state",
+        "torch_rng_state",
+        "cuda_rng_state",
+        "split_hash",
+        "config_hash",
+    }
+    if set(payload) != required:
+        raise ValueError("resume configuration mismatch: checkpoint fields")
+    if payload["schema"] != TRAINING_STATE_SCHEMA:
+        raise ValueError("resume configuration mismatch: checkpoint schema")
+    if (
+        payload["split_hash"] != expected_split_hash
+        or payload["config_hash"] != expected_config_hash
+    ):
+        raise ValueError("resume configuration mismatch")
+
+    epoch = payload["epoch"]
+    sampler_epoch = payload["sampler_epoch"]
+    if type(epoch) is not int or epoch < 0:
+        raise ValueError("resume configuration mismatch: epoch")
+    if type(sampler_epoch) is not int or sampler_epoch < 0:
+        raise ValueError("resume configuration mismatch: sampler epoch")
+    early_payload = payload["early_stopping"]
+    if not isinstance(early_payload, Mapping):
+        raise ValueError("resume configuration mismatch: early stopping")
+    if set(early_payload) != {
+        "best_score",
+        "best_epoch",
+        "wait",
+        "best_state",
+    }:
+        raise ValueError("resume configuration mismatch: early stopping")
+
+    try:
+        model.load_state_dict(payload["model_state"], strict=True)
+        optimizer.load_state_dict(payload["optimizer_state"])
+        scheduler.load_state_dict(payload["scheduler_state"])
+        scaler.load_state_dict(payload["scaler_state"])
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"resume configuration mismatch: state restoration failed: {exc}"
+        ) from exc
+
+    best_state = early_payload["best_state"]
+    if not isinstance(best_state, Mapping) or not best_state:
+        raise ValueError("resume configuration mismatch: best state")
+    expected_state = model.state_dict()
+    if set(best_state) != set(expected_state):
+        raise ValueError("resume configuration mismatch: best state keys")
+    for name, expected_tensor in expected_state.items():
+        saved_tensor = best_state[name]
+        if (
+            not isinstance(saved_tensor, torch.Tensor)
+            or saved_tensor.shape != expected_tensor.shape
+            or saved_tensor.dtype != expected_tensor.dtype
+        ):
+            raise ValueError(
+                f"resume configuration mismatch: best state tensor {name!r}"
+            )
+    best_score = float(early_payload["best_score"])
+    best_epoch = early_payload["best_epoch"]
+    wait = early_payload["wait"]
+    if not math.isfinite(best_score):
+        raise ValueError("resume configuration mismatch: best score")
+    if type(best_epoch) is not int or not 1 <= best_epoch <= epoch:
+        raise ValueError("resume configuration mismatch: best epoch")
+    if type(wait) is not int or wait < 0:
+        raise ValueError("resume configuration mismatch: early-stop wait")
+    early_stopping.best_score = best_score
+    early_stopping.best_epoch = best_epoch
+    early_stopping.wait = wait
+    early_stopping.best_state = {
+        str(name): tensor.detach().cpu().clone()
+        for name, tensor in best_state.items()
+    }
+
+    try:
+        random.setstate(payload["python_rng_state"])
+        np.random.set_state(payload["numpy_rng_state"])
+        torch.set_rng_state(payload["torch_rng_state"].cpu())
+        cuda_state = payload["cuda_rng_state"]
+        if cuda_state is not None:
+            if not torch.cuda.is_available():
+                raise ValueError("CUDA RNG availability differs")
+            torch.cuda.set_rng_state_all(
+                [state.cpu() for state in cuda_state]
+            )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"resume configuration mismatch: RNG restoration failed: {exc}"
+        ) from exc
+
+    return {
+        "epoch": epoch,
+        "sampler_epoch": sampler_epoch,
+        "split_hash": str(payload["split_hash"]),
+        "config_hash": str(payload["config_hash"]),
+    }

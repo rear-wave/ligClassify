@@ -1,14 +1,62 @@
 from __future__ import annotations
 
 import copy
+import random
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
 
+import train
+from checkpoints import load_model_checkpoint
 from evaluation import evaluate_loader, selection_score
 from models import ModelOutput
-from training import EarlyStoppingState, compute_joint_loss, train_epoch
+from training import (
+    EarlyStoppingState,
+    compute_joint_loss,
+    load_last_state,
+    save_last_state,
+    train_epoch,
+)
+from tests.test_lig import make_piece, write_source
+
+
+def test_training_defaults_match_five_class_contract():
+    args = train.build_parser().parse_args([])
+
+    assert args.task_data == r"..\train_data"
+    assert args.output == r".\weights\five_class"
+    assert args.epochs == 50
+    assert args.batch_size == 256
+    assert args.patience == 10
+    assert args.samples_per_epoch == 120000
+    assert args.num_workers == 2
+    assert args.seed == 42
+    assert args.ic_fraction == 0.60
+    assert args.distance_weight == 0.5
+    assert args.base_channels == 64
+    assert args.lr == 0.0003
+    assert args.weight_decay == 0.0005
+    assert args.resume is None
+    assert args.no_amp is False
+    assert not hasattr(args, "init_model")
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--resume_cv",
+        "--init_model",
+        "--folds",
+        "--stop_after_oof",
+        "--rejection_target_precision",
+        "--verify_only",
+    ],
+)
+def test_old_training_options_are_rejected(option):
+    with pytest.raises(SystemExit):
+        train.build_parser().parse_args([option])
 
 
 def _random_output(batch_size: int = 3) -> ModelOutput:
@@ -262,3 +310,342 @@ def test_early_stopping_requires_more_than_one_millionth_improvement():
     assert state.update(0.500002, epoch=4, model=model)
     assert state.wait == 0
     assert state.best_epoch == 4
+
+
+def _resume_components():
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5)
+    scaler = torch.amp.GradScaler("cpu", enabled=True)
+    loss = model(torch.ones(2, 2)).sum()
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    scheduler.step()
+    early_stopping = EarlyStoppingState()
+    early_stopping.update(0.75, epoch=3, model=model)
+    early_stopping.wait = 2
+    return model, optimizer, scheduler, scaler, early_stopping
+
+
+def test_exact_resume_restores_full_training_and_rng_state(tmp_path):
+    random.seed(17)
+    np.random.seed(18)
+    torch.manual_seed(19)
+    model, optimizer, scheduler, scaler, early_stopping = _resume_components()
+    expected_model = copy.deepcopy(model.state_dict())
+    expected_optimizer = copy.deepcopy(optimizer.state_dict())
+    expected_scheduler = copy.deepcopy(scheduler.state_dict())
+    expected_scaler = copy.deepcopy(scaler.state_dict())
+    expected_best = copy.deepcopy(early_stopping.best_state)
+    path = tmp_path / "last.pt"
+
+    save_last_state(
+        path,
+        epoch=3,
+        sampler_epoch=3,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        split_hash="split-abc",
+        config_hash="config-abc",
+    )
+    expected_python = random.random()
+    expected_numpy = np.random.random()
+    expected_torch = torch.rand(3)
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+    optimizer.param_groups[0]["lr"] = 99.0
+    scheduler.last_epoch = 99
+    early_stopping.best_score = -1.0
+    early_stopping.best_epoch = -1
+    early_stopping.wait = 99
+    early_stopping.best_state = None
+    random.seed(101)
+    np.random.seed(102)
+    torch.manual_seed(103)
+
+    restored = load_last_state(
+        path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        expected_split_hash="split-abc",
+        expected_config_hash="config-abc",
+        device="cpu",
+    )
+
+    assert restored == {
+        "epoch": 3,
+        "sampler_epoch": 3,
+        "split_hash": "split-abc",
+        "config_hash": "config-abc",
+    }
+    for name, tensor in expected_model.items():
+        assert torch.equal(model.state_dict()[name], tensor)
+    restored_optimizer = optimizer.state_dict()
+    assert restored_optimizer["param_groups"] == expected_optimizer["param_groups"]
+    assert restored_optimizer["state"].keys() == expected_optimizer["state"].keys()
+    for parameter_id, expected_values in expected_optimizer["state"].items():
+        for name, expected in expected_values.items():
+            actual = restored_optimizer["state"][parameter_id][name]
+            if isinstance(expected, torch.Tensor):
+                assert torch.equal(actual, expected)
+            else:
+                assert actual == expected
+    assert scheduler.state_dict() == expected_scheduler
+    assert scaler.state_dict() == expected_scaler
+    assert early_stopping.best_score == 0.75
+    assert early_stopping.best_epoch == 3
+    assert early_stopping.wait == 2
+    for name, tensor in expected_best.items():
+        assert torch.equal(early_stopping.best_state[name], tensor)
+    assert random.random() == expected_python
+    assert np.random.random() == expected_numpy
+    assert torch.equal(torch.rand(3), expected_torch)
+
+
+@pytest.mark.parametrize(
+    ("option", "changed"),
+    [
+        ("--ic_fraction", "0.50"),
+        ("--base_channels", "16"),
+        ("--seed", "43"),
+    ],
+)
+def test_resume_rejects_training_configuration_changes(tmp_path, option, changed):
+    base_args = train.build_parser().parse_args([])
+    changed_args = train.build_parser().parse_args([option, changed])
+    model, optimizer, scheduler, scaler, early_stopping = _resume_components()
+    path = tmp_path / "last.pt"
+    save_last_state(
+        path,
+        epoch=1,
+        sampler_epoch=1,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        split_hash="same-split",
+        config_hash=train.training_config_hash(base_args),
+    )
+
+    with pytest.raises(ValueError, match="resume configuration mismatch"):
+        load_last_state(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            early_stopping=early_stopping,
+            expected_split_hash="same-split",
+            expected_config_hash=train.training_config_hash(changed_args),
+            device="cpu",
+        )
+
+
+def test_resume_rejects_split_hash_mismatch(tmp_path):
+    model, optimizer, scheduler, scaler, early_stopping = _resume_components()
+    path = tmp_path / "last.pt"
+    save_last_state(
+        path,
+        epoch=1,
+        sampler_epoch=1,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        split_hash="original",
+        config_hash="same-config",
+    )
+
+    with pytest.raises(ValueError, match="resume configuration mismatch"):
+        load_last_state(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            early_stopping=early_stopping,
+            expected_split_hash="changed",
+            expected_config_hash="same-config",
+            device="cpu",
+        )
+
+
+def test_resume_rejects_corrupt_best_state(tmp_path):
+    model, optimizer, scheduler, scaler, early_stopping = _resume_components()
+    path = tmp_path / "last.pt"
+    save_last_state(
+        path,
+        epoch=1,
+        sampler_epoch=1,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        split_hash="split",
+        config_hash="config",
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["early_stopping"]["best_state"].pop(
+        next(iter(payload["early_stopping"]["best_state"]))
+    )
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match="resume configuration mismatch"):
+        load_last_state(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            early_stopping=early_stopping,
+            expected_split_hash="split",
+            expected_config_hash="config",
+        )
+
+
+def test_training_state_is_never_exposed_as_inference_checkpoint(tmp_path):
+    model, optimizer, scheduler, scaler, early_stopping = _resume_components()
+    path = tmp_path / "last.pt"
+    save_last_state(
+        path,
+        epoch=1,
+        sampler_epoch=1,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        split_hash="split",
+        config_hash="config",
+    )
+
+    with pytest.raises(ValueError, match="optimizer|checkpoint"):
+        load_model_checkpoint(path, "cpu")
+
+
+def _write_training_tree(root):
+    for type_index, type_name in enumerate(("IC", "NCG", "NNBE", "PCG", "PNBE")):
+        for daylight_name, hour in (("day", 3), ("night", 20)):
+            if type_name == "IC":
+                source = root / type_name / daylight_name / "sample.lig"
+            else:
+                source = (
+                    root
+                    / type_name
+                    / daylight_name
+                    / f"{type_index * 100}-{(type_index + 1) * 100}km"
+                    / "sample.lig"
+                )
+            source.parent.mkdir(parents=True, exist_ok=True)
+            write_source(
+                source,
+                [make_piece(type_index * 10 + item, hour=hour) for item in range(3)],
+            )
+
+
+def _smoke_args(root, output, *extra):
+    return [
+        "--task_data",
+        str(root),
+        "--output",
+        str(output),
+        "--epochs",
+        "1",
+        "--samples_per_epoch",
+        "20",
+        "--batch_size",
+        "5",
+        "--num_workers",
+        "0",
+        "--base_channels",
+        "8",
+        "--no_amp",
+        *extra,
+    ]
+
+
+def test_resume_with_exhausted_patience_does_not_train_another_epoch(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "train_data"
+    output = tmp_path / "output"
+    _write_training_tree(root)
+    calls = 0
+
+    def restore_exhausted(_path, **kwargs):
+        early_stopping = kwargs["early_stopping"]
+        model = kwargs["model"]
+        early_stopping.best_score = 0.5
+        early_stopping.best_epoch = 1
+        early_stopping.wait = 10
+        early_stopping.best_state = copy.deepcopy(model.state_dict())
+        return {
+            "epoch": 0,
+            "sampler_epoch": 0,
+            "split_hash": kwargs["expected_split_hash"],
+            "config_hash": kwargs["expected_config_hash"],
+        }
+
+    def count_training(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(train, "load_last_state", restore_exhausted)
+    monkeypatch.setattr(train, "train_epoch", count_training)
+
+    train.main(_smoke_args(root, output, "--resume", str(output / "last.pt")))
+
+    assert calls == 0
+
+
+def test_training_closes_every_dataset_when_validation_fails(tmp_path, monkeypatch):
+    root = tmp_path / "train_data"
+    output = tmp_path / "output"
+    _write_training_tree(root)
+    closed = set()
+    real_close = train.FiveClassDataset.close
+
+    def record_close(dataset):
+        closed.add(dataset.split)
+        real_close(dataset)
+
+    monkeypatch.setattr(train.FiveClassDataset, "close", record_close)
+    monkeypatch.setattr(train.FiveClassDataset, "__del__", lambda _dataset: None)
+    monkeypatch.setattr(
+        train,
+        "evaluate_loader",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("coverage")),
+    )
+
+    with pytest.raises(ValueError, match="coverage"):
+        train.main(_smoke_args(root, output))
+
+    assert closed == {"train", "validation", "test"}
+
+
+def test_single_split_training_smoke_writes_only_contract_artifacts(tmp_path):
+    root = tmp_path / "train_data"
+    output = tmp_path / "output"
+    _write_training_tree(root)
+
+    result = train.main(_smoke_args(root, output))
+
+    assert result["best_epoch"] == 1
+    assert {path.name for path in output.iterdir()} == {
+        "model.pt",
+        "last.pt",
+        "metrics.json",
+        "split.json",
+    }

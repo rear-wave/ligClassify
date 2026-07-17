@@ -8,6 +8,7 @@ import math
 from numbers import Real
 import os
 from pathlib import Path
+import pickle
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ from models import LegacyMultiTaskResNet, create_five_class_model
 
 
 FIVE_CLASS_SCHEMA = "five_class_v1"
+TRAINING_STATE_SCHEMA = "five_class_training_state_v1"
 LEGACY_FIVE_CLASS_SCHEMA = "legacy_five_class"
 TYPE_NAMES = ("IC", "NCG", "NNBE", "PCG", "PNBE")
 DISTANCE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
@@ -74,6 +76,8 @@ class LoadedCheckpoint:
 def _load_payload(path: os.PathLike[str] | str, device: torch.device | str):
     try:
         return torch.load(path, map_location=device, weights_only=True)
+    except pickle.UnpicklingError as exc:
+        raise ValueError("checkpoint payload cannot be safely loaded") from exc
     except TypeError:  # pragma: no cover - compatibility with older PyTorch
         return torch.load(path, map_location=device)
 
