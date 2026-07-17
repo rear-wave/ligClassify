@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+import math
+from numbers import Real
 import os
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,15 @@ _LEGACY_REQUIRED_FIELDS = frozenset(
     }
 )
 _STATE_FIELDS = frozenset({"model_state", "model_state_dict"})
+_NEW_PREPROCESS_KEYS = frozenset(
+    {
+        "local_length",
+        "global_length",
+        "use_filter",
+        "cutoff_hz",
+        "sample_rate_hz",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -112,10 +123,40 @@ def _state_mapping(value: object) -> dict[str, torch.Tensor]:
 
 def _new_preprocess_config(value: object) -> dict[str, Any]:
     config = _mapping(value, "preprocess_config")
-    if config.get("local_length") != 8000:
+    unknown = sorted(set(config) - _NEW_PREPROCESS_KEYS)
+    if unknown:
+        raise ValueError(
+            f"checkpoint preprocess_config has unknown fields: {unknown}"
+        )
+    if type(config.get("local_length")) is not int or config[
+        "local_length"
+    ] != 8000:
         raise ValueError("checkpoint preprocess_config local_length is invalid")
-    if config.get("global_length") != 2000:
+    if type(config.get("global_length")) is not int or config[
+        "global_length"
+    ] != 2000:
         raise ValueError("checkpoint preprocess_config global_length is invalid")
+    if "use_filter" in config and type(config["use_filter"]) is not bool:
+        raise ValueError("checkpoint preprocess_config use_filter is invalid")
+    cutoff_hz = config.get("cutoff_hz", 120_000.0)
+    sample_rate_hz = config.get("sample_rate_hz", 5_000_000.0)
+    for name, number in (
+        ("cutoff_hz", cutoff_hz),
+        ("sample_rate_hz", sample_rate_hz),
+    ):
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, Real)
+            or not math.isfinite(float(number))
+            or float(number) <= 0.0
+        ):
+            raise ValueError(
+                f"checkpoint preprocess_config {name} is invalid"
+            )
+    if float(cutoff_hz) >= float(sample_rate_hz) / 2.0:
+        raise ValueError(
+            "checkpoint preprocess_config cutoff_hz must be below Nyquist"
+        )
     return config
 
 
@@ -128,11 +169,29 @@ def _legacy_preprocess_config(value: object) -> dict[str, Any]:
     return config
 
 
+def _reject_optimizer_metadata(value: object, path: str = "metadata") -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            key_name = str(key)
+            nested_path = f"{path}.{key_name}"
+            if isinstance(key, str) and "optimizer" in key.casefold():
+                raise ValueError(
+                    f"checkpoint optimizer metadata is forbidden: {nested_path}"
+                )
+            _reject_optimizer_metadata(nested, nested_path)
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _reject_optimizer_metadata(nested, f"{path}[{index}]")
+
+
 def _inference_metadata(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = {
+        key: value for key, value in checkpoint.items() if key not in _STATE_FIELDS
+    }
+    _reject_optimizer_metadata(metadata)
     return {
         key: deepcopy(value)
-        for key, value in checkpoint.items()
-        if key not in _STATE_FIELDS and "optimizer" not in key.lower()
+        for key, value in metadata.items()
     }
 
 
@@ -219,6 +278,13 @@ def load_model_checkpoint(
     if not isinstance(payload, Mapping):
         raise ValueError("checkpoint payload must be a mapping")
     checkpoint = dict(payload)
+    _reject_optimizer_metadata(
+        {
+            key: value
+            for key, value in checkpoint.items()
+            if key not in _STATE_FIELDS
+        }
+    )
     schema = checkpoint.get("schema")
     if schema == FIVE_CLASS_SCHEMA:
         return _load_new(checkpoint, device)

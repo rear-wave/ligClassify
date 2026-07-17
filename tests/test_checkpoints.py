@@ -195,6 +195,50 @@ def test_malformed_tensor_shapes_are_rejected(tmp_path, legacy):
         {"distance_names": ["NNBE", "NCG", "PCG", "PNBE"]},
         {"distance_bins_km": list(range(100, 3100, 100))},
         {"preprocess_config": {"local_length": 8000}},
+        {
+            "preprocess_config": {
+                "local_length": 8000,
+                "global_length": 2000,
+                "normalize_mode": "minmax",
+            }
+        },
+        {
+            "preprocess_config": {
+                "local_length": 8000,
+                "global_length": 2000,
+                "use_filter": 1,
+            }
+        },
+        {
+            "preprocess_config": {
+                "local_length": 8000,
+                "global_length": 2000,
+                "cutoff_hz": float("inf"),
+            }
+        },
+        {
+            "preprocess_config": {
+                "local_length": 8000,
+                "global_length": 2000,
+                "cutoff_hz": "120000",
+            }
+        },
+        {
+            "preprocess_config": {
+                "local_length": 8000,
+                "global_length": 2000,
+                "cutoff_hz": 120_000.0,
+                "sample_rate_hz": 0.0,
+            }
+        },
+        {
+            "preprocess_config": {
+                "local_length": 8000,
+                "global_length": 2000,
+                "cutoff_hz": 2_500_000.0,
+                "sample_rate_hz": 5_000_000.0,
+            }
+        },
     ],
 )
 def test_malformed_new_checkpoint_configuration_is_rejected(tmp_path, updates):
@@ -205,14 +249,46 @@ def test_malformed_new_checkpoint_configuration_is_rejected(tmp_path, updates):
         load_model_checkpoint(path, "cpu")
 
 
-def test_loaded_checkpoint_does_not_expose_optimizer_state(tmp_path):
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"optimizer_state": {"state": {0: {"step": torch.tensor(1)}}}},
+        {
+            "training_config": {
+                "distance_weight": 0.5,
+                "resume": {"optimizer_state_dict": {"state": {}}},
+            }
+        },
+        {
+            "metadata": {
+                "run": {"components": [{"optimizer_name": "AdamW"}]}
+            }
+        },
+    ],
+)
+def test_optimizer_metadata_is_rejected_recursively(tmp_path, updates):
     path = tmp_path / "with-optimizer.pt"
-    _save_new(path, optimizer_state={"state": {0: {"step": torch.tensor(1)}}})
+    _save_new(path, **updates)
 
-    loaded = load_model_checkpoint(path, "cpu")
+    with pytest.raises(ValueError, match="optimizer"):
+        load_model_checkpoint(path, "cpu")
 
-    assert not hasattr(loaded, "optimizer_state")
-    assert "optimizer_state" not in loaded.metadata
+
+def test_save_rejects_nested_optimizer_metadata_before_replacement(tmp_path):
+    path = tmp_path / "model.pt"
+
+    with pytest.raises(ValueError, match="optimizer"):
+        save_model_checkpoint(
+            path,
+            create_five_class_model(base_channels=8),
+            model_config={"base_channels": 8},
+            preprocess_config={"local_length": 8000, "global_length": 2000},
+            split_hash="split",
+            training_config={"nested": {"optimizer": {"state": {}}}},
+        )
+
+    assert not path.exists()
+    assert not Path(f"{path}.tmp").exists()
 
 
 def test_model_sha256_streams_file_contents(tmp_path):
