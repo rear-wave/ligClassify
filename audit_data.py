@@ -1,164 +1,167 @@
-"""Audit trusted waveform data and write reproducible three-fold artifacts."""
+"""Audit the five-class piece manifest and deterministic split."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 
-from data.cross_validation import (
-    FOLD_COUNT,
-    MINIMUM_SUPPORTED_PIECES,
-    assign_exact_folds,
-    build_support_map,
-    validate_fold_assignment,
+import numpy as np
+
+from data.lig import read_raw_piece
+from data.manifest import TYPE_NAMES, PieceTable, build_piece_table
+from data.split import (
+    PARTITION_NAMES,
+    SplitAssignment,
+    assign_piece_splits,
+    split_artifact,
+    validate_piece_split,
 )
-from data.split_artifacts import build_data_audit, make_fold_manifest, write_json
-from data.training_manifest import build_manifest
 
 
-TYPE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
+TRAINING_PRIOR = {
+    "IC": 0.60,
+    "NCG": 0.10,
+    "NNBE": 0.10,
+    "PCG": 0.10,
+    "PNBE": 0.10,
+}
+
+
+def audit_duplicate_waveforms(
+    table: PieceTable,
+    assignment: SplitAssignment,
+) -> dict[str, int | str]:
+    """Hash complete raw pieces and reject duplicates crossing partitions."""
+    validate_piece_split(table, assignment)
+    first_by_digest: dict[str, tuple[int, str]] = {}
+    for position in range(len(table)):
+        source = table.sources[int(table.source_index[position])]
+        piece_index = int(table.piece_index[position])
+        identity = table.piece_key(position)
+        partition = int(assignment.partition[position])
+        digest = hashlib.sha256(
+            read_raw_piece(source.path, piece_index)
+        ).hexdigest()
+        first = first_by_digest.get(digest)
+        if first is None:
+            first_by_digest[digest] = (partition, identity)
+            continue
+        first_partition, first_identity = first
+        if first_partition != partition:
+            raise ValueError(
+                "duplicate waveform crosses partitions: "
+                f"{first_identity} ({PARTITION_NAMES[first_partition]}) and "
+                f"{identity} ({PARTITION_NAMES[partition]})"
+            )
+    return {
+        "algorithm": "sha256_complete_raw_piece",
+        "pieces_hashed": len(table),
+        "unique_digests": len(first_by_digest),
+    }
+
+
+def _type_counts(table: PieceTable) -> dict[str, int]:
+    return {
+        name: int(np.count_nonzero(table.type_index == index))
+        for index, name in enumerate(TYPE_NAMES)
+    }
+
+
+def _distance_bin_counts(table: PieceTable) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for distance_bin in sorted(
+        set(int(value) for value in table.distance_bin if int(value) >= 0)
+    ):
+        low = distance_bin * 100
+        counts[f"{low}-{low + 100}km"] = int(
+            np.count_nonzero(table.distance_bin == distance_bin)
+        )
+    return counts
 
 
 def audit_dataset(
-    task_data,
-    output=None,
-    seed=42,
-    val_fraction=0.15,
-    test_fraction=0.15,
-):
-    """Inspect trusted files without loading waveforms or starting training."""
-    entries, diagnostics = build_manifest(str(task_data), TYPE_NAMES)
-    if not entries:
-        raise RuntimeError(f"No valid trusted-type .lig files found under {task_data}")
+    task_data: str | Path,
+    output: str | Path | None = None,
+    seed: int = 42,
+    check_duplicates: bool = False,
+) -> dict[str, object]:
+    """Build and validate a piece split, optionally hashing raw waveforms."""
+    table, diagnostics = build_piece_table(task_data)
+    if not len(table):
+        raise RuntimeError(f"No valid .lig pieces found under {task_data}")
 
-    folds = assign_exact_folds(entries, n_folds=FOLD_COUNT, seed=seed)
-    validate_fold_assignment(folds, entries, n_folds=FOLD_COUNT)
-    fold_manifest = make_fold_manifest(folds, str(task_data), seed)
+    assignment = assign_piece_splits(table, seed=int(seed))
+    validate_piece_split(table, assignment)
+    artifact = split_artifact(table, assignment)
+    strata = artifact["strata"]
+    if not isinstance(strata, dict):
+        raise TypeError("split artifact strata must be a mapping")
 
-    reversed_folds = assign_exact_folds(
-        reversed(entries), n_folds=FOLD_COUNT, seed=seed
-    )
-    validate_fold_assignment(reversed_folds, entries, n_folds=FOLD_COUNT)
-    reversed_manifest = make_fold_manifest(
-        reversed_folds, str(task_data), seed
-    )
-    if fold_manifest["combined_hash"] != reversed_manifest["combined_hash"]:
-        raise RuntimeError("cross-validation fold hashes are not deterministic")
-    ownership = {
-        fold: [row["path"] for row in rows]
-        for fold, rows in fold_manifest["folds"].items()
-    }
-    reversed_ownership = {
-        fold: [row["path"] for row in rows]
-        for fold, rows in reversed_manifest["folds"].items()
-    }
-    if ownership != reversed_ownership:
-        raise RuntimeError("cross-validation fold ownership is not deterministic")
-
-    manifest_totals = {
-        "files": int(diagnostics["valid_files"]),
-        "pieces": int(sum(entry.n_pieces for entry in entries)),
-    }
-    fold_totals = {
-        "files": int(sum(len(rows) for rows in folds.values())),
-        "pieces": int(
-            sum(entry.n_pieces for rows in folds.values() for entry in rows)
+    report: dict[str, object] = {
+        "schema": "five_class_data_audit_v1",
+        "files": int(diagnostics["files"]),
+        "pieces": int(diagnostics["pieces"]),
+        "type_counts": _type_counts(table),
+        "daylight_counts": {
+            "day": int(np.count_nonzero(table.daylight)),
+            "night": int(np.count_nonzero(~table.daylight)),
+        },
+        "distance_bin_counts": _distance_bin_counts(table),
+        "small_strata": sorted(
+            name
+            for name, counts in strata.items()
+            if isinstance(counts, dict)
+            and int(counts.get("insufficient_for_evaluation", 0)) > 0
         ),
+        "split_schema": artifact["schema"],
+        "split_seed": artifact["seed"],
+        "split_ratios": artifact["ratios"],
+        "manifest_hash": artifact["manifest_hash"],
+        "split_hashes": artifact["partition_hashes"],
+        "split_counts": artifact["counts"],
+        "strata_counts": strata,
+        "training_prior": dict(TRAINING_PRIOR),
     }
-    if fold_totals != manifest_totals:
-        raise RuntimeError(
-            "cross-validation fold totals do not match the trusted manifest"
+    if check_duplicates:
+        report["duplicate_waveforms"] = audit_duplicate_waveforms(
+            table, assignment
         )
 
-    support_map = build_support_map(entries, TYPE_NAMES)
-    insufficient_support_cells = sorted(
-        name
-        for name, row in support_map.items()
-        if row["status"] == "insufficient_support"
-    )
-    named_folds = {
-        f"fold_{index}": rows for index, rows in sorted(folds.items())
-    }
-    data_audit = build_data_audit(named_folds, TYPE_NAMES)
-    data_audit["manifest_diagnostics"] = diagnostics
-    data_audit["manifest_totals"] = manifest_totals
-    data_audit["fold_totals"] = fold_totals
-    data_audit["fold_hashes"] = fold_manifest["holdout_hashes"]
-    data_audit["combined_fold_hash"] = fold_manifest["combined_hash"]
-    data_audit["cross_fold_files"] = data_audit["cross_split_files"]
-    data_audit["cv_contract"] = {
-        "schema": fold_manifest["schema"],
-        "fold_count": FOLD_COUNT,
-        "split_fractions_active": False,
-    }
-    data_audit["legacy_split_arguments"] = {
-        "active": False,
-        "val_fraction": float(val_fraction),
-        "test_fraction": float(test_fraction),
-    }
-    data_audit["insufficient_support_cell_count"] = len(
-        insufficient_support_cells
-    )
-    data_audit["insufficient_support_cells"] = insufficient_support_cells
-
-    result = {
-        "data_audit": data_audit,
-        "fold_manifest": fold_manifest,
-        "support_map": support_map,
-    }
     if output is not None:
-        output = Path(output)
-        write_json(output, data_audit)
-        write_json(output.parent / "fold_manifest.json", fold_manifest)
-        write_json(output.parent / "support_map.json", support_map)
-    return result
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return report
 
 
-def build_arg_parser():
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Return the compact audit command-line parser."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task_data", default="../train_data")
-    parser.add_argument(
-        "--output", default="./weights/conditional/data_audit.json"
-    )
+    parser.add_argument("--output")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--val_fraction",
-        type=float,
-        default=0.15,
-        help="Legacy compatibility argument; inactive under fixed three-fold CV.",
-    )
-    parser.add_argument(
-        "--test_fraction",
-        type=float,
-        default=0.15,
-        help="Legacy compatibility argument; inactive under fixed three-fold CV.",
-    )
+    parser.add_argument("--check_duplicates", action="store_true")
     return parser
 
 
-def main():
+def main() -> None:
+    """Run the audit CLI."""
     args = build_arg_parser().parse_args()
-    result = audit_dataset(
-        args.task_data,
-        args.output,
-        args.seed,
-        args.val_fraction,
-        args.test_fraction,
+    report = audit_dataset(
+        task_data=args.task_data,
+        output=args.output,
+        seed=args.seed,
+        check_duplicates=args.check_duplicates,
     )
-    audit = result["data_audit"]
     print(
-        f"Audited {audit['manifest_diagnostics']['valid_files']} trusted files; "
-        f"cross-fold files={audit['cross_fold_files']}"
+        f"Audited {report['files']} files and {report['pieces']} pieces; "
+        f"split counts={report['split_counts']}"
     )
-    for name, summary in audit["splits"].items():
-        print(f"  {name}: {summary['files']} files, {summary['pieces']} pieces")
-    if audit["insufficient_support_cells"]:
-        print(
-            "Insufficient-support cells "
-            f"(fewer than {MINIMUM_SUPPORTED_PIECES} waveform pieces):"
-        )
-        for condition in audit["insufficient_support_cells"]:
-            print(f"  {condition}")
 
 
 if __name__ == "__main__":

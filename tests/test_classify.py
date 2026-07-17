@@ -17,13 +17,56 @@ from data.lig import (
     PIECE_BYTES,
     WAVEFORM_SAMPLES,
 )
-from data.preprocessing import preprocess_batch as legacy_reference_preprocess
 from models import ModelOutput
 
 
 TYPE_NAMES = ("IC", "NCG", "NNBE", "PCG", "PNBE")
 DISTANCE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
 DISTANCE_BINS = tuple(range(0, 3000, 100))
+
+
+def legacy_reference_preprocess(
+    pieces: np.ndarray,
+    *,
+    target_length: int,
+    normalize_mode: str,
+) -> np.ndarray:
+    """Frozen oracle for the retained checkpoint's historical input view."""
+    from scipy.signal import butter, sosfiltfilt
+
+    values = np.asarray(pieces, dtype=np.float32)
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+    sos = butter(
+        2,
+        120_000.0 / (5_000_000.0 / 2.0),
+        btype="low",
+        output="sos",
+    )
+    values = sosfiltfilt(sos, values, axis=-1).astype(np.float32)
+
+    peaks = np.argmax(values, axis=1).astype(np.int64)
+    begins = peaks - 2000
+    ends = peaks + 6000
+    before_source = begins < 0
+    begins[before_source] = 0
+    ends[before_source] = target_length
+    after_source = ends > values.shape[1]
+    ends[after_source] = values.shape[1]
+    begins[after_source] = ends[after_source] - target_length
+    cropped = np.empty((len(values), target_length), dtype=np.float32)
+    for row in range(len(values)):
+        segment = values[row, begins[row]:ends[row]]
+        cropped[row, :len(segment)] = segment
+        cropped[row, len(segment):] = 0.0
+
+    assert normalize_mode == "minmax"
+    pmin = cropped.min(axis=1, keepdims=True)
+    pmax = cropped.max(axis=1, keepdims=True)
+    pmean = cropped.mean(axis=1, keepdims=True)
+    denominator = pmax - pmin
+    denominator[denominator < 1e-8] = 1.0
+    return ((cropped - pmean) / denominator).astype(np.float32)
 
 
 def make_piece(value: int, *, hour: int = 0, marker: int = 0) -> bytes:
