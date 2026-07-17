@@ -1,874 +1,566 @@
-"""
-Quick MTL inference: type + distance for existing classified .lig files.
-Filters by date in filename (YYMMDD pattern).
-"""
+"""Bounded, byte-preserving inference for both five-class schemas."""
+
+from __future__ import annotations
+
 import argparse
 import csv
 import os
-import struct
-from datetime import datetime, timedelta
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-from models import create_mtl_model
-from data.preprocessing import preprocess_batch, preprocess_multiscale_batch
-from data.signal_context import time_context_batch
-from data.training_manifest import infer_daytime
-from data.waveform_quality import waveform_quality_batch
-from distance_ordinal import decode_distance_distribution, decode_distance_logits
-from open_set import decode_with_rejection
 
-MAX_PER_FILE = 512
-PREDICTION_FIELDS = [
-    "source_file",
+from checkpoints import (
+    FIVE_CLASS_SCHEMA,
+    LEGACY_FIVE_CLASS_SCHEMA,
+    LoadedCheckpoint,
+    load_model_checkpoint,
+    model_sha256,
+)
+from data.lig import (
+    FILE_HEADER_BYTES,
+    MAX_PIECES_PER_FILE,
+    PIECE_BYTES,
+    LigFileIndex,
+    LigFormatError,
+    read_file_header,
+    write_lig_file,
+)
+from data.preprocess import PreprocessConfig, preprocess_views
+
+
+TYPE_NAMES = ("IC", "NCG", "NNBE", "PCG", "PNBE")
+DISTANCE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
+DISTANCE_BINS_KM = tuple(range(0, 3000, 100))
+SUPPORTED_SCHEMAS = frozenset({FIVE_CLASS_SCHEMA, LEGACY_FIVE_CLASS_SCHEMA})
+
+PREDICTION_FIELDS = (
+    "source_path",
     "piece_index",
-    "type",
-    "distance_km",
-    "bin_start_km",
-    "low_km",
-    "high_km",
-    "confidence",
-    "type_confidence",
-    "raw_type",
-    "type_margin",
-    "feature_distance",
-    "rejection_reason",
+    "piece_key",
     "final_type",
-    "head_source",
-    "status",
+    "prob_IC",
     "prob_NCG",
     "prob_NNBE",
     "prob_PCG",
     "prob_PNBE",
-    "expected_distance_km",
+    "type_confidence",
+    "distance_bin",
     "distance_low_km",
     "distance_high_km",
-    "daylight",
-    "snr_score",
-    "clipping_fraction",
-    "baseline_instability",
-    "quality_score",
-    "model_version",
-    "split_hash",
-    "support_status",
-    "support_file_count",
-    "support_condition",
-    "fold_manifest_hash",
-    "full_data_hash",
-    "calibration_hash",
-]
+    "expected_distance_km",
+    "distance_confidence",
+    "checkpoint_schema",
+    "model_sha256",
+    "output_file",
+)
+
+
+@dataclass(frozen=True)
+class Prediction:
+    """Schema-independent prediction for one waveform piece."""
+
+    final_type: str
+    output_class: str
+    type_probabilities: tuple[float, float, float, float, float]
+    type_confidence: float
+    distance_bin: int | None
+    expected_distance_km: float | None
+    distance_confidence: float | None
 
 
 class PredictionCsvWriter:
-    """Streaming CSV writer for auditable piece-level predictions."""
+    """Write the fixed inference audit schema incrementally."""
 
-    def __init__(self, path):
-        self.path = os.fspath(path)
-        self.handle = None
-        self.writer = None
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        self.path = Path(path)
+        self._handle: Any = None
+        self._writer: csv.DictWriter | None = None
 
-    def __enter__(self):
-        directory = os.path.dirname(os.path.abspath(self.path))
-        os.makedirs(directory, exist_ok=True)
-        self.handle = open(self.path, "w", newline="", encoding="utf-8")
-        self.writer = csv.DictWriter(self.handle, fieldnames=PREDICTION_FIELDS)
-        self.writer.writeheader()
+    def __enter__(self) -> "PredictionCsvWriter":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(
+            self._handle,
+            fieldnames=PREDICTION_FIELDS,
+            extrasaction="raise",
+        )
+        self._writer.writeheader()
+        self._handle.flush()
         return self
 
-    def write(self, row):
-        self.writer.writerow({field: row.get(field, "") for field in PREDICTION_FIELDS})
+    def write(self, row: Mapping[str, object]) -> None:
+        """Append one complete row and make it visible immediately."""
+        if self._writer is None or self._handle is None:
+            raise RuntimeError("PredictionCsvWriter is not open")
+        self._writer.writerow(
+            {name: "" if row.get(name) is None else row.get(name, "")
+             for name in PREDICTION_FIELDS}
+        )
+        self._handle.flush()
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.handle.close()
-
-
-def load_mtl_checkpoint(path, device):
-    """Load legacy, v2, or v3 structured checkpoint."""
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-    if "model_config" in checkpoint and "model_state" in checkpoint:
-        model = create_mtl_model(**checkpoint["model_config"]).to(device)
-        model.load_state_dict(checkpoint["model_state"])
-    elif "model_state_dict" in checkpoint:
-        architecture = checkpoint.get("model_name", "mtl_resnet")
-        model = create_mtl_model(
-            base_channels=checkpoint.get("base_channels", 64),
-            architecture=architecture,
-            num_types=len(checkpoint.get("type_names", [])) or 5,
-            dist_mlp_dim=checkpoint.get("dist_mlp_dim", 128),
-            dist_dropout=checkpoint.get("dist_dropout", 0.2),
-            context_dim=checkpoint.get("context_dim", 3),
-        ).to(device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        raise ValueError("Inference requires a structured MTL checkpoint")
-    model.eval()
-    return model, checkpoint
+    def __exit__(self, *_args: object) -> None:
+        if self._handle is not None:
+            self._handle.close()
+        self._handle = None
+        self._writer = None
 
 
-def checkpoint_time_context_mode(checkpoint):
-    """Select daylight context or legacy cyclic context from checkpoint shape."""
-    context_dim = int(checkpoint.get("context_dim", 3))
-    if context_dim == 3:
-        return "cyclic"
-    if context_dim == 1:
-        return "daylight"
-    raise ValueError(f"Unsupported checkpoint context_dim: {context_dim}")
+def _decode_prediction(
+    type_logits: torch.Tensor,
+    distance_logits: Sequence[torch.Tensor],
+    *,
+    type_only: bool,
+) -> Prediction:
+    if type_logits.ndim != 1 or type_logits.numel() != len(TYPE_NAMES):
+        raise ValueError("type_logits must contain exactly five values")
+    if len(distance_logits) != len(DISTANCE_NAMES):
+        raise ValueError("distance_logits must contain exactly four experts")
 
-
-def checkpoint_schema(checkpoint):
-    """Return an explicit supported type-label contract."""
-    if checkpoint.get("schema") == "four_class_cv_v3":
-        return "four_class_cv_v3"
-    if (
-        checkpoint.get("task_schema") == "four_class_rejection_v2"
-        and checkpoint.get("model_name") == "conditional_expert_v1"
-    ):
-        return "four_class_rejection_v2"
-    if checkpoint.get("task_schema") == "four_class_rejection_v1":
-        return "four_class_rejection_v1"
-    if checkpoint.get("type_names") == ["IC", "NCG", "NNBE", "PCG", "PNBE"]:
-        return "legacy_five_class"
-    raise ValueError("Unsupported checkpoint type schema")
-
-
-def distance_support_status(checkpoint, type_index, daylight, bin_start_km):
-    """Return (status, file_count, condition) from a v3 support map."""
-    if bin_start_km is None:
-        return "not_applicable", None, None
-    support_map = checkpoint.get("support_map")
-    if not support_map:
-        return "unknown", None, None
-    type_name = checkpoint["type_names"][int(type_index)]
-    condition = (
-        f"{type_name}/{'day' if daylight else 'night'}"
-        f"/{int(bin_start_km)}-{int(bin_start_km) + 100}km"
+    type_probabilities_tensor = torch.softmax(type_logits.detach().float(), dim=0)
+    type_index = int(type_probabilities_tensor.argmax().item())
+    type_probabilities = tuple(
+        float(value) for value in type_probabilities_tensor.cpu().tolist()
     )
-    support = support_map.get(condition)
-    if support is None:
-        return "insufficient_support", 0, condition
-    return support["status"], int(support["file_count"]), condition
+    final_type = TYPE_NAMES[type_index]
+    type_confidence = type_probabilities[type_index]
+    if type_only or type_index == 0:
+        return Prediction(
+            final_type=final_type,
+            output_class=final_type,
+            type_probabilities=type_probabilities,
+            type_confidence=type_confidence,
+            distance_bin=None,
+            expected_distance_km=None,
+            distance_confidence=None,
+        )
+
+    expert_logits = distance_logits[type_index - 1]
+    if expert_logits.ndim != 1 or expert_logits.numel() != len(DISTANCE_BINS_KM):
+        raise ValueError("each distance expert must contain exactly 30 values")
+    distance_probabilities = torch.softmax(expert_logits.detach().float(), dim=0)
+    distance_bin = int(distance_probabilities.argmax().item())
+    centers = torch.arange(
+        50.0,
+        3050.0,
+        100.0,
+        dtype=distance_probabilities.dtype,
+        device=distance_probabilities.device,
+    )
+    expected_distance_km = float(
+        torch.sum(distance_probabilities * centers).item()
+    )
+    distance_confidence = float(distance_probabilities[distance_bin].item())
+    distance_low_km = DISTANCE_BINS_KM[distance_bin]
+    return Prediction(
+        final_type=final_type,
+        output_class=(
+            f"{final_type}_{distance_low_km}-{distance_low_km + 100}km"
+        ),
+        type_probabilities=type_probabilities,
+        type_confidence=type_confidence,
+        distance_bin=distance_bin,
+        expected_distance_km=expected_distance_km,
+        distance_confidence=distance_confidence,
+    )
 
 
-def annotate_distance_support(prediction, checkpoint):
-    """Add support_status/condition/status to an inference prediction."""
-    result = dict(prediction)
-    if result.get("class_name") == "IC":
-        status, file_count, condition = "not_applicable", None, None
-    elif result.get("type_only", False):
-        status, file_count, condition = "not_evaluated", None, None
-    else:
-        modal_bin = result.get("modal_distance_bin")
-        if modal_bin is not None:
-            bin_start = int(modal_bin) * 100
+def decode_new_prediction(
+    type_logits: torch.Tensor,
+    distance_logits: Sequence[torch.Tensor],
+    *,
+    type_only: bool = False,
+) -> Prediction:
+    """Decode direct five-class argmax and its routed new-model expert."""
+    return _decode_prediction(
+        type_logits, distance_logits, type_only=type_only
+    )
+
+
+def decode_legacy_prediction(
+    type_logits: torch.Tensor,
+    distance_logits: Sequence[torch.Tensor],
+    *,
+    type_only: bool = False,
+) -> Prediction:
+    """Decode the retained legacy model into the normalized contract."""
+    return _decode_prediction(
+        type_logits, distance_logits, type_only=type_only
+    )
+
+
+def _legacy_preprocess_batch(waveforms: np.ndarray) -> np.ndarray:
+    """Reproduce the retained model's filter/crop/min-max inference view."""
+    pieces = np.asarray(waveforms, dtype=np.float32)
+    if pieces.ndim != 2 or pieces.shape[1] == 0:
+        raise ValueError("waveforms must be a non-empty two-dimensional batch")
+    try:
+        from scipy.signal import butter, sosfiltfilt
+
+        sos = butter(
+            2,
+            120_000.0 / (5_000_000.0 / 2.0),
+            btype="low",
+            output="sos",
+        )
+        pieces = sosfiltfilt(sos, pieces, axis=-1).astype(np.float32)
+    except ImportError:  # pragma: no cover - SciPy is a runtime dependency
+        pass
+
+    target_length = 8000
+    before = 2000
+    source_length = pieces.shape[1]
+    peaks = np.argmax(pieces, axis=1).astype(np.int64)
+    begins = peaks - before
+    ends = peaks + 6000
+    before_source = begins < 0
+    begins[before_source] = 0
+    ends[before_source] = target_length
+    after_source = ends > source_length
+    ends[after_source] = source_length
+    begins[after_source] = ends[after_source] - target_length
+
+    cropped = np.empty((len(pieces), target_length), dtype=np.float32)
+    for row_index in range(len(pieces)):
+        segment = pieces[row_index, begins[row_index]:ends[row_index]]
+        length = len(segment)
+        cropped[row_index, :length] = segment[:target_length]
+        if length < target_length:
+            cropped[row_index, length:] = 0.0
+
+    minimum = cropped.min(axis=1, keepdims=True)
+    maximum = cropped.max(axis=1, keepdims=True)
+    mean = cropped.mean(axis=1, keepdims=True)
+    denominator = maximum - minimum
+    denominator[denominator < 1e-8] = 1.0
+    return ((cropped - mean) / denominator).astype(np.float32)
+
+
+def _is_daylight(timestamp: datetime) -> bool:
+    """Match training's local UTC+8 daylight interval for each piece."""
+    local_hour = (timestamp.hour + 8 + timestamp.minute / 60.0) % 24
+    return 5.5 <= local_hour < 19.0
+
+
+def _new_preprocess_config(checkpoint: LoadedCheckpoint) -> PreprocessConfig:
+    config = checkpoint.preprocess_config
+    return PreprocessConfig(
+        local_length=int(config["local_length"]),
+        global_length=int(config["global_length"]),
+        use_filter=bool(config.get("use_filter", True)),
+        cutoff_hz=float(config.get("cutoff_hz", 120_000.0)),
+        sample_rate_hz=float(config.get("sample_rate_hz", 5_000_000.0)),
+    )
+
+
+def predict_batch(
+    checkpoint: LoadedCheckpoint,
+    waveforms: np.ndarray,
+    timestamps: Sequence[datetime],
+    *,
+    device: torch.device,
+    type_only: bool,
+) -> list[Prediction]:
+    """Run one bounded batch through its schema-specific input adapter."""
+    if checkpoint.schema not in SUPPORTED_SCHEMAS:
+        raise ValueError(f"unsupported checkpoint schema: {checkpoint.schema!r}")
+    values = np.asarray(waveforms, dtype=np.float32)
+    if values.ndim != 2 or len(values) == 0:
+        raise ValueError("waveforms must be a non-empty two-dimensional batch")
+    if len(values) != len(timestamps):
+        raise ValueError("waveforms and timestamps must be aligned")
+
+    checkpoint.model.eval()
+    with torch.inference_mode():
+        if checkpoint.schema == FIVE_CLASS_SCHEMA:
+            local, global_view = preprocess_views(
+                values, _new_preprocess_config(checkpoint)
+            )
+            local_tensor = torch.from_numpy(local).unsqueeze(1).to(device)
+            global_tensor = torch.from_numpy(global_view).unsqueeze(1).to(device)
+            daylight_tensor = torch.tensor(
+                [[float(_is_daylight(timestamp))] for timestamp in timestamps],
+                dtype=torch.float32,
+                device=device,
+            )
+            output = checkpoint.model(
+                local_tensor, global_tensor, daylight_tensor
+            )
+            type_logits = output.type_logits
+            distance_logits = output.distance_logits
+            decoder = decode_new_prediction
         else:
-            bin_start = result.get("bin_start_km")
-        status, file_count, condition = distance_support_status(
-            checkpoint,
-            result["type_index"],
-            result.get("daylight", True),
-            bin_start,
-        )
-    result.update({
-        "support_status": status,
-        "support_file_count": file_count,
-        "support_condition": condition,
-    })
-    return result
+            legacy_values = _legacy_preprocess_batch(values)
+            legacy_tensor = torch.from_numpy(legacy_values).unsqueeze(1).to(device)
+            type_logits, distance_logits = checkpoint.model(legacy_tensor)
+            decoder = decode_legacy_prediction
 
-
-def _checkpoint_policy(checkpoint):
-    """Return rejection policy from v2 or v3 checkpoint structure."""
-    schema = checkpoint_schema(checkpoint)
-    if schema == "four_class_cv_v3":
-        return checkpoint.get("rejection_policy")
-    return checkpoint.get("type_rejection")
-
-
-def _checkpoint_distance_temperatures(checkpoint):
-    """Return four distance temperatures from v2 or v3 checkpoint structure."""
-    schema = checkpoint_schema(checkpoint)
-    if schema == "four_class_cv_v3":
-        return checkpoint.get("distance_temperatures", [1.0] * 4)
-    return checkpoint.get("distance_calibration", {}).get(
-        "temperatures", [1.0] * 4
-    )
-
-
-def decode_conditional_batch(
-    type_logits,
-    features,
-    distance_logits,
-    quality,
-    checkpoint,
-    daylight,
-    type_only=False,
-):
-    """Decode a conditional batch while preserving raw four-type evidence."""
-    schema = checkpoint_schema(checkpoint)
-    if schema not in {"four_class_rejection_v2", "four_class_cv_v3"}:
-        raise ValueError("conditional decoding requires a v2 or v3 checkpoint")
-    policy = _checkpoint_policy(checkpoint)
-    if not policy:
-        raise ValueError("conditional checkpoint has no calibrated rejection policy")
-    decoded_types = decode_with_rejection(
-        type_logits,
-        features,
-        policy,
-        quality=quality,
-    )
-    probabilities = torch.softmax(
-        type_logits.detach().cpu() / float(policy["temperature"]), dim=1
-    )
-    temperatures = _checkpoint_distance_temperatures(checkpoint)
-    type_names = checkpoint["type_names"]
-    rejected_name = checkpoint.get("rejected_type_name", "IC")
-    predictions = []
-    for row, type_index in enumerate(decoded_types["predicted"].tolist()):
-        raw_type = type_names[type_index]
-        accepted = bool(decoded_types["accepted"][row].item())
-        final_type = raw_type if accepted else rejected_name
-        type_probabilities = {
-            name: float(probabilities[row, index].item())
-            for index, name in enumerate(type_names)
-        }
-        prediction = {
-            "type_index": type_index,
-            "type": final_type,
-            "raw_type": raw_type,
-            "final_type": final_type,
-            "class_name": final_type,
-            "distance_km": None,
-            "expected_distance_km": None,
-            "bin_start_km": None,
-            "low_km": None,
-            "high_km": None,
-            "distance_low_km": None,
-            "distance_high_km": None,
-            "confidence": float(decoded_types["confidence"][row].item()),
-            "type_confidence": float(decoded_types["confidence"][row].item()),
-            "type_margin": float(decoded_types["margin"][row].item()),
-            "feature_distance": float(
-                decoded_types["feature_distance"][row].item()
-            ),
-            "quality_score": float(decoded_types["quality_score"][row].item()),
-            "rejection_reason": decoded_types["reason"][row],
-            "head_source": "conditional",
-            "status": "reliable" if accepted else "rejected",
-            "type_probabilities": type_probabilities,
-            "daylight": bool(daylight[row].detach().cpu().item() >= 0.5),
-            "snr_score": float(quality[row, 0].detach().cpu().item()),
-            "clipping_fraction": float(quality[row, 1].detach().cpu().item()),
-            "baseline_instability": float(quality[row, 2].detach().cpu().item()),
-            "model_version": checkpoint.get(
-                "model_version", checkpoint.get("model_name", "")
-            ),
-            "split_hash": checkpoint.get("combined_split_hash", ""),
-        }
-        modal_bin = None
-        if accepted and not type_only:
-            distance = decode_distance_distribution(
-                distance_logits[type_index][row].detach().cpu().unsqueeze(0),
-                temperature=float(temperatures[type_index]),
-            )
-            modal_bin = int(distance["bin_index"].item())
-            expected_km = float(distance["expected_km"].item())
-            distance_low = float(distance["low_km"].item())
-            distance_high = float(distance["high_km"].item())
-            prediction.update({
-                "class_name": f"{raw_type}_{modal_bin * 100}-{(modal_bin + 1) * 100}km",
-                "modal_distance_bin": modal_bin,
-                "distance_km": expected_km,
-                "expected_distance_km": expected_km,
-                "bin_start_km": modal_bin * 100,
-                "low_km": distance_low,
-                "high_km": distance_high,
-                "distance_low_km": distance_low,
-                "distance_high_km": distance_high,
-                "confidence": float(distance["confidence"].item()),
-            })
-        prediction = annotate_distance_support(prediction, checkpoint)
-        predictions.append(prediction)
-    return predictions
-
-
-def decode_four_class_predictions(type_logits, features, checkpoint):
-    """Decode four researched types and route rejected rows to IC."""
-    if checkpoint_schema(checkpoint) != "four_class_rejection_v1":
-        raise ValueError("Four-class rejection requires a four-class checkpoint")
-    decoded = decode_with_rejection(
-        type_logits, features, checkpoint["type_rejection"]
-    )
-    predictions = []
-    for row, type_index in enumerate(decoded["predicted"].tolist()):
-        raw_type = checkpoint["type_names"][type_index]
-        accepted = bool(decoded["accepted"][row].item())
-        final_type = raw_type if accepted else checkpoint.get(
-            "rejected_type_name", "IC"
-        )
-        predictions.append({
-            "type": final_type,
-            "raw_type": raw_type,
-            "final_type": final_type,
-            "class_name": final_type,
-            "distance_km": None,
-            "bin_start_km": None,
-            "low_km": None,
-            "high_km": None,
-            "confidence": float(decoded["confidence"][row].item()),
-            "type_confidence": float(decoded["confidence"][row].item()),
-            "type_margin": float(decoded["margin"][row].item()),
-            "feature_distance": float(
-                decoded["feature_distance"][row].item()
-            ),
-            "rejection_reason": decoded["reason"][row],
-            "head_source": "type",
-            "status": "reliable" if accepted else "rejected",
-        })
-    return predictions
-
-
-def validate_type_only_options(checkpoint, min_type_confidence=0.0):
-    """Prevent legacy confidence overrides on calibrated four-class models."""
-    if (
-        checkpoint_schema(checkpoint) in {
-            "four_class_rejection_v1",
-            "four_class_rejection_v2",
-            "four_class_cv_v3",
-        }
-        and float(min_type_confidence) != 0.0
+    if type_logits.ndim != 2 or len(type_logits) != len(values):
+        raise ValueError("model returned malformed type logits")
+    if len(distance_logits) != 4 or any(
+        head.ndim != 2 or len(head) != len(values) for head in distance_logits
     ):
-        raise ValueError(
-            "--min_type_confidence is not valid for a four-class rejection "
-            "checkpoint"
+        raise ValueError("model returned malformed distance logits")
+    return [
+        decoder(
+            type_logits[row_index],
+            [head[row_index] for head in distance_logits],
+            type_only=type_only,
         )
+        for row_index in range(len(values))
+    ]
 
 
-def validate_checkpoint_pair(old_checkpoint, new_checkpoint):
-    """Reject hybrid checkpoints that do not use the same label contract."""
-    for field in ("type_names", "dist_names", "dist_bin_starts"):
-        if old_checkpoint.get(field) != new_checkpoint.get(field):
-            raise ValueError(f"Hybrid checkpoints disagree on {field}")
-    old_mode = old_checkpoint.get("preprocessing", {}).get(
-        "normalize_mode", "minmax"
-    )
-    new_mode = new_checkpoint.get("preprocessing", {}).get(
-        "normalize_mode", "minmax"
-    )
-    if old_mode != new_mode:
-        raise ValueError("Hybrid checkpoints disagree on preprocessing")
+@dataclass
+class _OutputBuffer:
+    """One output file; its first piece deterministically owns the header."""
+
+    relative_path: str
+    source_header: bytes
+    raw_pieces: list[bytes] = field(default_factory=list)
 
 
-def decode_hybrid_prediction(
-    old_type_logits,
-    old_distance_logits,
-    new_distance_logits,
-    old_checkpoint,
-    new_checkpoint,
-    old_distance_types=("NCG",),
+class _OutputRegrouper:
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+        self._buffers: dict[str, _OutputBuffer] = {}
+        self._next_file = defaultdict(int)
+
+    def _new_buffer(self, output_class: str, source_header: bytes) -> _OutputBuffer:
+        self._next_file[output_class] += 1
+        filename = f"{output_class}_{self._next_file[output_class]:06d}.lig"
+        relative_path = (Path(output_class) / filename).as_posix()
+        buffer = _OutputBuffer(
+            relative_path=relative_path,
+            source_header=source_header,
+        )
+        self._buffers[output_class] = buffer
+        return buffer
+
+    def add(self, output_class: str, source_header: bytes, raw_piece: bytes) -> str:
+        """Buffer one exact piece and return its already assigned output path."""
+        if len(raw_piece) != PIECE_BYTES:
+            raise LigFormatError("refusing to buffer a reconstructed piece")
+        buffer = self._buffers.get(output_class)
+        if buffer is None:
+            buffer = self._new_buffer(output_class, source_header)
+        buffer.raw_pieces.append(raw_piece)
+        relative_path = buffer.relative_path
+        if len(buffer.raw_pieces) == MAX_PIECES_PER_FILE:
+            self._flush(output_class)
+        return relative_path
+
+    def _flush(self, output_class: str) -> None:
+        buffer = self._buffers.pop(output_class, None)
+        if buffer is None or not buffer.raw_pieces:
+            return
+        destination = self.output_dir / Path(buffer.relative_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        write_lig_file(destination, buffer.source_header, buffer.raw_pieces)
+
+    def flush_all(self) -> None:
+        """Flush partial files in deterministic class-name order."""
+        for output_class in sorted(tuple(self._buffers)):
+            self._flush(output_class)
+
+
+def _source_batches(
+    source_path: Path, batch_size: int
 ):
-    """Use the proven old type head and the best distance head per type."""
-    probabilities = torch.softmax(old_type_logits, dim=0)
-    type_index = int(probabilities.argmax().item())
-    type_name = old_checkpoint["type_names"][type_index]
-    if type_name == "IC":
-        prediction = decode_piece_prediction(
-            type_index, old_distance_logits, old_checkpoint
-        )
-        prediction["type_confidence"] = float(probabilities[type_index].item())
-        prediction["head_source"] = "type"
-        return prediction
-    use_old = type_name in old_distance_types
-    checkpoint = old_checkpoint if use_old else new_checkpoint
-    distance_logits = old_distance_logits if use_old else new_distance_logits
-    prediction = decode_piece_prediction(type_index, distance_logits, checkpoint)
-    prediction["type_confidence"] = float(probabilities[type_index].item())
-    prediction["head_source"] = "old" if use_old else "new"
-    return prediction
+    """Yield bounded waveforms, timestamps, and complete raw pieces."""
+    with LigFileIndex([source_path], validate=True) as index, source_path.open(
+        "rb"
+    ) as raw_handle:
+        for start in range(0, len(index), batch_size):
+            stop = min(start + batch_size, len(index))
+            positions = range(start, stop)
+            waveforms = np.stack(index.read_pieces_batch(positions), axis=0)
+            timestamps = index.read_timestamps_batch(positions)
+            raw_handle.seek(FILE_HEADER_BYTES + start * PIECE_BYTES)
+            raw_pieces = [raw_handle.read(PIECE_BYTES) for _ in positions]
+            if any(len(raw) != PIECE_BYTES for raw in raw_pieces):
+                raise LigFormatError(f"short raw piece batch: {source_path}")
+            yield start, waveforms, timestamps, raw_pieces
 
 
-def decode_type_prediction(type_logits, checkpoint, min_confidence=0.0):
-    """Decode one type prediction without invoking any distance logic."""
-    probabilities = torch.softmax(type_logits, dim=0)
-    type_index = int(probabilities.argmax().item())
-    type_name = checkpoint["type_names"][type_index]
-    confidence = float(probabilities[type_index].item())
-    uncertain = type_name != "IC" and confidence < min_confidence
-    return {
-        "type": type_name,
-        "class_name": f"uncertained_{type_name}" if uncertain else type_name,
-        "distance_km": None,
-        "bin_start_km": None,
-        "low_km": None,
-        "high_km": None,
-        "confidence": confidence,
-        "type_confidence": confidence,
-        "head_source": "type",
-        "status": "uncertain" if uncertain else "reliable",
+def _relative_lig_files(input_dir: Path) -> list[tuple[str, Path]]:
+    discovered = [
+        (path.relative_to(input_dir).as_posix(), path)
+        for path in input_dir.rglob("*")
+        if path.is_file() and path.suffix.casefold() == ".lig"
+    ]
+    return sorted(discovered, key=lambda item: item[0])
+
+
+def _path_contains(parent: Path, child: Path) -> bool:
+    try:
+        return os.path.commonpath([parent, child]) == os.fspath(parent)
+    except ValueError:
+        return False
+
+
+def _validated_paths(
+    input_dir: str | os.PathLike[str],
+    output_dir: str | os.PathLike[str],
+    model_path: str | os.PathLike[str],
+) -> tuple[Path, Path, Path]:
+    source_root = Path(input_dir).expanduser().resolve()
+    destination_root = Path(output_dir).expanduser().resolve()
+    checkpoint_path = Path(model_path).expanduser().resolve()
+    if not source_root.is_dir():
+        raise ValueError(f"input_dir is not a directory: {source_root}")
+    if not checkpoint_path.is_file():
+        raise ValueError(f"model is not a file: {checkpoint_path}")
+    if destination_root.exists() and not destination_root.is_dir():
+        raise ValueError(f"output_dir is not a directory: {destination_root}")
+    if _path_contains(destination_root, source_root):
+        raise ValueError("output_dir must not contain input_dir")
+    if _path_contains(source_root, destination_root):
+        raise ValueError("input_dir must not contain output_dir")
+    return source_root, destination_root, checkpoint_path
+
+
+def _resolve_device(device: str | torch.device) -> torch.device:
+    if str(device).casefold() == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is unavailable")
+    return resolved
+
+
+def _csv_row(
+    relative_source: str,
+    piece_index: int,
+    prediction: Prediction,
+    *,
+    checkpoint_schema: str,
+    checkpoint_sha256: str,
+    output_file: str,
+) -> dict[str, object]:
+    distance_low_km = (
+        None if prediction.distance_bin is None else prediction.distance_bin * 100
+    )
+    distance_high_km = (
+        None if distance_low_km is None else distance_low_km + 100
+    )
+    row: dict[str, object] = {
+        "source_path": relative_source,
+        "piece_index": piece_index,
+        "piece_key": f"{relative_source}#{piece_index}",
+        "final_type": prediction.final_type,
+        "type_confidence": prediction.type_confidence,
+        "distance_bin": prediction.distance_bin,
+        "distance_low_km": distance_low_km,
+        "distance_high_km": distance_high_km,
+        "expected_distance_km": prediction.expected_distance_km,
+        "distance_confidence": prediction.distance_confidence,
+        "checkpoint_schema": checkpoint_schema,
+        "model_sha256": checkpoint_sha256,
+        "output_file": output_file,
     }
-
-
-def decode_piece_prediction(type_index, distance_logits, checkpoint):
-    """Decode one routed distance prediction with checkpoint calibration."""
-    type_names = checkpoint["type_names"]
-    type_name = type_names[type_index]
-    if type_name == "IC":
-        return {
-            "type": type_name,
-            "class_name": "IC",
-            "distance_km": None,
-            "bin_start_km": None,
-            "low_km": None,
-            "high_km": None,
-            "confidence": None,
-            "status": "reliable",
-        }
-
-    head_index = checkpoint["dist_names"].index(type_name)
-    logits = distance_logits[head_index]
-    training = checkpoint.get("distance_training", {})
-    per_type_modes = training.get("prediction_by_type", {})
-    mode = per_type_modes.get(
-        type_name, training.get("prediction", "argmax")
-    )
-    calibration = checkpoint.get("distance_calibration", {})
-    temperatures = calibration.get("temperatures", [1.0] * 4)
-    temperature = float(temperatures[head_index])
-
-    if mode == "expected":
-        decoded = decode_distance_logits(
-            logits.unsqueeze(0), temperature=temperature
+    row.update({
+        f"prob_{type_name}": probability
+        for type_name, probability in zip(
+            TYPE_NAMES, prediction.type_probabilities
         )
-        dist_bin = int(decoded["bin"].item())
-        distance_km = float(decoded["distance_km"].item())
-        low_km = float(decoded["low_km"].item())
-        high_km = float(decoded["high_km"].item())
-        confidence = float(decoded["confidence"].item())
-    else:
-        probabilities = torch.softmax(logits / temperature, dim=0)
-        dist_bin = int(probabilities.argmax().item())
-        distance_km = float(100 * (dist_bin + 0.5))
-        low_km = float(100 * dist_bin)
-        high_km = float(100 * (dist_bin + 1))
-        confidence = float(probabilities[dist_bin].item())
+    })
+    return row
 
-    bin_start = int(checkpoint["dist_bin_starts"][dist_bin])
-    threshold = float(calibration.get("confidence_threshold", 0.0))
-    reliable = confidence >= threshold
-    status = "reliable" if reliable else "uncertain"
-    class_name = (
-        f"{type_name}_{bin_start}-{bin_start + 100}km"
-        if reliable else f"UNCERTAIN_{type_name}"
+
+def classify_directory(
+    input_dir: str | os.PathLike[str],
+    output_dir: str | os.PathLike[str],
+    model: str | os.PathLike[str],
+    *,
+    batch_size: int = 256,
+    type_only: bool = False,
+    device: str | torch.device = "auto",
+) -> Path:
+    """Classify a directory recursively with bounded byte-exact regrouping."""
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    source_root, destination_root, checkpoint_path = _validated_paths(
+        input_dir, output_dir, model
     )
-    return {
-        "type": type_name,
-        "class_name": class_name,
-        "distance_km": distance_km,
-        "bin_start_km": bin_start,
-        "low_km": low_km,
-        "high_km": high_km,
-        "confidence": confidence,
-        "status": status,
-    }
-
-
-def decode_four_class_full_predictions(
-    type_logits,
-    features,
-    distance_logits,
-    checkpoint,
-):
-    """Decode rejection plus routed distance for one four-class batch."""
-    type_predictions = decode_four_class_predictions(
-        type_logits, features, checkpoint
-    )
-    predictions = []
-    for row, type_prediction in enumerate(type_predictions):
-        if type_prediction["status"] == "rejected":
-            predictions.append(type_prediction)
-            continue
-        type_index = checkpoint["type_names"].index(
-            type_prediction["raw_type"]
-        )
-        prediction = decode_piece_prediction(
-            type_index,
-            [head[row] for head in distance_logits],
-            checkpoint,
-        )
-        prediction.update({
-            "raw_type": type_prediction["raw_type"],
-            "final_type": type_prediction["final_type"],
-            "type_confidence": type_prediction["type_confidence"],
-            "type_margin": type_prediction["type_margin"],
-            "feature_distance": type_prediction["feature_distance"],
-            "rejection_reason": type_prediction["rejection_reason"],
-            "head_source": "single",
-        })
-        predictions.append(prediction)
-    return predictions
-
-
-def conditional_batch_inputs(
-    waveforms,
-    raw_pieces,
-    source_path,
-    use_filter=True,
-    time_context_mode="daylight",
-):
-    """Build multiscale, time-context, and quality arrays once per batch."""
-    raw_waveforms = np.asarray(waveforms, dtype=np.float32)
-    local, global_view = preprocess_multiscale_batch(
-        raw_waveforms,
-        use_filter=use_filter,
-    )
-    quality = waveform_quality_batch(raw_waveforms)
-    timestamps = []
-    daylight = []
-    for raw_piece in raw_pieces:
-        year, month, day, hour, minute, second = struct.unpack_from(
-            "<6i4x", raw_piece, 108
-        )
-        if year < 100:
-            year += 2000
-        timestamp = datetime(year, month, day) + timedelta(
-            hours=hour,
-            minutes=minute,
-            seconds=second,
-        )
-        timestamps.append(timestamp)
-        daylight.append(infer_daytime(source_path, timestamp))
-    context = time_context_batch(
-        timestamps,
-        daylight,
-        mode=time_context_mode,
-    )
-    return local, global_view, context, quality
-
-
-def read_pieces_stream(fpath, chunk=256):
-    """Yield waveforms, original piece bytes, timestamps, and piece indices."""
-    fsize = os.path.getsize(fpath)
-    n_pieces = (fsize - 112) // 32208
-    with open(fpath, 'rb') as f:
-        batch_wf, batch_raw, batch_ts, batch_indices = [], [], [], []
-        for pi in range(n_pieces):
-            f.seek(112 + pi * 32208)
-            raw_piece = f.read(32208)
-            if len(raw_piece) != 32208:
-                raise ValueError(f"Incomplete piece {pi} in {fpath}")
-            wf = np.frombuffer(
-                raw_piece, dtype=np.uint16, count=16000, offset=208
-            ).astype(np.float32)
-            year, month, day, hour, minute, second = struct.unpack_from(
-                "<6i4x", raw_piece, 108
-            )
-            sec_frac = struct.unpack_from("<d", raw_piece, 136)[0]
-            fraction_text = f"{sec_frac:.10f}"[1:]
-            ts = (
-                f"{year % 100:02d}{month:02d}{day:02d}{hour:02d}"
-                f"{minute:02d}{second:02d}{fraction_text}"
-            )
-            batch_wf.append(wf)
-            batch_raw.append(raw_piece)
-            batch_ts.append(ts)
-            batch_indices.append(pi)
-            if len(batch_wf) >= chunk:
-                yield batch_wf, batch_raw, batch_ts, batch_indices
-                batch_wf, batch_raw, batch_ts, batch_indices = [], [], [], []
-        if batch_wf:
-            yield batch_wf, batch_raw, batch_ts, batch_indices
-
-
-def write_lig(raw_pieces, outpath, lig_header):
-    """Regroup original piece bytes without rewriting their metadata."""
-    outpath = os.fspath(outpath)
-    os.makedirs(os.path.dirname(outpath), exist_ok=True)
-    idx = 0
-    base = outpath.rsplit('.', 1)[0]
-    while idx < len(raw_pieces):
-        chunk = raw_pieces[idx:idx + MAX_PER_FILE]
-        fname = f"{base}.lig" if idx == 0 else f"{base}_{idx//MAX_PER_FILE+1}.lig"
-        with open(fname, 'wb') as f:
-            gh = bytearray(lig_header[:112])
-            if len(gh) < 112:
-                gh.extend(b"\x00" * (112 - len(gh)))
-            struct.pack_into('<i', gh, 4, len(chunk))
-            f.write(gh)
-            for raw_piece in chunk:
-                if len(raw_piece) != 32208:
-                    raise ValueError("Each raw piece must contain exactly 32208 bytes")
-                f.write(raw_piece)
-        idx += MAX_PER_FILE
-
-
-def build_arg_parser():
-    p = argparse.ArgumentParser(
-        description="Classify .lig pieces with one structured checkpoint."
-    )
-    p.add_argument("--input_dir", required=True)
-    p.add_argument("--output_dir", required=True)
-    p.add_argument("--date", help="Optional YYMMDD filename filter, e.g. 210413")
-    p.add_argument("--old_model", default="./weights/old/model.pt")
-    p.add_argument("--new_model", default="./weights/new/model.pt")
-    p.add_argument("--type_only", action="store_true")
-    p.add_argument(
-        "--four_class",
-        action="store_true",
-        help="Deprecated alias for the default single-checkpoint route",
-    )
-    p.add_argument(
-        "--legacy_hybrid",
-        action="store_true",
-        help="Explicitly use --old_model and --new_model instead of --model",
-    )
-    p.add_argument("--model", default="./weights/conditional/candidate.pt")
-    p.add_argument("--min_type_confidence", type=float, default=0.0)
-    p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument(
-        "--keep_uncertain_in_type_bin",
-        action="store_true",
-        help="Keep uncertain pieces in their estimated bin instead of UNCERTAIN_<TYPE>",
-    )
-    return p
-
-
-def main():
-    args = build_arg_parser().parse_args()
-    if not 0.0 <= args.min_type_confidence <= 1.0:
-        raise ValueError("--min_type_confidence must be between 0 and 1")
-    if args.type_only and args.four_class:
-        raise ValueError("--type_only and --four_class are mutually exclusive")
-    if args.legacy_hybrid and (args.type_only or args.four_class):
-        raise ValueError("--legacy_hybrid cannot be combined with single-model modes")
-
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    if dev == "cuda":
-        torch.backends.cudnn.enabled = True
-        torch.backends.cudnn.benchmark = True
-
-    if not args.legacy_hybrid:
-        type_model, type_ckpt = load_mtl_checkpoint(args.model, dev)
-        if args.type_only:
-            validate_type_only_options(type_ckpt, args.min_type_confidence)
-        elif checkpoint_schema(type_ckpt) not in {
-            "four_class_rejection_v1", "four_class_rejection_v2", "four_class_cv_v3"
-        }:
-            raise ValueError("full single-model inference requires a four-class checkpoint")
-        inference_ckpt = type_ckpt
-    else:
-        old_model, old_ckpt = load_mtl_checkpoint(args.old_model, dev)
-        new_model, new_ckpt = load_mtl_checkpoint(args.new_model, dev)
-        validate_checkpoint_pair(old_ckpt, new_ckpt)
-        inference_ckpt = old_ckpt
-
-    files = []
-    for root, _, names in os.walk(args.input_dir):
-        for name in names:
-            if name.lower().endswith(".lig") and (
-                not args.date or args.date in name
-            ):
-                files.append(os.path.join(root, name))
+    files = _relative_lig_files(source_root)
     if not files:
-        raise FileNotFoundError("No matching .lig files were found")
-    print(f"Found {len(files)} files")
-    with open(sorted(files)[0], "rb") as handle:
-        lh = handle.read(112)
+        raise FileNotFoundError(f"no .lig files found below {source_root}")
 
-    # Cache per output class
-    os.makedirs(args.output_dir, exist_ok=True)
-    cache = {}
-    total, processed = 0, 0
-    csv_writer = PredictionCsvWriter(
-        os.path.join(args.output_dir, "predictions.csv")
-    )
-    csv_writer.__enter__()
+    runtime_device = _resolve_device(device)
+    checkpoint = load_model_checkpoint(checkpoint_path, runtime_device)
+    if checkpoint.schema not in SUPPORTED_SCHEMAS:
+        raise ValueError(f"unsupported checkpoint schema: {checkpoint.schema!r}")
+    checkpoint.model.eval()
+    checkpoint_hash = model_sha256(checkpoint_path)
+    destination_root.mkdir(parents=True, exist_ok=True)
+    csv_path = destination_root / "predictions.csv"
+    regrouper = _OutputRegrouper(destination_root)
 
     try:
-        for fp in sorted(files):
-            for batch_wf, batch_raw, batch_ts, batch_indices in read_pieces_stream(
-                fp, args.batch_size
-            ):
-                if not batch_wf:
-                    continue
-                schema = checkpoint_schema(inference_ckpt)
-                if schema in {"four_class_rejection_v2", "four_class_cv_v3"}:
-                    local_np, global_np, context_np, quality_np = (
-                        conditional_batch_inputs(
-                            batch_wf,
-                            batch_raw,
-                            fp,
-                            use_filter=inference_ckpt.get(
-                                "preprocessing", {}
-                            ).get("use_filter", True),
-                            time_context_mode=checkpoint_time_context_mode(
-                                inference_ckpt
-                            ),
-                        )
+        with PredictionCsvWriter(csv_path) as writer:
+            for relative_source, source_path in files:
+                source_header = read_file_header(source_path)
+                for start, waveforms, timestamps, raw_pieces in _source_batches(
+                    source_path, batch_size
+                ):
+                    predictions = predict_batch(
+                        checkpoint,
+                        waveforms,
+                        timestamps,
+                        device=runtime_device,
+                        type_only=type_only,
                     )
-                    local = torch.from_numpy(local_np).unsqueeze(1).to(dev)
-                    global_view = torch.from_numpy(global_np).unsqueeze(1).to(dev)
-                    context = torch.from_numpy(context_np).to(dev)
-                    quality = torch.from_numpy(quality_np).to(dev)
-                else:
-                    normalize_mode = inference_ckpt.get(
-                        "preprocessing", {}
-                    ).get("normalize_mode", "minmax")
-                    wf_pp = preprocess_batch(
-                        np.stack(batch_wf), normalize_mode=normalize_mode
-                    )
-                    x = torch.from_numpy(wf_pp).unsqueeze(1).to(dev)
-                with torch.no_grad():
-                    if not args.legacy_hybrid and schema in {"four_class_rejection_v2", "four_class_cv_v3"}:
-                        (
-                            features,
-                            type_logits,
-                            distance_logits,
-                            _,
-                        ) = type_model.forward_with_features(
-                            local, global_view, context
-                        )
-                        predictions = decode_conditional_batch(
-                            type_logits,
-                            features,
-                            distance_logits,
-                            quality,
-                            type_ckpt,
-                            context[:, 0],
-                            type_only=args.type_only,
-                        )
-                    elif not args.legacy_hybrid and args.type_only:
-                        if schema == "four_class_rejection_v1":
-                            features = type_model.extract_type_features(x)
-                            type_logits = type_model.type_head(features)
-                            predictions = decode_four_class_predictions(
-                                type_logits, features, type_ckpt
-                            )
-                        else:
-                            type_logits = type_model.forward_type(x)
-                            predictions = [
-                                decode_type_prediction(
-                                    row,
-                                    type_ckpt,
-                                    min_confidence=args.min_type_confidence,
-                                )
-                                for row in type_logits
-                            ]
-                    elif not args.legacy_hybrid:
-                        (
-                            features,
-                            type_logits,
-                            distance_logits,
-                        ) = type_model.forward_with_features(x)
-                        predictions = decode_four_class_full_predictions(
-                            type_logits,
-                            features,
-                            distance_logits,
-                            type_ckpt,
-                        )
-                    else:
-                        old_type_logits, old_distance_logits = old_model(x)
-                        predicted_types = old_type_logits.argmax(dim=1)
-                        new_positions = torch.nonzero(
-                            predicted_types > 1, as_tuple=False
-                        ).flatten()
-                        new_by_position = {}
-                        if len(new_positions):
-                            _, selected_logits = new_model(x[new_positions])
-                            for row, position in enumerate(new_positions.tolist()):
-                                new_by_position[position] = [
-                                    head[row] for head in selected_logits
-                                ]
-                        predictions = [
-                            decode_hybrid_prediction(
-                                old_type_logits[i],
-                                [head[i] for head in old_distance_logits],
-                                new_by_position.get(
-                                    i, [head[i] for head in old_distance_logits]
-                                ),
-                                old_ckpt,
-                                new_ckpt,
-                            )
-                            for i in range(len(batch_wf))
-                        ]
-
-                for i in range(len(batch_wf)):
-                    prediction = predictions[i]
-                    cls_out = prediction["class_name"]
-                    if (
-                        args.keep_uncertain_in_type_bin
-                        and prediction["status"] == "uncertain"
+                    for offset, (raw_piece, prediction) in enumerate(
+                        zip(raw_pieces, predictions)
                     ):
-                        lo = prediction["bin_start_km"]
-                        cls_out = f'{prediction["type"]}_{lo}-{lo + 100}km'
-                    csv_writer.write({
-                        "source_file": fp,
-                        "piece_index": batch_indices[i],
-                        "type": prediction["type"],
-                        "distance_km": prediction["distance_km"],
-                        "bin_start_km": prediction["bin_start_km"],
-                        "low_km": prediction["low_km"],
-                        "high_km": prediction["high_km"],
-                        "confidence": prediction["confidence"],
-                        "type_confidence": prediction["type_confidence"],
-                        "raw_type": prediction.get("raw_type", prediction["type"]),
-                        "type_margin": prediction.get("type_margin"),
-                        "feature_distance": prediction.get("feature_distance"),
-                        "rejection_reason": prediction.get("rejection_reason"),
-                        "final_type": prediction.get("final_type", prediction["type"]),
-                        "head_source": prediction["head_source"],
-                        "status": prediction["status"],
-                        "prob_NCG": prediction.get("type_probabilities", {}).get("NCG"),
-                        "prob_NNBE": prediction.get("type_probabilities", {}).get("NNBE"),
-                        "prob_PCG": prediction.get("type_probabilities", {}).get("PCG"),
-                        "prob_PNBE": prediction.get("type_probabilities", {}).get("PNBE"),
-                        "expected_distance_km": prediction.get("expected_distance_km"),
-                        "distance_low_km": prediction.get("distance_low_km"),
-                        "distance_high_km": prediction.get("distance_high_km"),
-                        "daylight": prediction.get("daylight"),
-                        "snr_score": prediction.get("snr_score"),
-                        "clipping_fraction": prediction.get("clipping_fraction"),
-                        "baseline_instability": prediction.get("baseline_instability"),
-                        "quality_score": prediction.get("quality_score"),
-                        "model_version": prediction.get("model_version"),
-                        "split_hash": prediction.get("split_hash"),
-                        "support_status": prediction.get("support_status"),
-                        "support_file_count": prediction.get("support_file_count"),
-                        "support_condition": prediction.get("support_condition"),
-                        "fold_manifest_hash": inference_ckpt.get("fold_manifest_hash", ""),
-                        "full_data_hash": inference_ckpt.get("full_data_hash", ""),
-                        "calibration_hash": inference_ckpt.get("rejection_policy", {}).get("calibration_hash") or inference_ckpt.get("type_rejection", {}).get("calibration_hash", ""),
-                    })
-
-                    if cls_out not in cache:
-                        cache[cls_out] = []
-                    cache[cls_out].append((batch_raw[i], batch_ts[i]))
-
-                    if len(cache[cls_out]) >= MAX_PER_FILE:
-                        chunk = cache[cls_out][:MAX_PER_FILE]
-                        path = os.path.join(args.output_dir, cls_out,
-                                           f"GZ_{batch_ts[i].replace('.','')}.lig")
-                        write_lig([piece for piece, _ in chunk], path, lh)
-                        cache[cls_out] = cache[cls_out][MAX_PER_FILE:]
-
-                    processed += 1
-                    if processed % 10000 == 0:
-                        print(f"  Processed {processed} pieces...")
+                        piece_index = start + offset
+                        output_file = regrouper.add(
+                            prediction.output_class, source_header, raw_piece
+                        )
+                        writer.write(_csv_row(
+                            relative_source,
+                            piece_index,
+                            prediction,
+                            checkpoint_schema=checkpoint.schema,
+                            checkpoint_sha256=checkpoint_hash,
+                            output_file=output_file,
+                        ))
     finally:
-        csv_writer.__exit__(None, None, None)
+        regrouper.flush_all()
+    return csv_path
 
-    # Flush remaining
-    for cls_out, pieces in cache.items():
-        if pieces:
-            ts = pieces[0][1]
-            path = os.path.join(args.output_dir, cls_out,
-                               f"GZ_{ts.replace('.','')}.lig")
-            write_lig([piece for piece, _ in pieces], path, lh)
 
-    print(f"\nDone. {processed} pieces classified into {len(cache)} categories.")
-    for cls_out in sorted(os.listdir(args.output_dir)):
-        d = os.path.join(args.output_dir, cls_out)
-        if os.path.isdir(d):
-            n = len(os.listdir(d))
-            print(f"  {cls_out}: {n} files")
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the compact two-schema inference command line."""
+    parser = argparse.ArgumentParser(
+        description="Classify LIG pieces with a five-class checkpoint."
+    )
+    parser.add_argument("--input_dir", required=True)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--type_only", action="store_true")
+    parser.add_argument("--device", default="auto")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> Path:
+    """Run the inference CLI and return the generated CSV path."""
+    args = build_arg_parser().parse_args(argv)
+    return classify_directory(
+        args.input_dir,
+        args.output_dir,
+        args.model,
+        batch_size=args.batch_size,
+        type_only=args.type_only,
+        device=args.device,
+    )
 
 
 if __name__ == "__main__":

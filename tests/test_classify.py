@@ -1,605 +1,325 @@
 import csv
+import hashlib
 import struct
+from datetime import datetime
+from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
+from torch import nn
 
 import classify
-from models import MultiTaskOrdinalResNet, MultiTaskResNet, create_mtl_model
-from tests.test_training_manifest import write_lig as write_test_lig
-
-
-def make_checkpoint(architecture):
-    model = create_mtl_model(
-        base_channels=8,
-        architecture=architecture,
-        dist_mlp_dim=12,
-        dist_dropout=0.0,
-    )
-    return {
-        "model_name": architecture,
-        "base_channels": 8,
-        "dist_mlp_dim": 12,
-        "dist_dropout": 0.0,
-        "type_names": ["IC", "NCG", "NNBE", "PCG", "PNBE"],
-        "dist_names": ["NCG", "NNBE", "PCG", "PNBE"],
-        "dist_bin_starts": [index * 100 for index in range(30)],
-        "model_state_dict": model.state_dict(),
-    }
-
-
-def make_four_class_checkpoint(architecture="ordinal_v2"):
-    model = create_mtl_model(
-        base_channels=8,
-        architecture=architecture,
-        num_types=4,
-        dist_mlp_dim=12,
-        dist_dropout=0.0,
-    )
-    return {
-        "task_schema": "four_class_rejection_v1",
-        "model_name": architecture,
-        "base_channels": 8,
-        "dist_mlp_dim": 12,
-        "dist_dropout": 0.0,
-        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
-        "dist_names": ["NCG", "NNBE", "PCG", "PNBE"],
-        "dist_bin_starts": [index * 100 for index in range(30)],
-        "type_rejection": {
-            "version": 1,
-            "temperature": 1.0,
-            "centroids": [[0.0, 0.0]] * 4,
-            "scales": [[1.0, 1.0]] * 4,
-            "probability_thresholds": [0.5] * 4,
-            "margin_thresholds": [0.1] * 4,
-            "distance_thresholds": [2.0] * 4,
-        },
-        "model_state_dict": model.state_dict(),
-    }
-
-
-def make_conditional_checkpoint(context_dim=1, include_model=False):
-    checkpoint = {
-        "task_schema": "four_class_rejection_v2",
-        "model_name": "conditional_expert_v1",
-        "model_version": "conditional-test",
-        "context_dim": context_dim,
-        "time_context": "daylight" if context_dim == 1 else "cyclic",
-        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
-        "rejected_type_name": "IC",
-        "combined_split_hash": "split-hash",
-        "type_rejection": {
-            "version": 2,
-            "temperature": 1.0,
-            "centroids": [[0.0, 0.0]] * 4,
-            "scales": [[1.0, 1.0]] * 4,
-            "probability_thresholds": [0.5] * 4,
-            "margin_thresholds": [0.1] * 4,
-            "distance_thresholds": [2.0] * 4,
-            "quality_thresholds": [0.1] * 4,
-            "calibration_split_hash": "validation-hash",
-        },
-        "distance_calibration": {"temperatures": [1.0] * 4},
-    }
-    if include_model:
-        model = create_mtl_model(
-            base_channels=8,
-            architecture="conditional_expert_v1",
-            num_types=4,
-            dist_mlp_dim=12,
-            dist_dropout=0.0,
-            context_dim=context_dim,
-        )
-        checkpoint.update({
-            "base_channels": 8,
-            "dist_mlp_dim": 12,
-            "dist_dropout": 0.0,
-            "model_state_dict": model.state_dict(),
-        })
-    return checkpoint
-
-
-def test_load_checkpoint_selects_legacy_and_v2_architectures(tmp_path):
-    legacy_path = tmp_path / "legacy.pt"
-    v2_path = tmp_path / "v2.pt"
-    torch.save(make_checkpoint("mtl_resnet"), legacy_path)
-    torch.save(make_checkpoint("ordinal_v2"), v2_path)
-
-    legacy, _ = classify.load_mtl_checkpoint(legacy_path, "cpu")
-    v2, _ = classify.load_mtl_checkpoint(v2_path, "cpu")
-
-    assert isinstance(legacy, MultiTaskResNet)
-    assert isinstance(v2, MultiTaskOrdinalResNet)
-
-
-def test_load_checkpoint_uses_four_class_type_head(tmp_path):
-    path = tmp_path / "four.pt"
-    torch.save(make_four_class_checkpoint(), path)
-
-    model, checkpoint = classify.load_mtl_checkpoint(path, "cpu")
-
-    assert model.type_head.out_features == 4
-    assert classify.checkpoint_schema(checkpoint) == "four_class_rejection_v1"
-
-
-@pytest.mark.parametrize(
-    ("context_dim", "stored_context_dim", "expected_mode"),
-    [(1, True, "daylight"), (3, False, "cyclic")],
+from checkpoints import LoadedCheckpoint
+from data.lig import (
+    FILE_HEADER_BYTES,
+    MAX_PIECES_PER_FILE,
+    PIECE_BYTES,
+    WAVEFORM_SAMPLES,
 )
-def test_load_conditional_checkpoint_preserves_context_compatibility(
-    tmp_path, context_dim, stored_context_dim, expected_mode
+from data.preprocessing import preprocess_batch as legacy_reference_preprocess
+from models import ModelOutput
+
+
+TYPE_NAMES = ("IC", "NCG", "NNBE", "PCG", "PNBE")
+DISTANCE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
+DISTANCE_BINS = tuple(range(0, 3000, 100))
+
+
+def make_piece(value: int, *, hour: int = 0, marker: int = 0) -> bytes:
+    raw = bytearray((marker + index * 17) % 256 for index in range(PIECE_BYTES))
+    struct.pack_into("<6i4x", raw, 108, 20, 1, 2, hour, 4, 5)
+    struct.pack_into("<d", raw, 136, 0.25)
+    waveform = np.full(WAVEFORM_SAMPLES, value, dtype="<u2")
+    raw[208:208 + waveform.nbytes] = waveform.tobytes()
+    return bytes(raw)
+
+
+def write_source(path: Path, pieces: list[bytes], *, marker: int = 0) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = bytearray((marker + index * 29) % 256 for index in range(FILE_HEADER_BYTES))
+    struct.pack_into("<i", header, 4, len(pieces))
+    path.write_bytes(bytes(header) + b"".join(pieces))
+    return bytes(header)
+
+
+class ConstantNewModel(nn.Module):
+    def __init__(self, type_index: int = 2, distance_bin: int = 5):
+        super().__init__()
+        self.type_index = type_index
+        self.distance_bin = distance_bin
+        self.batch_sizes: list[int] = []
+        self.daylight_batches: list[torch.Tensor] = []
+
+    def forward(self, local, global_view, daylight):
+        count = len(local)
+        self.batch_sizes.append(count)
+        self.daylight_batches.append(daylight.detach().cpu().clone())
+        type_logits = torch.zeros(count, 5, device=local.device)
+        type_logits[:, self.type_index] = 9.0
+        distance_logits = [
+            torch.zeros(count, 30, device=local.device) for _ in range(4)
+        ]
+        if self.type_index:
+            distance_logits[self.type_index - 1][:, self.distance_bin] = 10.0
+        return ModelOutput(
+            type_logits=type_logits,
+            distance_logits=tuple(distance_logits),
+            features=torch.zeros(count, 1, device=local.device),
+        )
+
+
+class RecordingLegacyModel(nn.Module):
+    def __init__(self, type_index: int = 1, distance_bin: int = 3):
+        super().__init__()
+        self.type_index = type_index
+        self.distance_bin = distance_bin
+        self.inputs: list[torch.Tensor] = []
+
+    def forward(self, values):
+        self.inputs.append(values.detach().cpu().clone())
+        count = len(values)
+        type_logits = torch.zeros(count, 5, device=values.device)
+        type_logits[:, self.type_index] = 9.0
+        heads = [torch.zeros(count, 30, device=values.device) for _ in range(4)]
+        if self.type_index:
+            heads[self.type_index - 1][:, self.distance_bin] = 10.0
+        return type_logits, tuple(heads)
+
+
+def loaded_new(model: nn.Module) -> LoadedCheckpoint:
+    return LoadedCheckpoint(
+        model=model,
+        schema="five_class_v1",
+        type_names=TYPE_NAMES,
+        distance_names=DISTANCE_NAMES,
+        distance_bins_km=DISTANCE_BINS,
+        preprocess_config={
+            "local_length": 8000,
+            "global_length": 2000,
+            "use_filter": False,
+        },
+        metadata={},
+    )
+
+
+def loaded_legacy(model: nn.Module) -> LoadedCheckpoint:
+    return LoadedCheckpoint(
+        model=model,
+        schema="legacy_five_class",
+        type_names=TYPE_NAMES,
+        distance_names=DISTANCE_NAMES,
+        distance_bins_km=DISTANCE_BINS,
+        preprocess_config={"normalize_mode": "minmax", "target_length": 8000},
+        metadata={},
+    )
+
+
+def test_direct_argmax_outputs_ic_without_threshold():
+    prediction = classify.decode_new_prediction(
+        type_logits=torch.tensor([9.0, 1.0, 0.0, 0.0, 0.0]),
+        distance_logits=[torch.zeros(30) for _ in range(4)],
+    )
+
+    assert prediction.final_type == "IC"
+    assert prediction.distance_bin is None
+    assert prediction.output_class == "IC"
+
+
+def test_non_ic_uses_matching_distance_expert():
+    heads = [torch.zeros(30) for _ in range(4)]
+    heads[1][5] = 10.0
+
+    prediction = classify.decode_new_prediction(
+        type_logits=torch.tensor([0.0, 0.0, 9.0, 0.0, 0.0]),
+        distance_logits=heads,
+    )
+
+    assert prediction.final_type == "NNBE"
+    assert prediction.distance_bin == 5
+    assert prediction.output_class == "NNBE_500-600km"
+    probabilities = torch.softmax(heads[1], dim=0)
+    centers = torch.arange(50.0, 3050.0, 100.0)
+    assert prediction.expected_distance_km == pytest.approx(
+        float((probabilities * centers).sum())
+    )
+
+
+def test_legacy_decode_uses_the_same_direct_prediction_contract():
+    heads = [torch.zeros(30) for _ in range(4)]
+    heads[3][29] = 10.0
+
+    prediction = classify.decode_legacy_prediction(
+        type_logits=torch.tensor([0.0, 0.0, 0.0, 0.0, 9.0]),
+        distance_logits=heads,
+    )
+
+    assert isinstance(prediction, classify.Prediction)
+    assert prediction.final_type == "PNBE"
+    assert prediction.distance_bin == 29
+    assert prediction.output_class == "PNBE_2900-3000km"
+
+
+def test_type_only_has_type_directory_and_no_distance_values():
+    heads = [torch.zeros(30) for _ in range(4)]
+    prediction = classify.decode_new_prediction(
+        torch.tensor([0.0, 9.0, 0.0, 0.0, 0.0]),
+        heads,
+        type_only=True,
+    )
+
+    assert prediction.output_class == "NCG"
+    assert prediction.distance_bin is None
+    assert prediction.expected_distance_km is None
+    assert prediction.distance_confidence is None
+
+
+def test_new_adapter_uses_signed_views_and_each_piece_timestamp():
+    model = ConstantNewModel(type_index=0)
+    waveforms = np.stack([
+        np.linspace(0, 1000, WAVEFORM_SAMPLES, dtype=np.float32),
+        np.linspace(1000, 0, WAVEFORM_SAMPLES, dtype=np.float32),
+    ])
+
+    predictions = classify.predict_batch(
+        loaded_new(model),
+        waveforms,
+        [datetime(2020, 1, 2, 0), datetime(2020, 1, 2, 16)],
+        device=torch.device("cpu"),
+        type_only=False,
+    )
+
+    assert [item.final_type for item in predictions] == ["IC", "IC"]
+    assert model.daylight_batches[0].flatten().tolist() == [1.0, 0.0]
+
+
+def test_legacy_adapter_matches_retained_8000_point_minmax_preprocessing():
+    model = RecordingLegacyModel()
+    waveforms = np.zeros((2, WAVEFORM_SAMPLES), dtype=np.float32)
+    waveforms[0, 3000] = 1000.0
+    waveforms[0, 8000] = 500.0
+    waveforms[1] = np.linspace(0.0, 2000.0, WAVEFORM_SAMPLES)
+    expected = legacy_reference_preprocess(
+        waveforms.copy(), target_length=8000, normalize_mode="minmax"
+    )
+
+    classify.predict_batch(
+        loaded_legacy(model),
+        waveforms,
+        [datetime(2020, 1, 2), datetime(2020, 1, 3)],
+        device=torch.device("cpu"),
+        type_only=False,
+    )
+
+    assert torch.equal(model.inputs[0], torch.from_numpy(expected).unsqueeze(1))
+
+
+def test_classification_preserves_bytes_and_writes_exact_csv_contract(
+    tmp_path, monkeypatch
 ):
-    path = tmp_path / f"conditional-{context_dim}.pt"
-    checkpoint = make_conditional_checkpoint(context_dim, include_model=True)
-    if not stored_context_dim:
-        checkpoint.pop("context_dim")
-        checkpoint.pop("time_context")
-    torch.save(checkpoint, path)
+    input_dir = tmp_path / "input"
+    pieces = [make_piece(11, hour=0, marker=31), make_piece(22, hour=16, marker=97)]
+    source = input_dir / "incoming" / "source.lig"
+    source_header = write_source(source, pieces, marker=43)
+    output_dir = tmp_path / "output"
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"synthetic-checkpoint")
+    expected_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    model = ConstantNewModel(type_index=2, distance_bin=5)
+    monkeypatch.setattr(classify, "load_model_checkpoint", lambda *_: loaded_new(model))
 
-    model, loaded = classify.load_mtl_checkpoint(path, "cpu")
-
-    assert model.context_dim == context_dim
-    assert classify.checkpoint_time_context_mode(loaded) == expected_mode
-
-
-def test_four_class_rejection_routes_failed_feature_to_ic():
-    checkpoint = make_four_class_checkpoint()
-
-    predictions = classify.decode_four_class_predictions(
-        torch.tensor([[5.0, 0.0, 0.0, 0.0]]),
-        torch.tensor([[20.0, 20.0]]),
-        checkpoint,
+    csv_path = classify.classify_directory(
+        input_dir,
+        output_dir,
+        model_path,
+        batch_size=1,
+        device="cpu",
     )
 
-    assert predictions[0]["raw_type"] == "NCG"
-    assert predictions[0]["type"] == "IC"
-    assert predictions[0]["class_name"] == "IC"
-    assert predictions[0]["rejection_reason"] == "feature_distance"
-    assert predictions[0]["status"] == "rejected"
-
-
-def test_four_class_full_prediction_uses_per_type_distance_mode():
-    checkpoint = make_four_class_checkpoint()
-    checkpoint["distance_training"] = {
-        "prediction": "expected",
-        "prediction_by_type": {
-            "NCG": "argmax",
-            "NNBE": "argmax",
-            "PCG": "expected",
-            "PNBE": "expected",
-        },
-    }
-    checkpoint["distance_calibration"] = {
-        "temperatures": [1.0] * 4,
-        "confidence_threshold": 0.0,
-    }
-    distance_logits = [torch.full((1, 30), -20.0) for _ in range(4)]
-    distance_logits[0][0, 4] = 20.0
-
-    predictions = classify.decode_four_class_full_predictions(
-        torch.tensor([[8.0, 0.0, 0.0, 0.0]]),
-        torch.tensor([[0.0, 0.0]]),
-        distance_logits,
-        checkpoint,
-    )
-
-    assert predictions[0]["type"] == "NCG"
-    assert predictions[0]["bin_start_km"] == 400
-    assert predictions[0]["head_source"] == "single"
-    assert predictions[0]["rejection_reason"] == "accepted"
-
-
-def test_four_class_full_prediction_keeps_rejected_piece_without_distance():
-    checkpoint = make_four_class_checkpoint()
-    distance_logits = [torch.zeros(1, 30) for _ in range(4)]
-
-    predictions = classify.decode_four_class_full_predictions(
-        torch.tensor([[5.0, 0.0, 0.0, 0.0]]),
-        torch.tensor([[20.0, 20.0]]),
-        distance_logits,
-        checkpoint,
-    )
-
-    assert predictions[0]["type"] == "IC"
-    assert predictions[0]["distance_km"] is None
-    assert predictions[0]["class_name"] == "IC"
-
-
-def test_conditional_checkpoint_routes_context_expert_and_distance():
-    checkpoint = make_conditional_checkpoint()
-    distance_logits = [torch.full((1, 30), -20.0) for _ in range(4)]
-    distance_logits[0][0, 4] = 20.0
-
-    predictions = classify.decode_conditional_batch(
-        torch.tensor([[8.0, 0.0, 0.0, 0.0]]),
-        torch.tensor([[0.0, 0.0]]),
-        distance_logits,
-        quality=torch.tensor([[10.0, 0.0, 0.0]]),
-        checkpoint=checkpoint,
-        daylight=torch.tensor([1.0]),
-    )
-
-    assert predictions[0]["final_type"] == "NCG"
-    assert predictions[0]["expected_distance_km"] == pytest.approx(450.0)
-    assert predictions[0]["distance_low_km"] <= predictions[0]["distance_high_km"]
-    assert set(predictions[0]["type_probabilities"]) == {
-        "NCG", "NNBE", "PCG", "PNBE"
-    }
-    assert predictions[0]["model_version"] == "conditional-test"
-    assert predictions[0]["split_hash"] == "split-hash"
-
-
-def test_conditional_rejected_piece_has_no_distance_and_keeps_probabilities():
-    checkpoint = make_conditional_checkpoint()
-    distance_logits = [torch.zeros((1, 30)) for _ in range(4)]
-
-    prediction = classify.decode_conditional_batch(
-        torch.tensor([[8.0, 0.0, 0.0, 0.0]]),
-        torch.tensor([[0.0, 0.0]]),
-        distance_logits,
-        quality=torch.tensor([[0.1, 1.0, 20.0]]),
-        checkpoint=checkpoint,
-        daylight=torch.tensor([0.0]),
-    )[0]
-
-    assert prediction["final_type"] == prediction["class_name"] == "IC"
-    assert prediction["expected_distance_km"] is None
-    assert prediction["distance_low_km"] is None
-    assert len(prediction["type_probabilities"]) == 4
-    assert prediction["rejection_reason"] == "low_quality"
-
-
-def test_v2_route_marks_low_confidence_prediction_uncertain():
-    checkpoint = make_checkpoint("ordinal_v2")
-    checkpoint["distance_training"] = {"prediction": "expected"}
-    checkpoint["distance_calibration"] = {
-        "temperatures": [1.0, 1.0, 1.0, 1.0],
-        "confidence_threshold": 0.8,
-    }
-    distance_logits = [torch.zeros(30) for _ in range(4)]
-
-    prediction = classify.decode_piece_prediction(
-        type_index=2,
-        distance_logits=distance_logits,
-        checkpoint=checkpoint,
-    )
-
-    assert prediction["status"] == "uncertain"
-    assert prediction["class_name"] == "UNCERTAIN_NNBE"
-
-
-def test_v2_route_exports_reliable_expected_distance():
-    checkpoint = make_checkpoint("ordinal_v2")
-    checkpoint["distance_training"] = {"prediction": "expected"}
-    checkpoint["distance_calibration"] = {
-        "temperatures": [1.0, 1.0, 1.0, 1.0],
-        "confidence_threshold": 0.8,
-    }
-    distance_logits = [torch.full((30,), -20.0) for _ in range(4)]
-    distance_logits[1][4] = 20.0
-
-    prediction = classify.decode_piece_prediction(
-        type_index=2,
-        distance_logits=distance_logits,
-        checkpoint=checkpoint,
-    )
-
-    assert prediction["status"] == "reliable"
-    assert prediction["class_name"] == "NNBE_400-500km"
-    assert prediction["distance_km"] == 450.0
-    assert prediction["low_km"] == 400.0
-    assert prediction["high_km"] == 500.0
-
-
-def test_hybrid_route_uses_old_type_and_old_ncg_distance():
-    old_checkpoint = make_checkpoint("mtl_resnet")
-    new_checkpoint = make_checkpoint("ordinal_v2")
-    old_type_logits = torch.tensor([0.0, 9.0, 0.0, 0.0, 0.0])
-    old_distance_logits = [torch.full((30,), -20.0) for _ in range(4)]
-    new_distance_logits = [torch.full((30,), -20.0) for _ in range(4)]
-    old_distance_logits[0][3] = 20.0
-    new_distance_logits[0][12] = 20.0
-
-    prediction = classify.decode_hybrid_prediction(
-        old_type_logits,
-        old_distance_logits,
-        new_distance_logits,
-        old_checkpoint,
-        new_checkpoint,
-    )
-
-    assert prediction["type"] == "NCG"
-    assert prediction["bin_start_km"] == 300
-    assert prediction["head_source"] == "old"
-
-
-def test_hybrid_route_uses_new_distance_for_non_ncg():
-    old_checkpoint = make_checkpoint("mtl_resnet")
-    new_checkpoint = make_checkpoint("ordinal_v2")
-    new_checkpoint["distance_training"] = {"prediction": "expected"}
-    old_type_logits = torch.tensor([0.0, 0.0, 9.0, 0.0, 0.0])
-    old_distance_logits = [torch.full((30,), -20.0) for _ in range(4)]
-    new_distance_logits = [torch.full((30,), -20.0) for _ in range(4)]
-    old_distance_logits[1][3] = 20.0
-    new_distance_logits[1][7] = 20.0
-
-    prediction = classify.decode_hybrid_prediction(
-        old_type_logits,
-        old_distance_logits,
-        new_distance_logits,
-        old_checkpoint,
-        new_checkpoint,
-    )
-
-    assert prediction["type"] == "NNBE"
-    assert prediction["bin_start_km"] == 700
-    assert prediction["head_source"] == "new"
-
-
-def test_hybrid_rejects_incompatible_class_mappings():
-    old_checkpoint = make_checkpoint("mtl_resnet")
-    new_checkpoint = make_checkpoint("ordinal_v2")
-    new_checkpoint["dist_bin_starts"] = [index * 50 for index in range(30)]
-
-    with pytest.raises(ValueError, match="dist_bin_starts"):
-        classify.validate_checkpoint_pair(old_checkpoint, new_checkpoint)
-
-
-def test_type_only_prediction_has_no_distance_fields():
-    checkpoint = make_checkpoint("ordinal_v2")
-    logits = torch.tensor([0.0, 0.0, 8.0, 0.0, 0.0])
-
-    prediction = classify.decode_type_prediction(logits, checkpoint)
-
-    assert prediction["type"] == prediction["class_name"] == "NNBE"
-    assert prediction["distance_km"] is None
-    assert prediction["bin_start_km"] is None
-    assert prediction["head_source"] == "type"
-    assert prediction["status"] == "reliable"
-
-
-def test_type_only_routes_low_confidence_non_ic_to_uncertained_folder():
-    checkpoint = make_checkpoint("ordinal_v2")
-    logits = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
-
-    prediction = classify.decode_type_prediction(
-        logits, checkpoint, min_confidence=0.85
-    )
-
-    assert prediction["type"] == "NCG"
-    assert prediction["class_name"] == "uncertained_NCG"
-    assert prediction["status"] == "uncertain"
-    assert prediction["confidence"] == prediction["type_confidence"]
-    assert prediction["confidence"] < 0.85
-
-
-def test_type_only_exempts_ic_from_confidence_gate():
-    checkpoint = make_checkpoint("ordinal_v2")
-    logits = torch.tensor([1.0, 0.9, 0.8, 0.7, 0.6])
-
-    prediction = classify.decode_type_prediction(
-        logits, checkpoint, min_confidence=0.85
-    )
-
-    assert prediction["type"] == prediction["class_name"] == "IC"
-    assert prediction["confidence"] < 0.85
-    assert prediction["status"] == "reliable"
-
-
-def test_type_only_cli_uses_one_explicit_checkpoint():
-    args = classify.build_arg_parser().parse_args([
-        "--input_dir", "input", "--output_dir", "output",
-        "--type_only", "--model", "fresh.pt",
-    ])
-
-    assert args.type_only is True
-    assert args.model == "fresh.pt"
-    assert args.min_type_confidence == 0.0
-
-
-def test_four_class_cli_uses_single_model_for_type_and_distance():
-    args = classify.build_arg_parser().parse_args([
-        "--input_dir", "input", "--output_dir", "output",
-        "--four_class", "--model", "candidate.pt",
-    ])
-
-    assert args.four_class is True
-    assert args.type_only is False
-    assert args.model == "candidate.pt"
-
-
-def test_single_checkpoint_is_default_and_legacy_hybrid_is_explicit():
-    args = classify.build_arg_parser().parse_args([
-        "--input_dir", "input", "--output_dir", "output",
-        "--model", "candidate.pt",
-    ])
-
-    assert args.legacy_hybrid is False
-    assert args.model == "candidate.pt"
-
-
-def test_four_class_checkpoint_rejects_legacy_confidence_override():
-    with pytest.raises(ValueError, match="min_type_confidence"):
-        classify.validate_type_only_options(
-            make_four_class_checkpoint(), min_type_confidence=0.85
-        )
-
-
-def test_v3_checkpoint_rejects_legacy_confidence_override():
-    checkpoint = {
-        "schema": "four_class_cv_v3",
-        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
-    }
-
-    with pytest.raises(ValueError, match="min_type_confidence"):
-        classify.validate_type_only_options(
-            checkpoint, min_type_confidence=0.85
-        )
-
-
-def test_forward_type_bypasses_ordinal_distance_projection():
-    model = create_mtl_model(
-        base_channels=8, architecture="ordinal_v2", dist_mlp_dim=8, dist_dropout=0.0
-    )
-
-    def fail_if_called(*_):
-        raise AssertionError("distance projection was called")
-
-    handle = model.distance_projection.register_forward_pre_hook(fail_if_called)
-    try:
-        logits = model.forward_type(torch.randn(2, 1, 128))
-    finally:
-        handle.remove()
-
-    assert logits.shape == (2, 5)
-
-
-def test_distance_support_status_marks_insufficient_from_support_map():
-    checkpoint = {
-        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
-        "support_map": {
-            "NCG/day/400-500km": {
-                "file_count": 2, "status": "insufficient_support"
-            }
-        },
-    }
-    status, file_count, condition = classify.distance_support_status(
-        checkpoint, 0, True, 400
-    )
-    assert status == "insufficient_support"
-    assert file_count == 2
-    assert condition == "NCG/day/400-500km"
-
-
-def test_old_checkpoint_without_support_map_reports_unknown():
-    status, file_count, condition = classify.distance_support_status(
-        {"type_names": ["NCG", "NNBE", "PCG", "PNBE"]}, 0, True, 400
-    )
-    assert status == "unknown"
-    assert file_count is None
-    assert condition is None
-
-
-def test_annotate_distance_support_preserves_accepted_distance(tmp_path):
-    checkpoint = {
-        "type_names": ["NCG", "NNBE", "PCG", "PNBE"],
-        "support_map": {
-            "NCG/day/400-500km": {
-                "file_count": 5, "status": "supported"
-            }
-        },
-    }
-    prediction = classify.annotate_distance_support({
-        "type_index": 0,
-        "class_name": "NCG_400-500km",
-        "expected_distance_km": 450.0,
-        "modal_distance_bin": 4,
-        "daylight": True,
-        "type_only": False,
-    }, checkpoint)
-    assert prediction["expected_distance_km"] == pytest.approx(450.0)
-    assert prediction["support_status"] == "supported"
-    assert prediction["support_file_count"] == 5
-    assert prediction["class_name"] == "NCG_400-500km"
-
-
-def test_annotate_ic_reports_not_applicable():
-    result = classify.annotate_distance_support({
-        "class_name": "IC", "type_only": False,
-    }, {})
-    assert result["support_status"] == "not_applicable"
-    assert result["support_file_count"] is None
-    assert result["support_condition"] is None
-
-
-def test_annotate_type_only_reports_not_evaluated():
-    result = classify.annotate_distance_support({
-        "class_name": "NCG_0-100km",
-        "type_only": True,
-    }, {})
-    assert result["support_status"] == "not_evaluated"
-
-
-def test_prediction_csv_writer_has_reliability_columns(tmp_path):
-    output = tmp_path / "predictions.csv"
-    with classify.PredictionCsvWriter(output) as writer:
-        writer.write({
-            "source_file": "sample.lig",
-            "piece_index": 7,
-            "type": "NNBE",
-            "distance_km": 450.0,
-            "bin_start_km": 400,
-            "low_km": 400.0,
-            "high_km": 500.0,
-            "confidence": 0.99,
-            "status": "reliable",
-        })
-
-    with output.open(newline="", encoding="utf-8") as handle:
-        row = next(csv.DictReader(handle))
-    assert set(row) == set(classify.PREDICTION_FIELDS)
-    assert row["status"] == "reliable"
-    assert {
-        "raw_type",
-        "type_margin",
-        "feature_distance",
-        "rejection_reason",
-        "final_type",
-    }.issubset(row)
-    assert {
-        "prob_NCG",
-        "prob_NNBE",
-        "prob_PCG",
-        "prob_PNBE",
-        "expected_distance_km",
-        "distance_low_km",
-        "distance_high_km",
-        "daylight",
-        "snr_score",
-        "clipping_fraction",
-        "model_version",
-        "split_hash",
-    }.issubset(row)
-
-
-def test_piece_stream_preserves_raw_bytes_and_reads_real_timestamp(tmp_path):
-    source = write_test_lig(
-        tmp_path / "GZ_160702000049.2536254.lig",
-        timestamp=(16, 7, 2, 0, 0, 49),
-        sec_frac=0.2536254,
-        pieces=2,
-    )
-    source_bytes = source.read_bytes()
-
-    waveforms, raw_pieces, timestamps, indices = next(
-        classify.read_pieces_stream(source, chunk=2)
-    )
-
-    assert indices == [0, 1]
-    assert timestamps[0].startswith("160702000049.2536254")
-    assert raw_pieces[0] == source_bytes[112:112 + 32208]
-    assert raw_pieces[1] == source_bytes[112 + 32208:112 + 2 * 32208]
-    assert waveforms[0][0] == 1
-    assert waveforms[1][0] == 2
-
-
-def test_write_lig_keeps_each_piece_byte_identical(tmp_path):
-    source = write_test_lig(
-        tmp_path / "source.lig",
-        timestamp=(16, 7, 2, 0, 0, 49),
-        sec_frac=0.25,
-        pieces=2,
-    )
-    source_bytes = source.read_bytes()
-    raw_pieces = [
-        source_bytes[112:112 + 32208],
-        source_bytes[112 + 32208:112 + 2 * 32208],
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+        assert handle.seek(0) == 0
+        assert next(csv.reader(handle)) == list(classify.PREDICTION_FIELDS)
+    assert len(rows) == 2
+    row = rows[0]
+    assert row["source_path"] == "incoming/source.lig"
+    assert row["piece_index"] == "0"
+    assert row["piece_key"] == "incoming/source.lig#0"
+    assert row["prob_IC"] != ""
+    assert row["prob_NNBE"] != ""
+    assert row["checkpoint_schema"] == "five_class_v1"
+    assert row["model_sha256"] == expected_hash
+
+    output_file = output_dir / Path(row["output_file"])
+    written = output_file.read_bytes()
+    written_header = bytearray(written[:FILE_HEADER_BYTES])
+    expected_header = bytearray(source_header)
+    struct.pack_into("<i", expected_header, 4, 2)
+    assert written_header == expected_header
+    assert written[FILE_HEADER_BYTES:FILE_HEADER_BYTES + PIECE_BYTES] == pieces[0]
+    assert written[FILE_HEADER_BYTES + PIECE_BYTES:] == pieces[1]
+
+
+def test_regrouping_is_bounded_and_first_piece_owns_each_output_header(
+    tmp_path, monkeypatch
+):
+    input_dir = tmp_path / "input"
+    first_pieces = [make_piece(index, marker=index % 251) for index in range(500)]
+    second_pieces = [
+        make_piece(1000 + index, marker=(index + 71) % 251) for index in range(15)
     ]
-    output = tmp_path / "classified" / "result.lig"
+    first_header = write_source(
+        input_dir / "incoming" / "a.lig", first_pieces, marker=13
+    )
+    second_header = write_source(
+        input_dir / "incoming" / "b.lig", second_pieces, marker=211
+    )
+    output_dir = tmp_path / "output"
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"bounded")
+    model = ConstantNewModel(type_index=1, distance_bin=0)
+    monkeypatch.setattr(classify, "load_model_checkpoint", lambda *_: loaded_new(model))
 
-    classify.write_lig(raw_pieces, output, bytes(112))
+    classify.classify_directory(
+        input_dir,
+        output_dir,
+        model_path,
+        batch_size=17,
+        device="cpu",
+    )
 
-    written = output.read_bytes()
-    assert struct.unpack_from("<i", written, 4)[0] == 2
-    assert written[112:112 + 32208] == raw_pieces[0]
-    assert written[112 + 32208:112 + 2 * 32208] == raw_pieces[1]
+    output_files = sorted((output_dir / "NCG_0-100km").glob("*.lig"))
+    counts = [struct.unpack_from("<i", path.read_bytes(), 4)[0] for path in output_files]
+    assert counts == [MAX_PIECES_PER_FILE, 3]
+    assert max(model.batch_sizes) <= 17
+    first_written_header = bytearray(output_files[0].read_bytes()[:FILE_HEADER_BYTES])
+    second_written_header = bytearray(output_files[1].read_bytes()[:FILE_HEADER_BYTES])
+    first_expected = bytearray(first_header)
+    second_expected = bytearray(second_header)
+    struct.pack_into("<i", first_expected, 4, MAX_PIECES_PER_FILE)
+    struct.pack_into("<i", second_expected, 4, 3)
+    assert first_written_header == first_expected
+    assert second_written_header == second_expected
+
+
+def test_cli_is_compact_and_path_validation_rejects_unsafe_nesting(tmp_path):
+    args = classify.build_arg_parser().parse_args([
+        "--input_dir", "input",
+        "--output_dir", "output",
+        "--model", "model.pt",
+    ])
+    assert set(vars(args)) == {
+        "input_dir", "output_dir", "model", "batch_size", "type_only", "device"
+    }
+
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"model")
+    with pytest.raises(ValueError, match="must not contain"):
+        classify.classify_directory(child, parent, model, device="cpu")
+    with pytest.raises(ValueError, match="must not contain"):
+        classify.classify_directory(parent, child, model, device="cpu")
+    with pytest.raises(ValueError, match="batch_size"):
+        classify.classify_directory(parent, tmp_path / "elsewhere", model, batch_size=0)
