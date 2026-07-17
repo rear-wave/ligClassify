@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import asdict
 import hashlib
 import json
@@ -17,7 +18,7 @@ from torch.utils.data import DataLoader
 
 from checkpoints import save_model_checkpoint
 from data.dataset import FiveClassDataset, collate_batch
-from data.manifest import build_piece_table
+from data.manifest import PieceTable, build_piece_table
 from data.preprocess import AugmentationConfig, PreprocessConfig
 from data.sampling import FiveClassSampler
 from data.split import (
@@ -178,7 +179,7 @@ def _loader(
 def _fit_training(
     args: argparse.Namespace,
     output: Path,
-    table: Any,
+    table: PieceTable,
     diagnostics: Mapping[str, Any],
     artifact: Mapping[str, Any],
     train_positions: np.ndarray,
@@ -328,26 +329,29 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     test_positions = assignment.positions("test")
 
     preprocess_config = PreprocessConfig()
-    train_dataset = FiveClassDataset(
-        table,
-        train_positions,
-        split="train",
-        preprocess_config=preprocess_config,
-        augmentation_config=AugmentationConfig(),
-    )
-    validation_dataset = FiveClassDataset(
-        table,
-        validation_positions,
-        split="validation",
-        preprocess_config=preprocess_config,
-    )
-    test_dataset = FiveClassDataset(
-        table,
-        test_positions,
-        split="test",
-        preprocess_config=preprocess_config,
-    )
-    try:
+    with ExitStack() as datasets:
+        train_dataset = FiveClassDataset(
+            table,
+            train_positions,
+            split="train",
+            preprocess_config=preprocess_config,
+            augmentation_config=AugmentationConfig(),
+        )
+        datasets.callback(train_dataset.close)
+        validation_dataset = FiveClassDataset(
+            table,
+            validation_positions,
+            split="validation",
+            preprocess_config=preprocess_config,
+        )
+        datasets.callback(validation_dataset.close)
+        test_dataset = FiveClassDataset(
+            table,
+            test_positions,
+            split="test",
+            preprocess_config=preprocess_config,
+        )
+        datasets.callback(test_dataset.close)
         return _fit_training(
             args,
             output,
@@ -360,10 +364,6 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             validation_dataset,
             test_dataset,
         )
-    finally:
-        train_dataset.close()
-        validation_dataset.close()
-        test_dataset.close()
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:

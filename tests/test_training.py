@@ -312,7 +312,7 @@ def test_early_stopping_requires_more_than_one_millionth_improvement():
     assert state.best_epoch == 4
 
 
-def _resume_components():
+def _resume_components(*, scheduler_epoch=1, best_epoch=1, wait=0):
     model = nn.Linear(2, 1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5)
@@ -321,10 +321,11 @@ def _resume_components():
     scaler.scale(loss).backward()
     scaler.step(optimizer)
     scaler.update()
-    scheduler.step()
+    for _ in range(scheduler_epoch):
+        scheduler.step()
     early_stopping = EarlyStoppingState()
-    early_stopping.update(0.75, epoch=3, model=model)
-    early_stopping.wait = 2
+    early_stopping.update(0.75, epoch=best_epoch, model=model)
+    early_stopping.wait = wait
     return model, optimizer, scheduler, scaler, early_stopping
 
 
@@ -332,7 +333,9 @@ def test_exact_resume_restores_full_training_and_rng_state(tmp_path):
     random.seed(17)
     np.random.seed(18)
     torch.manual_seed(19)
-    model, optimizer, scheduler, scaler, early_stopping = _resume_components()
+    model, optimizer, scheduler, scaler, early_stopping = _resume_components(
+        scheduler_epoch=3, best_epoch=1, wait=2
+    )
     expected_model = copy.deepcopy(model.state_dict())
     expected_optimizer = copy.deepcopy(optimizer.state_dict())
     expected_scheduler = copy.deepcopy(scheduler.state_dict())
@@ -402,13 +405,88 @@ def test_exact_resume_restores_full_training_and_rng_state(tmp_path):
     assert scheduler.state_dict() == expected_scheduler
     assert scaler.state_dict() == expected_scaler
     assert early_stopping.best_score == 0.75
-    assert early_stopping.best_epoch == 3
+    assert early_stopping.best_epoch == 1
     assert early_stopping.wait == 2
     for name, tensor in expected_best.items():
         assert torch.equal(early_stopping.best_state[name], tensor)
     assert random.random() == expected_python
     assert np.random.random() == expected_numpy
     assert torch.equal(torch.rand(3), expected_torch)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "scheduler_t_max",
+        "scheduler_eta_min",
+        "scheduler_last_epoch",
+        "scheduler_step_count",
+        "scheduler_missing_step_count",
+        "scheduler_base_lrs",
+        "scheduler_not_mapping",
+        "optimizer_group_count",
+        "early_wait",
+        "sampler_epoch",
+    ],
+)
+def test_resume_rejects_incoherent_metadata_before_live_state_mutation(
+    tmp_path, tamper
+):
+    model, optimizer, scheduler, scaler, early_stopping = _resume_components()
+    path = tmp_path / "last.pt"
+    save_last_state(
+        path,
+        epoch=1,
+        sampler_epoch=1,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        split_hash="split",
+        config_hash="config",
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if tamper == "scheduler_t_max":
+        payload["scheduler_state"]["T_max"] = 99
+    elif tamper == "scheduler_eta_min":
+        payload["scheduler_state"]["eta_min"] = 0.25
+    elif tamper == "scheduler_last_epoch":
+        payload["scheduler_state"]["last_epoch"] = 0
+    elif tamper == "scheduler_step_count":
+        payload["scheduler_state"]["_step_count"] = 99
+    elif tamper == "scheduler_missing_step_count":
+        payload["scheduler_state"].pop("_step_count")
+    elif tamper == "scheduler_base_lrs":
+        payload["scheduler_state"]["base_lrs"] = [0.5]
+    elif tamper == "scheduler_not_mapping":
+        payload["scheduler_state"] = []
+    elif tamper == "optimizer_group_count":
+        payload["optimizer_state"]["param_groups"] = []
+    elif tamper == "early_wait":
+        payload["early_stopping"]["wait"] = 1
+    elif tamper == "sampler_epoch":
+        payload["sampler_epoch"] = 0
+    torch.save(payload, path)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+    unchanged = copy.deepcopy(model.state_dict())
+
+    with pytest.raises(ValueError, match="resume configuration mismatch"):
+        load_last_state(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            early_stopping=early_stopping,
+            expected_split_hash="split",
+            expected_config_hash="config",
+        )
+
+    for name, expected in unchanged.items():
+        assert torch.equal(model.state_dict()[name], expected)
 
 
 @pytest.mark.parametrize(
@@ -633,6 +711,35 @@ def test_training_closes_every_dataset_when_validation_fails(tmp_path, monkeypat
         train.main(_smoke_args(root, output))
 
     assert closed == {"train", "validation", "test"}
+
+
+def test_training_closes_constructed_dataset_when_later_constructor_fails(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "train_data"
+    output = tmp_path / "output"
+    _write_training_tree(root)
+    closed = set()
+    real_dataset = train.FiveClassDataset
+    real_close = real_dataset.close
+
+    def record_close(dataset):
+        closed.add(dataset.split)
+        real_close(dataset)
+
+    def fail_validation(*args, **kwargs):
+        if kwargs["split"] == "validation":
+            raise RuntimeError("validation constructor failed")
+        return real_dataset(*args, **kwargs)
+
+    monkeypatch.setattr(real_dataset, "close", record_close)
+    monkeypatch.setattr(real_dataset, "__del__", lambda _dataset: None)
+    monkeypatch.setattr(train, "FiveClassDataset", fail_validation)
+
+    with pytest.raises(RuntimeError, match="validation constructor failed"):
+        train.main(_smoke_args(root, output))
+
+    assert closed == {"train"}
 
 
 def test_single_split_training_smoke_writes_only_contract_artifacts(tmp_path):
