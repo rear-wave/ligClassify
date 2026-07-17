@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 import train
+import training
 from checkpoints import load_model_checkpoint
 from evaluation import evaluate_loader, selection_score
 from models import ModelOutput
@@ -414,6 +415,47 @@ def test_exact_resume_restores_full_training_and_rng_state(tmp_path):
     assert torch.equal(torch.rand(3), expected_torch)
 
 
+def test_resume_stages_checkpoint_on_cpu_before_device_restoration(
+    tmp_path, monkeypatch
+):
+    model, optimizer, scheduler, scaler, early_stopping = _resume_components()
+    path = tmp_path / "last.pt"
+    save_last_state(
+        path,
+        epoch=1,
+        sampler_epoch=1,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        split_hash="split",
+        config_hash="config",
+    )
+    requested_devices = []
+    real_load = training._load_training_payload
+
+    def record_load(checkpoint_path, device):
+        requested_devices.append(torch.device(device))
+        return real_load(checkpoint_path, "cpu")
+
+    monkeypatch.setattr(training, "_load_training_payload", record_load)
+
+    load_last_state(
+        path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        expected_split_hash="split",
+        expected_config_hash="config",
+        device="cuda",
+    )
+
+    assert requested_devices == [torch.device("cpu")]
+
+
 @pytest.mark.parametrize(
     "tamper",
     [
@@ -423,8 +465,22 @@ def test_exact_resume_restores_full_training_and_rng_state(tmp_path):
         "scheduler_step_count",
         "scheduler_missing_step_count",
         "scheduler_base_lrs",
+        "scheduler_missing_last_lr",
+        "scheduler_inconsistent_last_lr",
         "scheduler_not_mapping",
         "optimizer_group_count",
+        "optimizer_parameter_membership",
+        "optimizer_weight_decay",
+        "optimizer_betas",
+        "optimizer_boolean_type",
+        "optimizer_missing_state_entry",
+        "optimizer_state_keys",
+        "optimizer_state_tensor_shape",
+        "optimizer_step_type",
+        "optimizer_step_shape",
+        "optimizer_step_dtype",
+        "optimizer_lr_only",
+        "optimizer_and_scheduler_forged_lr",
         "early_wait",
         "sampler_epoch",
     ],
@@ -459,10 +515,46 @@ def test_resume_rejects_incoherent_metadata_before_live_state_mutation(
         payload["scheduler_state"].pop("_step_count")
     elif tamper == "scheduler_base_lrs":
         payload["scheduler_state"]["base_lrs"] = [0.5]
+    elif tamper == "scheduler_missing_last_lr":
+        payload["scheduler_state"].pop("_last_lr")
+    elif tamper == "scheduler_inconsistent_last_lr":
+        payload["scheduler_state"]["_last_lr"] = [0.123]
     elif tamper == "scheduler_not_mapping":
         payload["scheduler_state"] = []
     elif tamper == "optimizer_group_count":
         payload["optimizer_state"]["param_groups"] = []
+    elif tamper == "optimizer_parameter_membership":
+        payload["optimizer_state"]["param_groups"][0]["params"].pop()
+    elif tamper == "optimizer_weight_decay":
+        payload["optimizer_state"]["param_groups"][0]["weight_decay"] = 0.25
+    elif tamper == "optimizer_betas":
+        payload["optimizer_state"]["param_groups"][0]["betas"] = (0.8, 0.9)
+    elif tamper == "optimizer_boolean_type":
+        payload["optimizer_state"]["param_groups"][0]["maximize"] = 0
+    elif tamper == "optimizer_missing_state_entry":
+        payload["optimizer_state"]["state"].pop(
+            next(iter(payload["optimizer_state"]["state"]))
+        )
+    elif tamper == "optimizer_state_keys":
+        first_state = next(iter(payload["optimizer_state"]["state"].values()))
+        first_state.pop("exp_avg")
+    elif tamper == "optimizer_state_tensor_shape":
+        first_state = next(iter(payload["optimizer_state"]["state"].values()))
+        first_state["exp_avg"] = torch.zeros(1)
+    elif tamper == "optimizer_step_type":
+        first_state = next(iter(payload["optimizer_state"]["state"].values()))
+        first_state["step"] = 1.0
+    elif tamper == "optimizer_step_shape":
+        first_state = next(iter(payload["optimizer_state"]["state"].values()))
+        first_state["step"] = torch.ones(1, dtype=first_state["step"].dtype)
+    elif tamper == "optimizer_step_dtype":
+        first_state = next(iter(payload["optimizer_state"]["state"].values()))
+        first_state["step"] = first_state["step"].to(torch.int64)
+    elif tamper == "optimizer_lr_only":
+        payload["optimizer_state"]["param_groups"][0]["lr"] = 0.123
+    elif tamper == "optimizer_and_scheduler_forged_lr":
+        payload["optimizer_state"]["param_groups"][0]["lr"] = 0.123
+        payload["scheduler_state"]["_last_lr"] = [0.123]
     elif tamper == "early_wait":
         payload["early_stopping"]["wait"] = 1
     elif tamper == "sampler_epoch":
