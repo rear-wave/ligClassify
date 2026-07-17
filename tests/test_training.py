@@ -330,6 +330,73 @@ def _resume_components(*, scheduler_epoch=1, best_epoch=1, wait=0):
     return model, optimizer, scheduler, scaler, early_stopping
 
 
+class _PartiallyUsedModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.used = nn.Linear(2, 1)
+        self.unused = nn.Linear(2, 1)
+
+    def forward(self, inputs):
+        return self.used(inputs)
+
+
+def test_exact_resume_accepts_recorded_partial_adamw_state(tmp_path):
+    model = _PartiallyUsedModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    model(torch.ones(2, 2)).sum().backward()
+    optimizer.step()
+    scheduler.step()
+    early_stopping = EarlyStoppingState()
+    early_stopping.update(0.75, epoch=1, model=model)
+    path = tmp_path / "last.pt"
+
+    save_last_state(
+        path,
+        epoch=1,
+        sampler_epoch=1,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        early_stopping=early_stopping,
+        split_hash="split",
+        config_hash="config",
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    declared_ids = payload["optimizer_state"]["param_groups"][0]["params"]
+
+    assert payload["optimizer_state_membership"] == sorted(
+        payload["optimizer_state"]["state"]
+    )
+    assert len(payload["optimizer_state_membership"]) == 2
+    assert len(payload["optimizer_state_membership"]) < len(declared_ids)
+
+    restored_model = _PartiallyUsedModel()
+    restored_optimizer = torch.optim.AdamW(
+        restored_model.parameters(), lr=0.01
+    )
+    restored_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        restored_optimizer, T_max=5
+    )
+    restored_scaler = torch.amp.GradScaler("cpu", enabled=False)
+    restored_early_stopping = EarlyStoppingState()
+
+    load_last_state(
+        path,
+        model=restored_model,
+        optimizer=restored_optimizer,
+        scheduler=restored_scheduler,
+        scaler=restored_scaler,
+        early_stopping=restored_early_stopping,
+        expected_split_hash="split",
+        expected_config_hash="config",
+    )
+
+    assert len(restored_optimizer.state) == 2
+
+
 def test_exact_resume_restores_full_training_and_rng_state(tmp_path):
     random.seed(17)
     np.random.seed(18)
@@ -473,7 +540,12 @@ def test_resume_stages_checkpoint_on_cpu_before_device_restoration(
         "optimizer_weight_decay",
         "optimizer_betas",
         "optimizer_boolean_type",
+        "optimizer_membership_missing",
+        "optimizer_membership_not_list",
+        "optimizer_membership_duplicate",
+        "optimizer_membership_outside",
         "optimizer_missing_state_entry",
+        "optimizer_added_state_entry",
         "optimizer_state_keys",
         "optimizer_state_tensor_shape",
         "optimizer_step_type",
@@ -531,10 +603,23 @@ def test_resume_rejects_incoherent_metadata_before_live_state_mutation(
         payload["optimizer_state"]["param_groups"][0]["betas"] = (0.8, 0.9)
     elif tamper == "optimizer_boolean_type":
         payload["optimizer_state"]["param_groups"][0]["maximize"] = 0
+    elif tamper == "optimizer_membership_missing":
+        payload.pop("optimizer_state_membership")
+    elif tamper == "optimizer_membership_not_list":
+        payload["optimizer_state_membership"] = {}
+    elif tamper == "optimizer_membership_duplicate":
+        payload["optimizer_state_membership"].append(
+            payload["optimizer_state_membership"][0]
+        )
+    elif tamper == "optimizer_membership_outside":
+        payload["optimizer_state_membership"] = [999]
     elif tamper == "optimizer_missing_state_entry":
         payload["optimizer_state"]["state"].pop(
             next(iter(payload["optimizer_state"]["state"]))
         )
+    elif tamper == "optimizer_added_state_entry":
+        first_state = next(iter(payload["optimizer_state"]["state"].values()))
+        payload["optimizer_state"]["state"][999] = copy.deepcopy(first_state)
     elif tamper == "optimizer_state_keys":
         first_state = next(iter(payload["optimizer_state"]["state"].values()))
         first_state.pop("exp_avg")

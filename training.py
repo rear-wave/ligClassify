@@ -237,12 +237,15 @@ def save_last_state(
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(f"{destination}.tmp")
+    optimizer_state = optimizer.state_dict()
+    optimizer_state_membership = sorted(optimizer_state["state"])
     payload: dict[str, Any] = {
         "schema": TRAINING_STATE_SCHEMA,
         "epoch": completed_epoch,
         "sampler_epoch": current_sampler_epoch,
         "model_state": _cpu_state_dict(model),
-        "optimizer_state": optimizer.state_dict(),
+        "optimizer_state": optimizer_state,
+        "optimizer_state_membership": optimizer_state_membership,
         "scheduler_state": scheduler.state_dict(),
         "scaler_state": scaler.state_dict(),
         "early_stopping": {
@@ -373,6 +376,7 @@ def _same_number(saved: object, current: object) -> bool:
 
 def _validate_optimizer_state(
     value: object,
+    membership: object,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scheduler_state: Mapping[str, Any],
@@ -520,7 +524,16 @@ def _validate_optimizer_state(
     if len(set(all_parameter_ids)) != len(all_parameter_ids):
         raise ValueError("resume configuration mismatch: optimizer parameters")
     parameter_id_set = set(all_parameter_ids)
-    if set(saved_state) != parameter_id_set:
+    if (
+        not isinstance(membership, list)
+        or any(type(parameter_id) is not int for parameter_id in membership)
+        or len(set(membership)) != len(membership)
+        or not set(membership).issubset(parameter_id_set)
+    ):
+        raise ValueError(
+            "resume configuration mismatch: optimizer state membership manifest"
+        )
+    if set(saved_state) != set(membership):
         raise ValueError(
             "resume configuration mismatch: optimizer state membership"
         )
@@ -592,6 +605,7 @@ def load_last_state(
         "sampler_epoch",
         "model_state",
         "optimizer_state",
+        "optimizer_state_membership",
         "scheduler_state",
         "scaler_state",
         "early_stopping",
@@ -641,6 +655,7 @@ def load_last_state(
     )
     optimizer_state = _validate_optimizer_state(
         payload["optimizer_state"],
+        payload["optimizer_state_membership"],
         optimizer,
         scheduler,
         scheduler_state,
