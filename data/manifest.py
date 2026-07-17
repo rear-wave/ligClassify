@@ -58,6 +58,11 @@ def piece_key(relative_path: str | os.PathLike[str], piece_index: int) -> str:
     return f"{normalized}#{int(piece_index)}"
 
 
+def _normalized_source_identity(relative_path: str) -> str:
+    normalized = os.path.normcase(os.path.normpath(relative_path))
+    return normalized.replace("\\", "/")
+
+
 def _parse_distance_bin(relative_path: str, type_name: str) -> int:
     if type_name == "IC":
         return -1
@@ -112,7 +117,8 @@ def build_piece_table(
     """Scan the five trusted type directories and expand files into pieces."""
     root_path = Path(root).resolve()
     discovered: list[tuple[int, str, Path]] = []
-    seen_paths: set[str] = set()
+    seen_source_paths: set[str] = set()
+    seen_identity_paths: set[str] = set()
     for type_index, type_name in enumerate(TYPE_NAMES):
         type_dir = root_path / type_name
         if not type_dir.is_dir():
@@ -120,9 +126,13 @@ def build_piece_table(
         for path in type_dir.rglob("*.lig"):
             relative_path = path.relative_to(root_path).as_posix()
             resolved_key = os.path.normcase(str(path.resolve()))
-            if resolved_key in seen_paths:
+            if resolved_key in seen_source_paths:
                 raise ValueError(f"duplicate source path: {relative_path}")
-            seen_paths.add(resolved_key)
+            identity_path = _normalized_source_identity(relative_path)
+            if identity_path in seen_identity_paths:
+                raise ValueError(f"duplicate source identity: {relative_path}")
+            seen_source_paths.add(resolved_key)
+            seen_identity_paths.add(identity_path)
             discovered.append((type_index, relative_path, path))
     discovered.sort(key=lambda item: (item[0], item[1]))
 
@@ -136,7 +146,6 @@ def build_piece_table(
     distance_arrays: list[np.ndarray] = []
     daylight_arrays: list[np.ndarray] = []
     timestamp_arrays: list[np.ndarray] = []
-    identities: set[str] = set()
 
     for type_index, relative_path, path in discovered:
         type_name = TYPE_NAMES[type_index]
@@ -155,12 +164,6 @@ def build_piece_table(
                 piece_count=piece_count,
             )
         )
-        for piece_index in range(piece_count):
-            identity = piece_key(relative_path, piece_index)
-            if identity in identities:
-                raise ValueError(f"duplicate piece identity: {identity}")
-            identities.add(identity)
-
         source_arrays.append(np.full(piece_count, source_position, dtype=np.int32))
         piece_arrays.append(np.arange(piece_count, dtype=np.int32))
         type_arrays.append(np.full(piece_count, type_index, dtype=np.int8))

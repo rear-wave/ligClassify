@@ -1,5 +1,6 @@
 import pytest
 
+import data.manifest as manifest
 from data.manifest import (
     DISTANCE_NAMES,
     TYPE_NAMES,
@@ -67,3 +68,21 @@ def test_manifest_allows_ic_without_distance_directory(tmp_path):
     assert table.distance_bin.tolist() == [-1, -1]
     assert table.daylight.tolist() == [True, False]
     assert diagnostics == {"files": 1, "pieces": 2}
+
+
+def test_manifest_does_not_materialize_piece_keys_while_building(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "NCG" / "day" / "0-100km" / "sample.lig"
+    source.parent.mkdir(parents=True)
+    write_source(source, [make_piece(1), make_piece(2)])
+
+    def fail_if_called(*_args):
+        raise AssertionError("piece keys must remain lazy")
+
+    monkeypatch.setattr(manifest, "piece_key", fail_if_called)
+
+    table, diagnostics = manifest.build_piece_table(tmp_path)
+
+    assert len(table) == 2
+    assert diagnostics["pieces"] == 2
