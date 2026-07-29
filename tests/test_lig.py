@@ -10,6 +10,7 @@ from data.lig import (
     WAVEFORM_SAMPLES,
     LigFileIndex,
     LigFormatError,
+    iter_lig_batches,
     read_file_header,
     read_lig_timestamp,
     read_raw_piece,
@@ -17,12 +18,20 @@ from data.lig import (
 )
 
 
-def make_piece(value, year=2020, month=1, day=2, hour=3):
-    raw = bytearray(PIECE_BYTES)
+def make_piece(
+    value,
+    year=2020,
+    month=1,
+    day=2,
+    hour=3,
+    piece_bytes=PIECE_BYTES,
+    waveform_offset=208,
+):
+    raw = bytearray(piece_bytes)
     struct.pack_into("<6i4x", raw, 108, year - 2000, month, day, hour, 4, 5)
     struct.pack_into("<d", raw, 136, 0.25)
     waveform = np.full(WAVEFORM_SAMPLES, value, dtype="<u2")
-    raw[208:208 + waveform.nbytes] = waveform.tobytes()
+    raw[waveform_offset:waveform_offset + waveform.nbytes] = waveform.tobytes()
     return bytes(raw)
 
 
@@ -47,6 +56,30 @@ def test_raw_piece_round_trip_is_byte_exact(tmp_path):
     assert struct.unpack_from("<i", output.read_bytes(), 4)[0] == 1
 
 
+def test_extended_header_layout_preserves_waveform_timestamp_and_raw_bytes(
+    tmp_path,
+):
+    source = tmp_path / "extended.lig"
+    piece = make_piece(
+        37,
+        hour=11,
+        piece_bytes=PIECE_BYTES + 256,
+        waveform_offset=208 + 256,
+    )
+    write_source(source, [piece])
+
+    with LigFileIndex([source], validate=True) as index:
+        assert np.all(index.read_piece(0) == 37)
+        assert index.read_timestamps_batch([0]) == [
+            datetime(2020, 1, 2, 11, 4, 5, 250000)
+        ]
+    assert read_raw_piece(source, 0) == piece
+
+    output = tmp_path / "extended-output.lig"
+    write_lig_file(output, source.read_bytes()[:FILE_HEADER_BYTES], [piece])
+    assert output.read_bytes()[FILE_HEADER_BYTES:] == piece
+
+
 def test_index_batch_reads_waveforms_and_piece_timestamps(tmp_path):
     first = tmp_path / "first.lig"
     second = tmp_path / "second.lig"
@@ -67,6 +100,34 @@ def test_index_batch_reads_waveforms_and_piece_timestamps(tmp_path):
     assert read_lig_timestamp(first, 0) == datetime(
         2020, 1, 2, 8, 4, 5, 250000
     )
+
+
+def test_timestamp_normalizes_bounded_fractional_second_overflow(tmp_path):
+    source = tmp_path / "overflow.lig"
+    piece = bytearray(make_piece(3, hour=8))
+    struct.pack_into("<d", piece, 136, 2.5195954)
+    write_source(source, [bytes(piece)])
+
+    assert read_lig_timestamp(source, 0) == datetime(
+        2020, 1, 2, 8, 4, 7, 519595
+    )
+
+
+def test_inference_batches_can_coerce_missing_timestamp(tmp_path):
+    source = tmp_path / "missing-time.lig"
+    piece = bytearray(make_piece(3, hour=8))
+    piece[108:136] = bytes(28)
+    write_source(source, [bytes(piece)])
+
+    batch = next(
+        iter_lig_batches(
+            source,
+            batch_size=1,
+            allow_invalid_timestamps=True,
+        )
+    )
+
+    assert batch[2] == [None]
 
 
 def test_validation_rejects_declared_piece_count_size_mismatch(tmp_path):

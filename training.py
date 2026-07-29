@@ -12,105 +12,14 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 import torch
+from tqdm import tqdm
+
+
 from torch import nn
 from torch.nn import functional as F
 
-from checkpoints import TRAINING_STATE_SCHEMA, validate_optimizer_resume_state
-from models import DISTANCE_BIN_COUNT, DISTANCE_EXPERT_COUNT, ModelOutput, TYPE_COUNT
-
-
-@dataclass(frozen=True)
-class JointLoss:
-    """Differentiable total loss with detached logging components."""
-
-    total: torch.Tensor
-    type_loss: float
-    distance_loss: float
-    distance_count: int
-
-
-def _validate_joint_shapes(
-    output: ModelOutput,
-    type_labels: torch.Tensor,
-    distance_bins: torch.Tensor,
-) -> None:
-    batch_size = len(type_labels)
-    if type_labels.ndim != 1 or distance_bins.ndim != 1:
-        raise ValueError("type_label and distance_bin must be one-dimensional")
-    if len(distance_bins) != batch_size:
-        raise ValueError("type_label and distance_bin batch sizes differ")
-    if tuple(output.type_logits.shape) != (batch_size, TYPE_COUNT):
-        raise ValueError("type_logits must have shape [batch, 5]")
-    if len(output.distance_logits) != DISTANCE_EXPERT_COUNT:
-        raise ValueError("exactly four distance experts are required")
-    if any(
-        tuple(logits.shape) != (batch_size, DISTANCE_BIN_COUNT)
-        for logits in output.distance_logits
-    ):
-        raise ValueError("distance logits must have shape [batch, 30]")
-
-
-def compute_joint_loss(
-    output: ModelOutput,
-    batch: Mapping[str, object],
-    distance_weight: float = 0.5,
-) -> JointLoss:
-    """Compute five-class CE and true-type-routed ordered distance loss."""
-    if not math.isfinite(float(distance_weight)) or float(distance_weight) < 0:
-        raise ValueError("distance_weight must be finite and non-negative")
-    if not isinstance(batch.get("type_label"), torch.Tensor) or not isinstance(
-        batch.get("distance_bin"), torch.Tensor
-    ):
-        raise TypeError("batch labels must be tensors")
-
-    device = output.type_logits.device
-    type_labels = batch["type_label"].to(device=device, dtype=torch.long)
-    distance_bins = batch["distance_bin"].to(device=device, dtype=torch.long)
-    _validate_joint_shapes(output, type_labels, distance_bins)
-
-    if torch.any((type_labels < 0) | (type_labels >= TYPE_COUNT)):
-        raise ValueError("type_label must be in the five-class range 0..4")
-    ic_mask = type_labels == 0
-    if torch.any(distance_bins[ic_mask] != -1):
-        raise ValueError("IC labels must use distance_bin -1")
-    non_ic_mask = ~ic_mask
-    if torch.any(
-        (distance_bins[non_ic_mask] < 0)
-        | (distance_bins[non_ic_mask] >= DISTANCE_BIN_COUNT)
-    ):
-        raise ValueError("non-IC labels must use a distance bin in 0..29")
-
-    type_loss_tensor = F.cross_entropy(output.type_logits, type_labels)
-    distance_count = int(non_ic_mask.sum().item())
-    if distance_count:
-        routed_chunks = []
-        target_chunks = []
-        for type_index in range(1, TYPE_COUNT):
-            selected = type_labels == type_index
-            if torch.any(selected):
-                routed_chunks.append(output.distance_logits[type_index - 1][selected])
-                target_chunks.append(distance_bins[selected])
-        routed_logits = torch.cat(routed_chunks, dim=0)
-        targets = torch.cat(target_chunks, dim=0)
-        categorical = F.cross_entropy(routed_logits, targets)
-        probabilities = routed_logits.softmax(dim=1)
-        predicted_cdf = probabilities.cumsum(dim=1)
-        target_cdf = (
-            torch.arange(DISTANCE_BIN_COUNT, device=device)[None, :]
-            >= targets[:, None]
-        ).to(routed_logits.dtype)
-        ordered = torch.abs(predicted_cdf - target_cdf).mean()
-        distance_loss_tensor = categorical + 0.2 * ordered
-    else:
-        distance_loss_tensor = output.type_logits.sum() * 0.0
-
-    total = type_loss_tensor + float(distance_weight) * distance_loss_tensor
-    return JointLoss(
-        total=total,
-        type_loss=float(type_loss_tensor.detach().item()),
-        distance_loss=float(distance_loss_tensor.detach().item()),
-        distance_count=distance_count,
-    )
+from checkpoints import TRAINING_STATE_SCHEMA
+from models import DISTANCE_BIN_COUNT, DISTANCE_NAMES
 
 
 def _move_training_batch(
@@ -125,57 +34,104 @@ def _move_training_batch(
     return moved
 
 
-def train_epoch(
+def distance_expert_loss(
+    logits: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    """Combine categorical and ordered losses for one distance expert."""
+    if logits.ndim != 2 or logits.shape[1] != DISTANCE_BIN_COUNT:
+        raise ValueError("distance logits must have shape [batch, 30]")
+    if targets.ndim != 1 or len(targets) != len(logits):
+        raise ValueError("distance targets must have shape [batch]")
+    if torch.any((targets < 0) | (targets >= DISTANCE_BIN_COUNT)):
+        raise ValueError("distance targets must be in 0..29")
+    categorical = F.cross_entropy(logits, targets)
+    probabilities = logits.softmax(dim=1)
+    predicted_cdf = probabilities.cumsum(dim=1)
+    target_cdf = (
+        torch.arange(DISTANCE_BIN_COUNT, device=logits.device)[None, :]
+        >= targets[:, None]
+    ).to(logits.dtype)
+    ordered = torch.abs(predicted_cdf - target_cdf).mean()
+    return categorical + 0.2 * ordered
+
+
+def train_role_epoch(
     model: nn.Module,
     loader: Iterable[Mapping[str, object]],
     optimizer: torch.optim.Optimizer,
     device: torch.device | str,
+    *,
+    role: str,
     scaler: torch.amp.GradScaler | None = None,
     amp: bool = True,
-    distance_weight: float = 0.5,
-) -> dict[str, float | int]:
-    """Train for one epoch using exactly one model forward per batch."""
+) -> dict[str, float | int | str]:
+    """Train exactly one independent type or distance role for one epoch."""
+    if role != "type" and role not in DISTANCE_NAMES:
+        raise ValueError(f"unknown training role: {role}")
     target_device = torch.device(device)
     amp_enabled = bool(amp and target_device.type == "cuda")
     if scaler is None:
         scaler = torch.amp.GradScaler(target_device.type, enabled=amp_enabled)
     model.train()
-
     sample_count = 0
-    distance_count = 0
-    type_sum = 0.0
-    distance_sum = 0.0
-    for raw_batch in loader:
+    loss_sum = 0.0
+    correct = 0
+    progress = tqdm(
+        loader,
+        desc=f"{role} Epoch",
+        dynamic_ncols=True,
+        unit="batch",
+        leave=True,
+    )
+    for raw_batch in progress:
         batch = _move_training_batch(raw_batch, target_device)
-        batch_size = int(batch["type_label"].shape[0])
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(
             device_type=target_device.type,
             enabled=amp_enabled,
         ):
-            output = model(batch["local"], batch["global"], batch["daylight"])
-            losses = compute_joint_loss(
-                output, batch, distance_weight=distance_weight
-            )
-        scaler.scale(losses.total).backward()
+            if role == "type":
+                logits, _ = model.forward_type(
+                    batch["local"], batch["global"], batch["daylight"]
+                )
+                targets = batch["type_label"].long()
+                loss = F.cross_entropy(logits, targets)
+            else:
+                expert_index = DISTANCE_NAMES.index(role)
+                expected_type = expert_index + 1
+                type_targets = batch["type_label"].long()
+                if torch.any(type_targets != expected_type):
+                    raise ValueError(
+                        f"{role} distance batches must contain only "
+                        f"type index {expected_type}"
+                    )
+                targets = batch["distance_bin"].long()
+                logits, _ = model.forward_distance_type(
+                    batch["local"],
+                    batch["global"],
+                    batch["daylight"],
+                    expert_index=expert_index,
+                )
+                loss = distance_expert_loss(logits, targets)
+        scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-
-        sample_count += batch_size
-        distance_count += losses.distance_count
-        type_sum += losses.type_loss * batch_size
-        distance_sum += losses.distance_loss * losses.distance_count
-
+        count = len(targets)
+        sample_count += count
+        loss_sum += float(loss.detach().item()) * count
+        correct += int(logits.detach().argmax(dim=1).eq(targets).sum().item())
+        progress.set_postfix(
+            loss=f"{loss_sum / sample_count:.4f}",
+            acc=f"{correct / sample_count:.4f}",
+            refresh=False,
+        )
     if sample_count == 0:
         raise ValueError("training loader produced no samples")
-    mean_type = type_sum / sample_count
-    mean_distance = distance_sum / distance_count if distance_count else 0.0
     return {
-        "loss": mean_type + float(distance_weight) * mean_distance,
-        "type_loss": mean_type,
-        "distance_loss": mean_distance,
+        "role": role,
+        "loss": loss_sum / sample_count,
+        "accuracy": correct / sample_count,
         "sample_count": sample_count,
-        "distance_count": distance_count,
     }
 
 
@@ -431,14 +387,17 @@ def load_last_state(
     scheduler_state = _validate_scheduler_state(
         payload["scheduler_state"], scheduler, optimizer, epoch
     )
-    optimizer_state = validate_optimizer_resume_state(
-        payload["optimizer_state"],
-        payload["optimizer_state_membership"],
-        optimizer,
-        scheduler,
-        scheduler_state,
-        epoch,
-    )
+    optimizer_state = payload["optimizer_state"]
+    membership = payload["optimizer_state_membership"]
+    if (
+        not isinstance(optimizer_state, Mapping)
+        or set(optimizer_state) != {"state", "param_groups"}
+        or not isinstance(optimizer_state["state"], Mapping)
+        or not isinstance(optimizer_state["param_groups"], list)
+        or not isinstance(membership, list)
+        or membership != sorted(optimizer_state["state"])
+    ):
+        raise ValueError("resume configuration mismatch: optimizer state")
     scaler_state = payload["scaler_state"]
     if not isinstance(scaler_state, Mapping):
         raise ValueError("resume configuration mismatch: scaler state")

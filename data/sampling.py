@@ -56,7 +56,7 @@ def _augmentation_seed(
 
 
 class FiveClassSampler:
-    """Sample type, daylight, then exact distance cells with replacement."""
+    """Sample type/daylight and optionally distance cells with replacement."""
 
     def __init__(
         self,
@@ -64,6 +64,7 @@ class FiveClassSampler:
         positions: Iterable[int],
         num_samples: int,
         seed: int,
+        balance_distance: bool = True,
     ) -> None:
         self.table = table
         raw_positions = tuple(positions)
@@ -80,6 +81,7 @@ class FiveClassSampler:
             raise ValueError("seed must be a non-negative integer")
         self.num_samples = int(num_samples)
         self.seed = int(seed)
+        self.balance_distance = bool(balance_distance)
         self.epoch = 1
 
         if self.num_samples <= 0:
@@ -99,13 +101,14 @@ class FiveClassSampler:
         for type_index, type_name in enumerate(TYPE_NAMES):
             if type_index not in available_types:
                 raise ValueError(f"missing required type: {type_name}")
-        for position in self.positions:
-            type_index = int(table.type_index[position])
-            distance_bin = int(table.distance_bin[position])
-            if type_index != 0 and not 0 <= distance_bin <= 29:
-                raise ValueError(
-                    f"distance_bin outside 0..29 at position {position}"
-                )
+        if self.balance_distance:
+            for position in self.positions:
+                type_index = int(table.type_index[position])
+                distance_bin = int(table.distance_bin[position])
+                if type_index != 0 and not 0 <= distance_bin <= 29:
+                    raise ValueError(
+                        f"distance_bin outside 0..29 at position {position}"
+                    )
 
     def __len__(self) -> int:
         return self.num_samples
@@ -143,7 +146,7 @@ class FiveClassSampler:
                     for position in type_positions
                     if bool(self.table.daylight[position]) == daylight
                 ]
-                if type_index == 0:
+                if type_index == 0 or not self.balance_distance:
                     leaves = [daylight_positions]
                 else:
                     distance_bins = sorted(
@@ -188,6 +191,124 @@ class FiveClassSampler:
             used_seeds.add(augmentation_seed)
             requests.append(SampleRequest(position, augmentation_seed))
 
+        rng = np.random.default_rng(
+            np.random.SeedSequence([self.seed, self.epoch, 0x53485546])
+        )
+        rng.shuffle(requests)
+        return iter(requests)
+
+
+class DistanceExpertSampler:
+    """Sample one non-IC type uniformly across observed distance/day cells."""
+
+    def __init__(
+        self,
+        table: PieceTable,
+        positions: Iterable[int],
+        type_index: int,
+        num_samples: int,
+        seed: int,
+    ) -> None:
+        if (
+            isinstance(type_index, bool)
+            or not isinstance(type_index, Integral)
+            or not 1 <= int(type_index) < len(TYPE_NAMES)
+        ):
+            raise ValueError("type_index must be an integer in 1..4")
+        raw_positions = tuple(positions)
+        if any(
+            isinstance(position, (bool, np.bool_))
+            or not isinstance(position, Integral)
+            for position in raw_positions
+        ):
+            raise ValueError("positions must contain integer table positions")
+        normalized = tuple(int(position) for position in raw_positions)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("positions must be unique")
+        if any(position < 0 or position >= len(table) for position in normalized):
+            raise ValueError("positions must reference the piece table")
+        if isinstance(num_samples, bool) or not isinstance(num_samples, Integral):
+            raise ValueError("num_samples must be a positive integer")
+        if isinstance(seed, bool) or not isinstance(seed, Integral):
+            raise ValueError("seed must be a non-negative integer")
+        if int(num_samples) <= 0:
+            raise ValueError("num_samples must be positive")
+        if int(seed) < 0:
+            raise ValueError("seed must be non-negative")
+
+        self.table = table
+        self.type_index = int(type_index)
+        self.positions = tuple(
+            position
+            for position in normalized
+            if int(table.type_index[position]) == self.type_index
+        )
+        if not self.positions:
+            raise ValueError(
+                f"no pieces available for distance type "
+                f"{TYPE_NAMES[self.type_index]}"
+            )
+        if any(
+            not 0 <= int(table.distance_bin[position]) <= 29
+            for position in self.positions
+        ):
+            raise ValueError("distance_bin must be in 0..29")
+        self.num_samples = int(num_samples)
+        self.seed = int(seed)
+        self.epoch = 1
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        """Select a positive epoch for deterministic independent draws."""
+        normalized = int(epoch)
+        if normalized != epoch or normalized <= 0:
+            raise ValueError("epoch must be a positive integer")
+        self.epoch = normalized
+
+    def _draw_positions(self) -> list[int]:
+        cells: dict[tuple[bool, int], list[int]] = {}
+        for position in self.positions:
+            key = (
+                bool(self.table.daylight[position]),
+                int(self.table.distance_bin[position]),
+            )
+            cells.setdefault(key, []).append(position)
+        ordered_cells = [cells[key] for key in sorted(cells)]
+        quotas = _largest_remainders(
+            self.num_samples, [1.0] * len(ordered_cells)
+        )
+        rng = np.random.default_rng(
+            np.random.SeedSequence([self.seed, self.epoch])
+        )
+        draws: list[int] = []
+        for cell, quota in zip(ordered_cells, quotas):
+            if quota:
+                selected = rng.choice(cell, size=quota, replace=True)
+                draws.extend(int(position) for position in selected)
+        return draws
+
+    def __iter__(self) -> Iterator[SampleRequest]:
+        positions = self._draw_positions()
+        requests: list[SampleRequest] = []
+        used_seeds: set[int] = set()
+        for draw_index, position in enumerate(positions):
+            attempt = 0
+            augmentation_seed = _augmentation_seed(
+                self.seed, self.epoch, draw_index, position
+            )
+            while augmentation_seed in used_seeds:
+                attempt += 1
+                augmentation_seed = _augmentation_seed(
+                    self.seed,
+                    self.epoch,
+                    draw_index,
+                    position,
+                    attempt,
+                )
+            used_seeds.add(augmentation_seed)
+            requests.append(SampleRequest(position, augmentation_seed))
         rng = np.random.default_rng(
             np.random.SeedSequence([self.seed, self.epoch, 0x53485546])
         )

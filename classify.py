@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+import math
 import os
-from collections import defaultdict
+import warnings
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,19 +21,20 @@ from checkpoints import (
     FIVE_CLASS_SCHEMA,
     LEGACY_FIVE_CLASS_SCHEMA,
     LoadedCheckpoint,
+    LoadedModelBundle,
+    MODEL_BUNDLE_SCHEMA,
+    forward_model_bundle,
+    load_model_bundle,
     load_model_checkpoint,
     model_sha256,
 )
-from data.lig import (
-    FILE_HEADER_BYTES,
-    MAX_PIECES_PER_FILE,
-    PIECE_BYTES,
-    LigFileIndex,
-    LigFormatError,
-    read_file_header,
-    write_lig_file,
+from data.lig import LigOutputRegrouper, iter_lig_batches, read_file_header
+from data.manifest import discover_date_inputs
+from data.preprocess import (
+    PreprocessConfig,
+    legacy_preprocess_batch,
+    preprocess_views,
 )
-from data.preprocess import PreprocessConfig, preprocess_views
 
 
 TYPE_NAMES = ("IC", "NCG", "NNBE", "PCG", "PNBE")
@@ -39,26 +42,12 @@ DISTANCE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
 DISTANCE_BINS_KM = tuple(range(0, 3000, 100))
 SUPPORTED_SCHEMAS = frozenset({FIVE_CLASS_SCHEMA, LEGACY_FIVE_CLASS_SCHEMA})
 
-PREDICTION_FIELDS = (
-    "source_path",
-    "piece_index",
-    "piece_key",
-    "final_type",
-    "prob_IC",
-    "prob_NCG",
-    "prob_NNBE",
-    "prob_PCG",
-    "prob_PNBE",
-    "type_confidence",
-    "distance_bin",
-    "distance_low_km",
-    "distance_high_km",
-    "expected_distance_km",
-    "distance_confidence",
-    "checkpoint_schema",
-    "model_sha256",
-    "output_file",
-)
+PREDICTION_FIELDS = tuple(
+    "source_path piece_index piece_key final_type prob_IC prob_NCG "
+    "prob_NNBE prob_PCG prob_PNBE type_confidence distance_bin "
+    "distance_low_km distance_high_km expected_distance_km "
+    "distance_confidence checkpoint_schema model_sha256 model_hashes "
+    "output_file".split())
 
 
 @dataclass(frozen=True)
@@ -115,7 +104,7 @@ def _decode_prediction(
     type_logits: torch.Tensor,
     distance_logits: Sequence[torch.Tensor],
     *,
-    type_only: bool,
+    type_only: bool = False,
 ) -> Prediction:
     if type_logits.ndim != 1 or type_logits.numel() != len(TYPE_NAMES):
         raise ValueError("type_logits must contain exactly five values")
@@ -127,8 +116,8 @@ def _decode_prediction(
     type_probabilities = tuple(
         float(value) for value in type_probabilities_tensor.cpu().tolist()
     )
-    final_type = TYPE_NAMES[type_index]
     type_confidence = type_probabilities[type_index]
+    final_type = TYPE_NAMES[type_index]
     if type_only or type_index == 0:
         return Prediction(
             final_type=final_type,
@@ -160,7 +149,8 @@ def _decode_prediction(
     return Prediction(
         final_type=final_type,
         output_class=(
-            f"{final_type}_{distance_low_km}-{distance_low_km + 100}km"
+            f"{final_type}/"
+            f"{distance_low_km:04d}-{distance_low_km + 100:04d}km"
         ),
         type_probabilities=type_probabilities,
         type_confidence=type_confidence,
@@ -170,81 +160,52 @@ def _decode_prediction(
     )
 
 
-def decode_new_prediction(
-    type_logits: torch.Tensor,
-    distance_logits: Sequence[torch.Tensor],
-    *,
-    type_only: bool = False,
-) -> Prediction:
-    """Decode direct five-class argmax and its routed new-model expert."""
-    return _decode_prediction(
-        type_logits, distance_logits, type_only=type_only
-    )
-
-
-def decode_legacy_prediction(
-    type_logits: torch.Tensor,
-    distance_logits: Sequence[torch.Tensor],
-    *,
-    type_only: bool = False,
-) -> Prediction:
-    """Decode the retained legacy model into the normalized contract."""
-    return _decode_prediction(
-        type_logits, distance_logits, type_only=type_only
-    )
-
-
-def _legacy_preprocess_batch(waveforms: np.ndarray) -> np.ndarray:
-    """Reproduce the retained model's filter/crop/min-max inference view."""
-    pieces = np.asarray(waveforms, dtype=np.float32)
-    if pieces.ndim != 2 or pieces.shape[1] == 0:
-        raise ValueError("waveforms must be a non-empty two-dimensional batch")
-    try:
-        from scipy.signal import butter, sosfiltfilt
-
-        sos = butter(
-            2,
-            120_000.0 / (5_000_000.0 / 2.0),
-            btype="low",
-            output="sos",
-        )
-        pieces = sosfiltfilt(sos, pieces, axis=-1).astype(np.float32)
-    except ImportError:  # pragma: no cover - SciPy is a runtime dependency
-        pass
-
-    target_length = 8000
-    before = 2000
-    source_length = pieces.shape[1]
-    peaks = np.argmax(pieces, axis=1).astype(np.int64)
-    begins = peaks - before
-    ends = peaks + 6000
-    before_source = begins < 0
-    begins[before_source] = 0
-    ends[before_source] = target_length
-    after_source = ends > source_length
-    ends[after_source] = source_length
-    begins[after_source] = ends[after_source] - target_length
-
-    cropped = np.empty((len(pieces), target_length), dtype=np.float32)
-    for row_index in range(len(pieces)):
-        segment = pieces[row_index, begins[row_index]:ends[row_index]]
-        length = len(segment)
-        cropped[row_index, :length] = segment[:target_length]
-        if length < target_length:
-            cropped[row_index, length:] = 0.0
-
-    minimum = cropped.min(axis=1, keepdims=True)
-    maximum = cropped.max(axis=1, keepdims=True)
-    mean = cropped.mean(axis=1, keepdims=True)
-    denominator = maximum - minimum
-    denominator[denominator < 1e-8] = 1.0
-    return ((cropped - mean) / denominator).astype(np.float32)
+decode_new_prediction = _decode_prediction
+decode_legacy_prediction = _decode_prediction
 
 
 def _is_daylight(timestamp: datetime) -> bool:
     """Match training's local UTC+8 daylight interval for each piece."""
     local_hour = (timestamp.hour + 8 + timestamp.minute / 60.0) % 24
     return 5.5 <= local_hour < 19.0
+
+
+def _daylight_inputs(
+    timestamps: Sequence[datetime | None],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Build known daylight values and two alternatives for missing times."""
+    missing = torch.tensor(
+        [timestamp is None for timestamp in timestamps],
+        dtype=torch.bool,
+        device=device,
+    )
+    primary = torch.tensor(
+        [
+            [0.0 if timestamp is None else float(_is_daylight(timestamp))]
+            for timestamp in timestamps
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    if not bool(missing.any()):
+        return primary, None, missing
+    alternate = primary.clone()
+    alternate[missing] = 1.0
+    return primary, alternate, missing
+
+
+def _average_unknown_logits(
+    primary: torch.Tensor,
+    alternate: torch.Tensor,
+    missing: torch.Tensor,
+) -> torch.Tensor:
+    """Average day/night probabilities only for missing timestamps."""
+    averaged = torch.logaddexp(
+        primary.log_softmax(dim=-1),
+        alternate.log_softmax(dim=-1),
+    ) - math.log(2.0)
+    return torch.where(missing.unsqueeze(1), averaged, primary)
 
 
 def _new_preprocess_config(checkpoint: LoadedCheckpoint) -> PreprocessConfig:
@@ -261,7 +222,7 @@ def _new_preprocess_config(checkpoint: LoadedCheckpoint) -> PreprocessConfig:
 def predict_batch(
     checkpoint: LoadedCheckpoint,
     waveforms: np.ndarray,
-    timestamps: Sequence[datetime],
+    timestamps: Sequence[datetime | None],
     *,
     device: torch.device,
     type_only: bool,
@@ -283,19 +244,64 @@ def predict_batch(
             )
             local_tensor = torch.from_numpy(local).unsqueeze(1).to(device)
             global_tensor = torch.from_numpy(global_view).unsqueeze(1).to(device)
-            daylight_tensor = torch.tensor(
-                [[float(_is_daylight(timestamp))] for timestamp in timestamps],
-                dtype=torch.float32,
-                device=device,
+            daylight_tensor, alternate_daylight, missing = _daylight_inputs(
+                timestamps,
+                device,
             )
-            output = checkpoint.model(
-                local_tensor, global_tensor, daylight_tensor
-            )
-            type_logits = output.type_logits
-            distance_logits = output.distance_logits
+            if type_only:
+                type_logits, _ = checkpoint.model.forward_type(
+                    local_tensor, global_tensor, daylight_tensor
+                )
+                if alternate_daylight is not None:
+                    alternate_logits, _ = checkpoint.model.forward_type(
+                        local_tensor,
+                        global_tensor,
+                        alternate_daylight,
+                    )
+                    type_logits = _average_unknown_logits(
+                        type_logits,
+                        alternate_logits,
+                        missing,
+                    )
+                distance_logits = tuple(
+                    type_logits.new_zeros((len(values), len(DISTANCE_BINS_KM)))
+                    for _ in DISTANCE_NAMES
+                )
+            else:
+                cascade = getattr(checkpoint.model, "predict_cascade", None)
+                run_model = checkpoint.model if cascade is None else cascade
+                output = run_model(
+                    local_tensor,
+                    global_tensor,
+                    daylight_tensor,
+                )
+                type_logits = output.type_logits
+                distance_logits = output.distance_logits
+                if alternate_daylight is not None:
+                    alternate_output = run_model(
+                        local_tensor,
+                        global_tensor,
+                        alternate_daylight,
+                    )
+                    type_logits = _average_unknown_logits(
+                        type_logits,
+                        alternate_output.type_logits,
+                        missing,
+                    )
+                    distance_logits = tuple(
+                        _average_unknown_logits(
+                            primary_head,
+                            alternate_head,
+                            missing,
+                        )
+                        for primary_head, alternate_head in zip(
+                            distance_logits,
+                            alternate_output.distance_logits,
+                        )
+                    )
             decoder = decode_new_prediction
         else:
-            legacy_values = _legacy_preprocess_batch(values)
+            legacy_values = legacy_preprocess_batch(values)
             legacy_tensor = torch.from_numpy(legacy_values).unsqueeze(1).to(device)
             type_logits, distance_logits = checkpoint.model(legacy_tensor)
             decoder = decode_legacy_prediction
@@ -316,76 +322,70 @@ def predict_batch(
     ]
 
 
-@dataclass
-class _OutputBuffer:
-    """One output file; its first piece deterministically owns the header."""
-
-    relative_path: str
-    source_header: bytes
-    raw_pieces: list[bytes] = field(default_factory=list)
-
-
-class _OutputRegrouper:
-    def __init__(self, output_dir: Path) -> None:
-        self.output_dir = output_dir
-        self._buffers: dict[str, _OutputBuffer] = {}
-        self._next_file = defaultdict(int)
-
-    def _new_buffer(self, output_class: str, source_header: bytes) -> _OutputBuffer:
-        self._next_file[output_class] += 1
-        filename = f"{output_class}_{self._next_file[output_class]:06d}.lig"
-        relative_path = (Path(output_class) / filename).as_posix()
-        buffer = _OutputBuffer(
-            relative_path=relative_path,
-            source_header=source_header,
+def predict_bundle_batch(
+    bundle: LoadedModelBundle,
+    waveforms: np.ndarray,
+    timestamps: Sequence[datetime | None],
+    *,
+    device: torch.device,
+    type_only: bool,
+) -> list[Prediction]:
+    """Run type inference first, then only the selected role checkpoints."""
+    values = np.asarray(waveforms, dtype=np.float32)
+    if values.ndim != 2 or not len(values):
+        raise ValueError("waveforms must be a non-empty two-dimensional batch")
+    if len(values) != len(timestamps):
+        raise ValueError("waveforms and timestamps must be aligned")
+    checkpoint = bundle.type_checkpoint
+    local, global_view = preprocess_views(
+        values, _new_preprocess_config(checkpoint)
+    )
+    local_tensor = torch.from_numpy(local).unsqueeze(1).to(device)
+    global_tensor = torch.from_numpy(global_view).unsqueeze(1).to(device)
+    daylight, alternate_daylight, missing = _daylight_inputs(
+        timestamps,
+        device,
+    )
+    with torch.inference_mode():
+        type_logits, heads = forward_model_bundle(
+            bundle,
+            local_tensor,
+            global_tensor,
+            daylight,
+            type_only=type_only,
         )
-        self._buffers[output_class] = buffer
-        return buffer
-
-    def add(self, output_class: str, source_header: bytes, raw_piece: bytes) -> str:
-        """Buffer one exact piece and return its already assigned output path."""
-        if len(raw_piece) != PIECE_BYTES:
-            raise LigFormatError("refusing to buffer a reconstructed piece")
-        buffer = self._buffers.get(output_class)
-        if buffer is None:
-            buffer = self._new_buffer(output_class, source_header)
-        buffer.raw_pieces.append(raw_piece)
-        relative_path = buffer.relative_path
-        if len(buffer.raw_pieces) == MAX_PIECES_PER_FILE:
-            self._flush(output_class)
-        return relative_path
-
-    def _flush(self, output_class: str) -> None:
-        buffer = self._buffers.pop(output_class, None)
-        if buffer is None or not buffer.raw_pieces:
-            return
-        destination = self.output_dir / Path(buffer.relative_path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        write_lig_file(destination, buffer.source_header, buffer.raw_pieces)
-
-    def flush_all(self) -> None:
-        """Flush partial files in deterministic class-name order."""
-        for output_class in sorted(tuple(self._buffers)):
-            self._flush(output_class)
-
-
-def _source_batches(
-    source_path: Path, batch_size: int
-):
-    """Yield bounded waveforms, timestamps, and complete raw pieces."""
-    with LigFileIndex([source_path], validate=True) as index, source_path.open(
-        "rb"
-    ) as raw_handle:
-        for start in range(0, len(index), batch_size):
-            stop = min(start + batch_size, len(index))
-            positions = range(start, stop)
-            waveforms = np.stack(index.read_pieces_batch(positions), axis=0)
-            timestamps = index.read_timestamps_batch(positions)
-            raw_handle.seek(FILE_HEADER_BYTES + start * PIECE_BYTES)
-            raw_pieces = [raw_handle.read(PIECE_BYTES) for _ in positions]
-            if any(len(raw) != PIECE_BYTES for raw in raw_pieces):
-                raise LigFormatError(f"short raw piece batch: {source_path}")
-            yield start, waveforms, timestamps, raw_pieces
+        if alternate_daylight is not None:
+            alternate_type_logits, alternate_heads = forward_model_bundle(
+                bundle,
+                local_tensor,
+                global_tensor,
+                alternate_daylight,
+                type_only=type_only,
+            )
+            type_logits = _average_unknown_logits(
+                type_logits,
+                alternate_type_logits,
+                missing,
+            )
+            heads = tuple(
+                _average_unknown_logits(
+                    primary_head,
+                    alternate_head,
+                    missing,
+                )
+                for primary_head, alternate_head in zip(
+                    heads,
+                    alternate_heads,
+                )
+            )
+    return [
+        decode_new_prediction(
+            type_logits[row],
+            [head[row] for head in heads],
+            type_only=type_only,
+        )
+        for row in range(len(values))
+    ]
 
 
 def _relative_lig_files(input_dir: Path) -> list[tuple[str, Path]]:
@@ -440,7 +440,8 @@ def _csv_row(
     prediction: Prediction,
     *,
     checkpoint_schema: str,
-    checkpoint_sha256: str,
+    checkpoint_sha256: str | None,
+    model_hashes: str | None,
     output_file: str,
 ) -> dict[str, object]:
     distance_low_km = (
@@ -462,6 +463,7 @@ def _csv_row(
         "distance_confidence": prediction.distance_confidence,
         "checkpoint_schema": checkpoint_schema,
         "model_sha256": checkpoint_sha256,
+        "model_hashes": model_hashes,
         "output_file": output_file,
     }
     row.update({
@@ -471,6 +473,66 @@ def _csv_row(
         )
     })
     return row
+
+
+def _classify_files(
+    files: Sequence[tuple[str, Path]],
+    destination_root: Path,
+    *,
+    batch_size: int,
+    predict: Any,
+    checkpoint_schema: str,
+    checkpoint_hash: str | None,
+    model_hashes: str | None = None,
+) -> Path:
+    if not files:
+        raise FileNotFoundError("no .lig files found in requested inputs")
+    destination_root.mkdir(parents=True, exist_ok=True)
+    csv_path = destination_root / "predictions.csv"
+    regrouper = LigOutputRegrouper(destination_root)
+    invalid_timestamp_count = 0
+    try:
+        with PredictionCsvWriter(csv_path) as writer:
+            for relative_source, source_path in files:
+                source_header = read_file_header(source_path)
+                for start, waveforms, timestamps, raw_pieces in iter_lig_batches(
+                    source_path,
+                    batch_size,
+                    allow_invalid_timestamps=True,
+                ):
+                    invalid_timestamp_count += sum(
+                        timestamp is None for timestamp in timestamps
+                    )
+                    predictions = predict(waveforms, timestamps)
+                    for offset, (raw_piece, prediction, timestamp) in enumerate(
+                        zip(raw_pieces, predictions, timestamps)
+                    ):
+                        output_file = regrouper.add(
+                            prediction.output_class,
+                            source_header,
+                            raw_piece,
+                            timestamp,
+                        )
+                        writer.write(_csv_row(
+                            relative_source,
+                            start + offset,
+                            prediction,
+                            checkpoint_schema=checkpoint_schema,
+                            checkpoint_sha256=checkpoint_hash,
+                            model_hashes=model_hashes,
+                            output_file=output_file,
+                        ))
+    finally:
+        regrouper.flush_all()
+    if invalid_timestamp_count:
+        warnings.warn(
+            f"{invalid_timestamp_count} waveform records have invalid "
+            "timestamps; predictions averaged day/night probabilities and "
+            "unknown output groups use GZ_unknown names",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return csv_path
 
 
 def classify_directory(
@@ -498,52 +560,84 @@ def classify_directory(
         raise ValueError(f"unsupported checkpoint schema: {checkpoint.schema!r}")
     checkpoint.model.eval()
     checkpoint_hash = model_sha256(checkpoint_path)
-    destination_root.mkdir(parents=True, exist_ok=True)
-    csv_path = destination_root / "predictions.csv"
-    regrouper = _OutputRegrouper(destination_root)
+    return _classify_files(
+        files,
+        destination_root,
+        batch_size=batch_size,
+        predict=lambda waveforms, timestamps: predict_batch(
+            checkpoint,
+            waveforms,
+            timestamps,
+            device=runtime_device,
+            type_only=type_only,
+        ),
+        checkpoint_schema=checkpoint.schema,
+        checkpoint_hash=checkpoint_hash,
+        model_hashes=None,
+    )
 
-    try:
-        with PredictionCsvWriter(csv_path) as writer:
-            for relative_source, source_path in files:
-                source_header = read_file_header(source_path)
-                for start, waveforms, timestamps, raw_pieces in _source_batches(
-                    source_path, batch_size
-                ):
-                    predictions = predict_batch(
-                        checkpoint,
-                        waveforms,
-                        timestamps,
-                        device=runtime_device,
-                        type_only=type_only,
-                    )
-                    for offset, (raw_piece, prediction) in enumerate(
-                        zip(raw_pieces, predictions)
-                    ):
-                        piece_index = start + offset
-                        output_file = regrouper.add(
-                            prediction.output_class, source_header, raw_piece
-                        )
-                        writer.write(_csv_row(
-                            relative_source,
-                            piece_index,
-                            prediction,
-                            checkpoint_schema=checkpoint.schema,
-                            checkpoint_sha256=checkpoint_hash,
-                            output_file=output_file,
-                        ))
-    finally:
-        regrouper.flush_all()
-    return csv_path
+
+def classify_date_range(
+    input_root: str | os.PathLike[str],
+    start_date: str,
+    end_date: str,
+    output_dir: str | os.PathLike[str],
+    model_dir: str | os.PathLike[str],
+    *,
+    batch_size: int = 256,
+    type_only: bool = False,
+    device: str | torch.device = "auto",
+) -> Path:
+    """Classify exact inclusive date directories with a five-role bundle."""
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    root = Path(input_root).expanduser().resolve()
+    destination = Path(output_dir).expanduser().resolve()
+    bundle_root = Path(model_dir).expanduser().resolve()
+    if destination.exists() and not destination.is_dir():
+        raise ValueError(f"output_dir is not a directory: {destination}")
+    if _path_contains(destination, root) or _path_contains(root, destination):
+        raise ValueError("input_root and output_dir must not contain each other")
+    date_paths = discover_date_inputs(root, start_date, end_date)
+    files = sorted(
+        (
+            source.relative_to(root).as_posix(),
+            source,
+        )
+        for date_path in date_paths
+        for source in date_path.rglob("*")
+        if source.is_file() and source.suffix.casefold() == ".lig"
+    )
+    runtime_device = _resolve_device(device)
+    bundle = load_model_bundle(bundle_root, runtime_device)
+    combined_hash = json.dumps(bundle.hashes, sort_keys=True)
+    return _classify_files(
+        files,
+        destination,
+        batch_size=batch_size,
+        predict=lambda waveforms, timestamps: predict_bundle_batch(
+            bundle,
+            waveforms,
+            timestamps,
+            device=runtime_device,
+            type_only=type_only,
+        ),
+        checkpoint_schema=MODEL_BUNDLE_SCHEMA,
+        checkpoint_hash=None,
+        model_hashes=combined_hash,
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build the compact two-schema inference command line."""
-    parser = argparse.ArgumentParser(
-        description="Classify LIG pieces with a five-class checkpoint."
-    )
-    parser.add_argument("--input_dir", required=True)
+    """Build single-directory and date-range inference modes."""
+    parser = argparse.ArgumentParser(description="Classify LIG pieces.")
+    parser.add_argument("--input_dir")
+    parser.add_argument("--input_root")
+    parser.add_argument("--start_date")
+    parser.add_argument("--end_date")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model")
+    parser.add_argument("--model_dir")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--type_only", action="store_true")
     parser.add_argument("--device", default="auto")
@@ -553,6 +647,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> Path:
     """Run the inference CLI and return the generated CSV path."""
     args = build_arg_parser().parse_args(argv)
+    single = args.input_dir is not None or args.model is not None
+    range_values = (args.input_root, args.start_date, args.end_date, args.model_dir)
+    ranged = any(value is not None for value in range_values)
+    if single == ranged:
+        raise ValueError(
+            "choose exactly one mode: --input_dir/--model or "
+            "--input_root/--start_date/--end_date/--model_dir"
+        )
+    if ranged:
+        if any(value is None for value in range_values):
+            raise ValueError("date-range mode requires all four range options")
+        return classify_date_range(
+            args.input_root,
+            args.start_date,
+            args.end_date,
+            args.output_dir,
+            args.model_dir,
+            batch_size=args.batch_size,
+            type_only=args.type_only,
+            device=args.device,
+        )
+    if args.input_dir is None or args.model is None:
+        raise ValueError("single mode requires --input_dir and --model")
     return classify_directory(
         args.input_dir,
         args.output_dir,

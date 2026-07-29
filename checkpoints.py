@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+import json
 import math
 from numbers import Real
 import os
@@ -23,6 +24,8 @@ LEGACY_FIVE_CLASS_SCHEMA = "legacy_five_class"
 TYPE_NAMES = ("IC", "NCG", "NNBE", "PCG", "PNBE")
 DISTANCE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
 DISTANCE_BINS_KM = tuple(range(0, 3000, 100))
+MODEL_BUNDLE_SCHEMA = "five_class_model_bundle_v1"
+BUNDLE_ROLES = ("type", *DISTANCE_NAMES)
 
 _NEW_REQUIRED_FIELDS = frozenset(
     {
@@ -71,6 +74,61 @@ class LoadedCheckpoint:
     distance_bins_km: tuple[int, ...]
     preprocess_config: Mapping[str, Any]
     metadata: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class LoadedModelBundle:
+    """Five independently initialized role checkpoints."""
+
+    type_checkpoint: LoadedCheckpoint
+    distance_checkpoints: tuple[LoadedCheckpoint, ...]
+    hashes: dict[str, str]
+
+
+def forward_model_bundle(
+    bundle: LoadedModelBundle,
+    local: torch.Tensor,
+    global_view: torch.Tensor,
+    daylight: torch.Tensor,
+    *,
+    type_only: bool = False,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    """Run type first and route rows to independent distance checkpoints."""
+    models = (
+        bundle.type_checkpoint.model,
+        *(item.model for item in bundle.distance_checkpoints),
+    )
+    for model in models:
+        model.eval()
+    type_logits, _ = models[0].forward_type(local, global_view, daylight)
+    if tuple(type_logits.shape) != (len(local), len(TYPE_NAMES)):
+        raise ValueError("type model returned malformed logits")
+    predicted = type_logits.argmax(dim=1)
+    heads = [
+        type_logits.new_zeros((len(local), len(DISTANCE_BINS_KM)))
+        for _ in DISTANCE_NAMES
+    ]
+    if type_only:
+        return type_logits, tuple(heads)
+    for type_index, checkpoint in enumerate(
+        bundle.distance_checkpoints, start=1
+    ):
+        selected = predicted == type_index
+        if not torch.any(selected):
+            continue
+        distance_logits, _ = checkpoint.model.forward_distance_type(
+            local[selected],
+            global_view[selected],
+            daylight[selected],
+            expert_index=type_index - 1,
+        )
+        expected = (int(selected.sum().item()), len(DISTANCE_BINS_KM))
+        if tuple(distance_logits.shape) != expected:
+            raise ValueError(
+                f"{TYPE_NAMES[type_index]} model returned malformed logits"
+            )
+        heads[type_index - 1][selected] = distance_logits
+    return type_logits, tuple(heads)
 
 
 def _load_payload(path: os.PathLike[str] | str, device: torch.device | str):
@@ -338,227 +396,164 @@ def save_model_checkpoint(
             temporary.unlink()
 
 
-def _same_number(saved: object, current: object) -> bool:
-    return (
-        not isinstance(saved, bool)
-        and isinstance(saved, Real)
-        and not isinstance(current, bool)
-        and isinstance(current, Real)
-        and math.isfinite(float(saved))
-        and math.isclose(
-            float(saved), float(current), rel_tol=1e-12, abs_tol=1e-15
-        )
-    )
-
-
-def validate_optimizer_resume_state(
-    value: object,
-    membership: object,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    scheduler_state: Mapping[str, Any],
-    epoch: int,
-) -> dict[str, Any]:
-    """Validate optimizer state before exact same-run restoration."""
-    if not isinstance(value, Mapping) or set(value) != {
-        "state",
-        "param_groups",
-    }:
-        raise ValueError("resume configuration mismatch: optimizer state")
-    saved_state = value["state"]
-    saved_groups = value["param_groups"]
-    current_state = optimizer.state_dict()
-    current_groups = current_state["param_groups"]
-    if not isinstance(saved_state, Mapping) or not isinstance(saved_groups, list):
-        raise ValueError("resume configuration mismatch: optimizer structure")
-    if len(saved_groups) != len(current_groups):
-        raise ValueError("resume configuration mismatch: optimizer groups")
-
-    scheduler_base_lrs = scheduler_state["base_lrs"]
-    scheduler_last_lrs = scheduler_state["_last_lr"]
-    all_parameter_ids: list[int] = []
-    parameter_by_id: dict[int, torch.Tensor] = {}
-    amsgrad_by_id: dict[int, bool] = {}
-    step_dtype_by_id: dict[int, torch.dtype] = {}
-    step_device_by_id: dict[int, torch.device] = {}
-    immutable_fields = (
-        "weight_decay",
-        "betas",
-        "eps",
-        "amsgrad",
-        "maximize",
-        "foreach",
-        "capturable",
-        "differentiable",
-        "fused",
-    )
-    for index, (saved_group, current_group) in enumerate(
-        zip(saved_groups, current_groups)
-    ):
-        if not isinstance(saved_group, Mapping):
-            raise ValueError(
-                "resume configuration mismatch: optimizer group structure"
-            )
-        if set(saved_group) != set(current_group):
-            raise ValueError("resume configuration mismatch: optimizer group keys")
-        saved_parameters = saved_group.get("params")
-        current_parameters = current_group["params"]
-        if (
-            not isinstance(saved_parameters, list)
-            or saved_parameters != current_parameters
-            or any(type(parameter_id) is not int for parameter_id in saved_parameters)
-        ):
-            raise ValueError(
-                "resume configuration mismatch: optimizer parameter membership"
-            )
-        all_parameter_ids.extend(saved_parameters)
-        live_parameters = optimizer.param_groups[index]["params"]
-        if len(live_parameters) != len(saved_parameters):
-            raise ValueError(
-                "resume configuration mismatch: optimizer parameter count"
-            )
-        parameter_by_id.update(zip(saved_parameters, live_parameters))
-        amsgrad_by_id.update(
-            (parameter_id, bool(current_group["amsgrad"]))
-            for parameter_id in saved_parameters
-        )
-        fused = bool(current_group.get("fused", False))
-        step_dtype = (
-            torch.float64
-            if torch.get_default_dtype() == torch.float64 and not fused
-            else torch.float32
-        )
-        for parameter_id in saved_parameters:
-            step_dtype_by_id[parameter_id] = step_dtype
-            step_device_by_id[parameter_id] = torch.device("cpu")
-
-        for field in immutable_fields:
-            if field not in current_group:
-                continue
-            saved_option = saved_group[field]
-            current_option = current_group[field]
-            if isinstance(current_option, bool):
-                same_option = (
-                    type(saved_option) is bool and saved_option == current_option
-                )
-            elif current_option is None:
-                same_option = saved_option is None
-            else:
-                same_option = saved_option == current_option
-            if not same_option:
-                raise ValueError(
-                    f"resume configuration mismatch: optimizer {field}"
-                )
-        betas = saved_group["betas"]
-        if (
-            not isinstance(betas, (list, tuple))
-            or len(betas) != 2
-            or not all(
-                _same_number(saved, current)
-                for saved, current in zip(betas, current_group["betas"])
-            )
-        ):
-            raise ValueError("resume configuration mismatch: optimizer betas")
-        for field in ("weight_decay", "eps"):
-            if not _same_number(saved_group[field], current_group[field]):
-                raise ValueError(
-                    f"resume configuration mismatch: optimizer {field}"
-                )
-
-        if "initial_lr" in current_group:
-            if (
-                "initial_lr" not in saved_group
-                or not _same_number(
-                    saved_group["initial_lr"], current_group["initial_lr"]
-                )
-                or not _same_number(
-                    saved_group["initial_lr"], scheduler_base_lrs[index]
-                )
-            ):
-                raise ValueError(
-                    "resume configuration mismatch: optimizer initial lr"
-                )
-        saved_lr = saved_group.get("lr")
-        if (
-            not _same_number(saved_lr, scheduler_last_lrs[index])
-            or float(saved_lr) < 0.0
-        ):
-            raise ValueError("resume configuration mismatch: optimizer current lr")
-
-        if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
-            base_lr = float(scheduler_base_lrs[index])
-            eta_min = float(scheduler_state["eta_min"])
-            t_max = int(scheduler_state["T_max"])
-            expected_lr = eta_min + (base_lr - eta_min) * (
-                1.0 + math.cos(math.pi * epoch / t_max)
-            ) / 2.0
-            if not math.isclose(
-                float(saved_lr), expected_lr, rel_tol=1e-10, abs_tol=1e-12
-            ):
-                raise ValueError(
-                    "resume configuration mismatch: cosine learning rate"
-                )
-
-    if len(set(all_parameter_ids)) != len(all_parameter_ids):
-        raise ValueError("resume configuration mismatch: optimizer parameters")
-    parameter_id_set = set(all_parameter_ids)
-    if (
-        not isinstance(membership, list)
-        or any(type(parameter_id) is not int for parameter_id in membership)
-        or len(set(membership)) != len(membership)
-        or not set(membership).issubset(parameter_id_set)
-    ):
+def _bundle_role_paths(
+    root: Path, role_paths: Mapping[str, os.PathLike[str] | str]
+) -> dict[str, Path]:
+    if set(role_paths) != set(BUNDLE_ROLES):
         raise ValueError(
-            "resume configuration mismatch: optimizer state membership manifest"
+            f"bundle roles must be exactly {BUNDLE_ROLES}; "
+            "missing or extra roles were provided"
         )
-    if set(saved_state) != set(membership):
-        raise ValueError(
-            "resume configuration mismatch: optimizer state membership"
-        )
-    for parameter_id, state in saved_state.items():
-        if type(parameter_id) is not int or parameter_id not in parameter_id_set:
-            raise ValueError(
-                "resume configuration mismatch: optimizer state membership"
-            )
-        if not isinstance(state, Mapping):
-            raise ValueError(
-                "resume configuration mismatch: optimizer parameter state"
-            )
-        expected_keys = {"step", "exp_avg", "exp_avg_sq"}
-        if amsgrad_by_id[parameter_id]:
-            expected_keys.add("max_exp_avg_sq")
-        if set(state) != expected_keys:
-            raise ValueError(
-                "resume configuration mismatch: optimizer parameter state keys"
-            )
-        step = state["step"]
+    resolved_root = root.resolve()
+    normalized: dict[str, Path] = {}
+    for role in BUNDLE_ROLES:
+        path = Path(role_paths[role]).resolve()
+        try:
+            path.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ValueError("bundle model paths must stay below model_dir") from exc
+        if not path.is_file():
+            raise ValueError(f"bundle role {role} model is missing: {path}")
+        normalized[role] = path
+    return normalized
+
+
+def save_model_bundle(
+    model_dir: os.PathLike[str] | str,
+    role_paths: Mapping[str, os.PathLike[str] | str],
+    *,
+    preprocess_config: Mapping[str, Any],
+) -> Path:
+    """Validate five role checkpoints and atomically write ``bundle.json``."""
+    root = Path(model_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    paths = _bundle_role_paths(root, role_paths)
+    preprocess = _new_preprocess_config(preprocess_config)
+    roles: dict[str, dict[str, str]] = {}
+    split_hashes: set[str] = set()
+    for role, path in paths.items():
+        checkpoint = load_model_checkpoint(path, "cpu")
+        training = checkpoint.metadata.get("training_config")
+        split_hash = checkpoint.metadata.get("split_hash")
         if (
-            not isinstance(step, torch.Tensor)
-            or step.shape != torch.Size([])
-            or step.dtype != step_dtype_by_id[parameter_id]
-            or step.device != step_device_by_id[parameter_id]
-            or not bool(torch.isfinite(step).item())
-            or float(step.item()) < 1.0
+            checkpoint.schema != FIVE_CLASS_SCHEMA
+            or checkpoint.preprocess_config != preprocess
+            or not isinstance(training, Mapping)
+            or training.get("role") != role
+            or not isinstance(split_hash, str)
+            or not split_hash
         ):
-            raise ValueError(
-                "resume configuration mismatch: optimizer step state"
-            )
-        parameter = parameter_by_id[parameter_id]
-        moment_names = {"exp_avg", "exp_avg_sq"}
-        if amsgrad_by_id[parameter_id]:
-            moment_names.add("max_exp_avg_sq")
-        for name in moment_names:
-            moment = state[name]
-            if (
-                not isinstance(moment, torch.Tensor)
-                or moment.shape != parameter.shape
-                or moment.dtype != parameter.dtype
-                or not bool(torch.isfinite(moment).all().item())
-            ):
-                raise ValueError(
-                    f"resume configuration mismatch: optimizer {name} state"
-                )
-    return {"state": dict(saved_state), "param_groups": list(saved_groups)}
+            raise ValueError(f"bundle role {role} checkpoint is incompatible")
+        split_hashes.add(split_hash)
+        roles[role] = {
+            "path": path.relative_to(root.resolve()).as_posix(),
+            "sha256": model_sha256(path),
+        }
+    if len(split_hashes) != 1:
+        raise ValueError("bundle role checkpoints use different split hashes")
+    payload = {
+        "schema": MODEL_BUNDLE_SCHEMA,
+        "roles": roles,
+        "type_names": list(TYPE_NAMES),
+        "distance_names": list(DISTANCE_NAMES),
+        "distance_bins_km": list(DISTANCE_BINS_KM),
+        "preprocess_config": dict(preprocess),
+        "split_hash": split_hashes.pop(),
+    }
+    destination = root / "bundle.json"
+    temporary = Path(f"{destination}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return destination
+
+
+def load_model_bundle(
+    model_dir: os.PathLike[str] | str,
+    device: torch.device | str = "cpu",
+) -> LoadedModelBundle:
+    """Load and cross-check a five-role model bundle."""
+    root = Path(model_dir).resolve()
+    manifest_path = root / "bundle.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"model bundle manifest is missing: {manifest_path}")
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("model bundle manifest is invalid") from exc
+    required = {
+        "schema",
+        "roles",
+        "type_names",
+        "distance_names",
+        "distance_bins_km",
+        "preprocess_config",
+        "split_hash",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != required:
+        raise ValueError("model bundle manifest fields are invalid")
+    if payload["schema"] != MODEL_BUNDLE_SCHEMA:
+        raise ValueError("model bundle schema is invalid")
+    _ordered_names(payload["type_names"], TYPE_NAMES, "bundle type")
+    _ordered_names(
+        payload["distance_names"], DISTANCE_NAMES, "bundle distance-name"
+    )
+    _distance_bins(payload["distance_bins_km"])
+    preprocess = _new_preprocess_config(payload["preprocess_config"])
+    split_hash = payload["split_hash"]
+    if not isinstance(split_hash, str) or not split_hash:
+        raise ValueError("model bundle split hash is invalid")
+    roles = _mapping(payload["roles"], "bundle roles")
+    if set(roles) != set(BUNDLE_ROLES):
+        raise ValueError("model bundle roles are invalid")
+    loaded: dict[str, LoadedCheckpoint] = {}
+    hashes: dict[str, str] = {}
+    for role in BUNDLE_ROLES:
+        entry = _mapping(roles[role], f"bundle role {role}")
+        if set(entry) != {"path", "sha256"}:
+            raise ValueError(f"model bundle role {role} fields are invalid")
+        relative = entry["path"]
+        expected_hash = entry["sha256"]
+        if (
+            not isinstance(relative, str)
+            or not isinstance(expected_hash, str)
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+        ):
+            raise ValueError(f"model bundle role {role} path is invalid")
+        path = (root / Path(relative)).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("model bundle path escapes model_dir") from exc
+        if not path.is_file():
+            raise ValueError(f"model bundle role {role} model is missing")
+        actual_hash = model_sha256(path)
+        if actual_hash != expected_hash:
+            raise ValueError(f"model bundle role {role} hash mismatch")
+        checkpoint = load_model_checkpoint(path, device)
+        training = checkpoint.metadata.get("training_config")
+        if (
+            checkpoint.schema != FIVE_CLASS_SCHEMA
+            or checkpoint.preprocess_config != preprocess
+            or not isinstance(training, Mapping)
+            or training.get("role") != role
+            or checkpoint.metadata.get("split_hash") != split_hash
+        ):
+            raise ValueError(f"model bundle role {role} is incompatible")
+        loaded[role] = checkpoint
+        hashes[role] = actual_hash
+    return LoadedModelBundle(
+        type_checkpoint=loaded["type"],
+        distance_checkpoints=tuple(loaded[name] for name in DISTANCE_NAMES),
+        hashes=hashes,
+    )
 
 
 def model_sha256(path: os.PathLike[str] | str) -> str:

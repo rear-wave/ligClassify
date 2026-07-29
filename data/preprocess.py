@@ -181,3 +181,43 @@ def preprocess_views(
     local = _local_view(signed_source, config.local_length)
     global_view = _global_view(signed_source, config.global_length)
     return _robust_normalize(local), _robust_normalize(global_view)
+
+
+def legacy_preprocess_batch(values: np.ndarray) -> np.ndarray:
+    """Reproduce the retained model's historical 8000-point input view."""
+    pieces = np.asarray(values, dtype=np.float32)
+    if pieces.ndim != 2 or pieces.shape[1] == 0:
+        raise ValueError("waveforms must be a non-empty two-dimensional batch")
+    try:
+        from scipy.signal import butter, sosfiltfilt
+
+        sos = butter(
+            2,
+            120_000.0 / (5_000_000.0 / 2.0),
+            btype="low",
+            output="sos",
+        )
+        pieces = sosfiltfilt(sos, pieces, axis=-1).astype(np.float32)
+    except ImportError:  # pragma: no cover - SciPy is a runtime dependency
+        pass
+    target_length = 8000
+    peaks = np.argmax(pieces, axis=1).astype(np.int64)
+    begins = peaks - 2000
+    ends = peaks + 6000
+    before_source = begins < 0
+    begins[before_source] = 0
+    ends[before_source] = target_length
+    after_source = ends > pieces.shape[1]
+    ends[after_source] = pieces.shape[1]
+    begins[after_source] = ends[after_source] - target_length
+    cropped = np.zeros((len(pieces), target_length), dtype=np.float32)
+    for row, (begin, end) in enumerate(zip(begins, ends)):
+        segment = pieces[row, begin:end][:target_length]
+        cropped[row, :len(segment)] = segment
+    denominator = cropped.max(axis=1, keepdims=True) - cropped.min(
+        axis=1, keepdims=True
+    )
+    denominator[denominator < 1e-8] = 1.0
+    return (
+        (cropped - cropped.mean(axis=1, keepdims=True)) / denominator
+    ).astype(np.float32)

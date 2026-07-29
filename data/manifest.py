@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +18,37 @@ DISTANCE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
 
 _DISTANCE_RE = re.compile(r"(?<!\d)(\d{1,4})[-_](\d{1,4})km", re.IGNORECASE)
 _EPOCH = datetime(1970, 1, 1)
+
+
+def discover_date_inputs(
+    input_root: str | os.PathLike[str],
+    start_date: str,
+    end_date: str,
+) -> list[Path]:
+    """Resolve exact inclusive ``GZ_YYYYMMDD`` directories, never Index."""
+    root = Path(input_root).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"input_root is not a directory: {root}")
+    try:
+        start = datetime.strptime(start_date, "%Y%m%d").date()
+        end = datetime.strptime(end_date, "%Y%m%d").date()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("dates must use YYYYMMDD") from exc
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    dates = [
+        start + timedelta(days=offset)
+        for offset in range((end - start).days + 1)
+    ]
+    paths = [root / f"GZ_{value:%Y%m%d}" for value in dates]
+    missing = [
+        value.strftime("%Y%m%d")
+        for value, path in zip(dates, paths)
+        if not path.is_dir()
+    ]
+    if missing:
+        raise ValueError(f"missing requested date directories: {missing}")
+    return paths
 
 
 @dataclass(frozen=True)
@@ -113,6 +144,8 @@ def _empty_piece_table(root: Path) -> PieceTable:
 
 def build_piece_table(
     root: str | os.PathLike[str],
+    *,
+    require_distance: bool = True,
 ) -> tuple[PieceTable, dict[str, int]]:
     """Scan the five trusted type directories and expand files into pieces."""
     root_path = Path(root).resolve()
@@ -149,7 +182,11 @@ def build_piece_table(
 
     for type_index, relative_path, path in discovered:
         type_name = TYPE_NAMES[type_index]
-        distance_bin = _parse_distance_bin(relative_path, type_name)
+        distance_bin = (
+            _parse_distance_bin(relative_path, type_name)
+            if require_distance
+            else -1
+        )
         with LigFileIndex([path], validate=True) as index:
             piece_count = len(index)
             timestamps = index.read_timestamps_batch(range(piece_count))

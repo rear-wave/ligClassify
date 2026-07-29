@@ -125,6 +125,24 @@ def test_ic_ignores_distance_and_non_ic_uses_exact_distance_strata(piece_table):
     assert len(artifact["strata"]) == 10
 
 
+def test_classification_only_split_strata_do_not_include_distance(piece_table):
+    classification_table = _reorder_table(
+        piece_table, np.arange(len(piece_table))
+    )
+    classification_table.distance_bin[:] = -1
+
+    assignment = assign_piece_splits(classification_table, seed=42)
+    validate_piece_split(classification_table, assignment)
+    artifact = split_artifact(classification_table, assignment)
+
+    assert all("km" not in name for name in artifact["strata"])
+    assert set(artifact["strata"]) == {
+        f"{type_name}|{daylight}"
+        for type_name in ("IC", "NCG", "NNBE", "PCG", "PNBE")
+        for daylight in ("day", "night")
+    }
+
+
 def test_two_piece_stratum_is_train_only_and_reported(single_stratum_table):
     tiny = _reorder_table(single_stratum_table, [0, 1])
 

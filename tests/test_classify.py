@@ -1,4 +1,5 @@
 import csv
+import csv
 import hashlib
 import struct
 from datetime import datetime
@@ -10,7 +11,7 @@ import torch
 from torch import nn
 
 import classify
-from checkpoints import LoadedCheckpoint
+from checkpoints import LoadedCheckpoint, LoadedModelBundle
 from data.lig import (
     FILE_HEADER_BYTES,
     MAX_PIECES_PER_FILE,
@@ -111,6 +112,33 @@ class ConstantNewModel(nn.Module):
             features=torch.zeros(count, 1, device=local.device),
         )
 
+    def forward_type(self, local, global_view, daylight):
+        output = self.forward(local, global_view, daylight)
+        return output.type_logits, output.features
+
+    def forward_distance(self, local, global_view, daylight):
+        output = self.forward(local, global_view, daylight)
+        return output.distance_logits, output.features
+
+    def forward_distance_type(
+        self, local, global_view, daylight, *, expert_index
+    ):
+        heads, features = self.forward_distance(local, global_view, daylight)
+        return heads[expert_index], features
+
+
+class TypeOnlyNewModel(nn.Module):
+    def forward_type(self, local, global_view, daylight):
+        logits = torch.zeros(len(local), 5, device=local.device)
+        logits[:, 1] = 3.0
+        return logits, torch.zeros(len(local), 1, device=local.device)
+
+    def forward(self, *_args):
+        raise AssertionError("type-only inference must not run the full model")
+
+    def predict_cascade(self, *_args):
+        raise AssertionError("type-only inference must not run distance routing")
+
 
 class RecordingLegacyModel(nn.Module):
     def __init__(self, type_index: int = 1, distance_bin: int = 3):
@@ -180,7 +208,7 @@ def test_non_ic_uses_matching_distance_expert():
 
     assert prediction.final_type == "NNBE"
     assert prediction.distance_bin == 5
-    assert prediction.output_class == "NNBE_500-600km"
+    assert prediction.output_class == "NNBE/0500-0600km"
     probabilities = torch.softmax(heads[1], dim=0)
     centers = torch.arange(50.0, 3050.0, 100.0)
     assert prediction.expected_distance_km == pytest.approx(
@@ -200,7 +228,7 @@ def test_legacy_decode_uses_the_same_direct_prediction_contract():
     assert isinstance(prediction, classify.Prediction)
     assert prediction.final_type == "PNBE"
     assert prediction.distance_bin == 29
-    assert prediction.output_class == "PNBE_2900-3000km"
+    assert prediction.output_class == "PNBE/2900-3000km"
 
 
 def test_type_only_has_type_directory_and_no_distance_values():
@@ -234,6 +262,18 @@ def test_new_adapter_uses_signed_views_and_each_piece_timestamp():
 
     assert [item.final_type for item in predictions] == ["IC", "IC"]
     assert model.daylight_batches[0].flatten().tolist() == [1.0, 0.0]
+
+
+def test_new_type_only_adapter_skips_distance_routing():
+    predictions = classify.predict_batch(
+        loaded_new(TypeOnlyNewModel()),
+        np.zeros((2, WAVEFORM_SAMPLES), dtype=np.float32),
+        [datetime(2020, 1, 2), datetime(2020, 1, 3)],
+        device=torch.device("cpu"),
+        type_only=True,
+    )
+
+    assert [item.final_type for item in predictions] == ["NCG", "NCG"]
 
 
 def test_legacy_adapter_matches_retained_8000_point_minmax_preprocessing():
@@ -292,6 +332,9 @@ def test_classification_preserves_bytes_and_writes_exact_csv_contract(
     assert row["prob_NNBE"] != ""
     assert row["checkpoint_schema"] == "five_class_v1"
     assert row["model_sha256"] == expected_hash
+    assert row["output_file"] == (
+        "NNBE/0500-0600km/GZ_20200102000405.lig"
+    )
 
     output_file = output_dir / Path(row["output_file"])
     written = output_file.read_bytes()
@@ -301,6 +344,44 @@ def test_classification_preserves_bytes_and_writes_exact_csv_contract(
     assert written_header == expected_header
     assert written[FILE_HEADER_BYTES:FILE_HEADER_BYTES + PIECE_BYTES] == pieces[0]
     assert written[FILE_HEADER_BYTES + PIECE_BYTES:] == pieces[1]
+
+
+def test_classification_preserves_piece_with_missing_timestamp(
+    tmp_path, monkeypatch
+):
+    input_dir = tmp_path / "input"
+    piece = bytearray(make_piece(11, hour=0, marker=31))
+    piece[108:136] = bytes(28)
+    source = input_dir / "incoming" / "GZ_000000000000.0128000.lig"
+    write_source(source, [bytes(piece)], marker=43)
+    output_dir = tmp_path / "output"
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"synthetic-checkpoint")
+    model = ConstantNewModel(type_index=2)
+    monkeypatch.setattr(
+        classify,
+        "load_model_checkpoint",
+        lambda *_: loaded_new(model),
+    )
+
+    with pytest.warns(RuntimeWarning, match="invalid timestamps"):
+        csv_path = classify.classify_directory(
+            input_dir,
+            output_dir,
+            model_path,
+            batch_size=1,
+            type_only=True,
+            device="cpu",
+        )
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    output_file = output_dir / Path(row["output_file"])
+    assert output_file.name == "GZ_unknown.lig"
+    assert output_file.read_bytes()[FILE_HEADER_BYTES:] == bytes(piece)
+    assert [
+        batch.flatten().tolist() for batch in model.daylight_batches
+    ] == [[0.0], [1.0]]
 
 
 def test_regrouping_is_bounded_and_first_piece_owns_each_output_header(
@@ -331,9 +412,15 @@ def test_regrouping_is_bounded_and_first_piece_owns_each_output_header(
         device="cpu",
     )
 
-    output_files = sorted((output_dir / "NCG_0-100km").glob("*.lig"))
+    output_files = sorted(
+        (output_dir / "NCG" / "0000-0100km").glob("*.lig")
+    )
     counts = [struct.unpack_from("<i", path.read_bytes(), 4)[0] for path in output_files]
     assert counts == [MAX_PIECES_PER_FILE, 3]
+    assert [path.name for path in output_files] == [
+        "GZ_20200102000405.lig",
+        "GZ_20200102000405_002.lig",
+    ]
     assert max(model.batch_sizes) <= 17
     first_written_header = bytearray(output_files[0].read_bytes()[:FILE_HEADER_BYTES])
     second_written_header = bytearray(output_files[1].read_bytes()[:FILE_HEADER_BYTES])
@@ -352,7 +439,16 @@ def test_cli_is_compact_and_path_validation_rejects_unsafe_nesting(tmp_path):
         "--model", "model.pt",
     ])
     assert set(vars(args)) == {
-        "input_dir", "output_dir", "model", "batch_size", "type_only", "device"
+        "input_dir",
+        "input_root",
+        "start_date",
+        "end_date",
+        "output_dir",
+        "model",
+        "model_dir",
+        "batch_size",
+        "type_only",
+        "device",
     }
 
     parent = tmp_path / "parent"
@@ -366,3 +462,64 @@ def test_cli_is_compact_and_path_validation_rejects_unsafe_nesting(tmp_path):
         classify.classify_directory(parent, child, model, device="cpu")
     with pytest.raises(ValueError, match="batch_size"):
         classify.classify_directory(parent, tmp_path / "elsewhere", model, batch_size=0)
+
+
+def test_date_range_is_inclusive_and_excludes_index(tmp_path):
+    for name in (
+        "GZ_20160702",
+        "GZ_20160702Index",
+        "GZ_20160703",
+        "GZ_20160703Index",
+    ):
+        (tmp_path / name).mkdir()
+
+    discovered = classify.discover_date_inputs(
+        tmp_path, "20160702", "20160703"
+    )
+
+    assert discovered == [
+        tmp_path / "GZ_20160702",
+        tmp_path / "GZ_20160703",
+    ]
+
+
+def test_date_range_reports_every_missing_day(tmp_path):
+    (tmp_path / "GZ_20160702").mkdir()
+
+    with pytest.raises(ValueError, match="20160703.*20160704"):
+        classify.discover_date_inputs(
+            tmp_path, "20160702", "20160704"
+        )
+
+
+def test_bundle_prediction_routes_to_matching_distance_model():
+    type_checkpoint = loaded_new(ConstantNewModel(type_index=2))
+    distances = tuple(
+        loaded_new(
+            ConstantNewModel(
+                type_index=type_index,
+                distance_bin=type_index + 5,
+            )
+        )
+        for type_index in range(1, 5)
+    )
+    bundle = LoadedModelBundle(
+        type_checkpoint=type_checkpoint,
+        distance_checkpoints=distances,
+        hashes={
+            role: role.lower()
+            for role in ("type", "NCG", "NNBE", "PCG", "PNBE")
+        },
+    )
+    waveforms = np.zeros((2, WAVEFORM_SAMPLES), dtype=np.float32)
+
+    predictions = classify.predict_bundle_batch(
+        bundle,
+        waveforms,
+        [datetime(2016, 7, 8, 1), datetime(2016, 7, 8, 2)],
+        device=torch.device("cpu"),
+        type_only=False,
+    )
+
+    assert [item.final_type for item in predictions] == ["NNBE", "NNBE"]
+    assert [item.distance_bin for item in predictions] == [7, 7]

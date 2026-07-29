@@ -1,4 +1,5 @@
 import hashlib
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -6,8 +7,10 @@ import torch
 
 from checkpoints import (
     FIVE_CLASS_SCHEMA,
+    load_model_bundle,
     load_model_checkpoint,
     model_sha256,
+    save_model_bundle,
     save_model_checkpoint,
 )
 from models import LegacyMultiTaskResNet, create_five_class_model
@@ -296,3 +299,90 @@ def test_model_sha256_streams_file_contents(tmp_path):
     path.write_bytes(b"abc" * 400_000)
 
     assert model_sha256(path) == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_model_bundle(root):
+    role_paths = {}
+    preprocess = {"local_length": 8000, "global_length": 2000}
+    for role in ("type", "NCG", "NNBE", "PCG", "PNBE"):
+        path = root / role / "model.pt"
+        save_model_checkpoint(
+            path,
+            create_five_class_model(base_channels=8),
+            model_config={"base_channels": 8},
+            preprocess_config=preprocess,
+            split_hash="split",
+            training_config={"role": role},
+        )
+        role_paths[role] = path
+    save_model_bundle(root, role_paths, preprocess_config=preprocess)
+    return root
+
+
+def test_model_bundle_round_trip_has_five_independent_roles(tmp_path):
+    root = _write_model_bundle(tmp_path / "bundle")
+
+    loaded = load_model_bundle(root, "cpu")
+
+    assert loaded.type_checkpoint.schema == FIVE_CLASS_SCHEMA
+    assert len(loaded.distance_checkpoints) == 4
+    assert set(loaded.hashes) == {"type", "NCG", "NNBE", "PCG", "PNBE"}
+    assert len(
+        {
+            id(loaded.type_checkpoint.model),
+            *(id(item.model) for item in loaded.distance_checkpoints),
+        }
+    ) == 5
+
+
+def test_model_bundle_rejects_missing_role(tmp_path):
+    root = tmp_path / "bundle"
+    root.mkdir()
+
+    with pytest.raises(ValueError, match="missing.*PNBE|roles"):
+        save_model_bundle(
+            root,
+            {"type": root / "type" / "model.pt"},
+            preprocess_config={
+                "local_length": 8000,
+                "global_length": 2000,
+            },
+        )
+
+
+def test_model_bundle_rejects_hash_mismatch(tmp_path):
+    root = _write_model_bundle(tmp_path / "bundle")
+    with (root / "NCG" / "model.pt").open("ab") as handle:
+        handle.write(b"tampered")
+
+    with pytest.raises(ValueError, match="hash"):
+        load_model_bundle(root, "cpu")
+
+
+def test_model_bundle_rejects_mismatched_split(tmp_path):
+    root = _write_model_bundle(tmp_path / "bundle")
+    save_model_checkpoint(
+        root / "NCG" / "model.pt",
+        create_five_class_model(base_channels=8),
+        model_config={"base_channels": 8},
+        preprocess_config={
+            "local_length": 8000,
+            "global_length": 2000,
+        },
+        split_hash="different-split",
+        training_config={"role": "NCG"},
+    )
+    role_paths = {
+        role: root / role / "model.pt"
+        for role in ("type", "NCG", "NNBE", "PCG", "PNBE")
+    }
+
+    with pytest.raises(ValueError, match="split"):
+        save_model_bundle(
+            root,
+            role_paths,
+            preprocess_config={
+                "local_length": 8000,
+                "global_length": 2000,
+            },
+        )

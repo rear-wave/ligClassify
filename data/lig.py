@@ -6,6 +6,7 @@ import math
 import os
 import struct
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO, Iterable, Sequence
@@ -15,6 +16,7 @@ import numpy as np
 
 FILE_HEADER_BYTES = 112
 PIECE_BYTES = 32208
+SUPPORTED_PIECE_BYTES = (PIECE_BYTES, PIECE_BYTES + 256)
 PIECE_HEADER_BYTES = 208
 WAVEFORM_SAMPLES = 16000
 WAVEFORM_BYTES = WAVEFORM_SAMPLES * 2
@@ -47,30 +49,51 @@ def _declared_piece_count(path: str | os.PathLike[str]) -> int:
     return piece_count
 
 
-def _validate_source(path: str | os.PathLike[str], piece_count: int) -> None:
+def _validate_source(path: str | os.PathLike[str], piece_count: int) -> int:
     if piece_count > MAX_PIECES_PER_FILE:
         raise LigFormatError(
             f"piece count exceeds {MAX_PIECES_PER_FILE}: {path}: {piece_count}"
         )
-    expected_size = FILE_HEADER_BYTES + piece_count * PIECE_BYTES
     actual_size = os.path.getsize(path)
-    if actual_size != expected_size:
-        raise LigFormatError(
-            f"LIG size mismatch: {path}: expected {expected_size}, got {actual_size}"
-        )
+    payload_size = actual_size - FILE_HEADER_BYTES
+    if piece_count == 0:
+        if payload_size == 0:
+            return PIECE_BYTES
+    elif payload_size >= 0 and payload_size % piece_count == 0:
+        piece_bytes = payload_size // piece_count
+        if piece_bytes in SUPPORTED_PIECE_BYTES:
+            return piece_bytes
+    expected = ", ".join(
+        str(FILE_HEADER_BYTES + piece_count * size)
+        for size in SUPPORTED_PIECE_BYTES
+    )
+    raise LigFormatError(
+        f"LIG size mismatch: {path}: expected one of [{expected}], "
+        f"got {actual_size}"
+    )
+
+
+def _source_piece_bytes(path: str | os.PathLike[str]) -> tuple[int, int]:
+    piece_count = _declared_piece_count(path)
+    return piece_count, _validate_source(path, piece_count)
 
 
 def read_raw_piece(path: str | os.PathLike[str], piece_index: int) -> bytes:
     """Read a complete piece without decoding or reconstructing its bytes."""
     piece_index = int(piece_index)
-    if piece_index < 0:
-        raise IndexError(f"piece_index must be non-negative: {piece_index}")
-    offset = FILE_HEADER_BYTES + piece_index * PIECE_BYTES
+    piece_count, piece_bytes = _source_piece_bytes(path)
+    if piece_index < 0 or piece_index >= piece_count:
+        raise IndexError(
+            f"piece_index={piece_index} outside file with {piece_count} pieces"
+        )
+    offset = FILE_HEADER_BYTES + piece_index * piece_bytes
     with open(path, "rb") as handle:
         handle.seek(offset)
-        raw = handle.read(PIECE_BYTES)
-    if len(raw) != PIECE_BYTES:
-        raise LigFormatError(f"short piece {piece_index}: {path}")
+        raw = handle.read(piece_bytes)
+    if len(raw) != piece_bytes:
+        raise LigFormatError(
+            f"short piece {piece_index}: {path}"
+        )
     return raw
 
 
@@ -86,9 +109,9 @@ def write_lig_file(
         raise LigFormatError(
             f"refusing to write more than {MAX_PIECES_PER_FILE} pieces"
         )
-    for raw in raw_pieces:
-        if len(raw) != PIECE_BYTES:
-            raise LigFormatError("refusing to write a reconstructed piece")
+    piece_sizes = {len(raw) for raw in raw_pieces}
+    if len(piece_sizes) > 1 or not piece_sizes.issubset(SUPPORTED_PIECE_BYTES):
+        raise LigFormatError("refusing to write a reconstructed piece")
 
     header = bytearray(source_header)
     struct.pack_into("<i", header, _PIECE_COUNT_OFFSET, len(raw_pieces))
@@ -120,7 +143,7 @@ def _decode_timestamp(
             raise ValueError(f"invalid minute: {minute}")
         if not 0 <= second <= 60:
             raise ValueError(f"invalid second: {second}")
-        if not math.isfinite(sec_frac) or not 0.0 <= sec_frac < 1.0:
+        if not math.isfinite(sec_frac) or not 0.0 <= sec_frac < 60.0:
             raise ValueError(f"invalid fractional second: {sec_frac}")
         return datetime(year, month, day) + timedelta(
             hours=hour,
@@ -162,14 +185,18 @@ class LigFileIndex:
             filepaths = [filepaths]
         self.filepaths: list[str] = []
         self.num_pieces_per_file: list[int] = []
+        self.piece_bytes_per_file: list[int] = []
         self._file_handles: OrderedDict[int, BinaryIO] = OrderedDict()
         for filepath in filepaths:
             path = str(Path(filepath))
             piece_count = _declared_piece_count(path)
             if validate:
-                _validate_source(path, piece_count)
+                piece_bytes = _validate_source(path, piece_count)
+            else:
+                piece_bytes = PIECE_BYTES
             self.filepaths.append(path)
             self.num_pieces_per_file.append(piece_count)
+            self.piece_bytes_per_file.append(piece_bytes)
 
         self._cumsum = np.cumsum(
             np.asarray([0, *self.num_pieces_per_file], dtype=np.int64)
@@ -206,19 +233,29 @@ class LigFileIndex:
         self._file_handles[file_index] = handle
         return handle
 
-    @staticmethod
-    def _waveform_offset(piece_index: int) -> int:
-        return FILE_HEADER_BYTES + piece_index * PIECE_BYTES + PIECE_HEADER_BYTES
+    def _waveform_offset(self, file_index: int, piece_index: int) -> int:
+        piece_bytes = self.piece_bytes_per_file[file_index]
+        waveform_header_bytes = (
+            PIECE_HEADER_BYTES + piece_bytes - PIECE_BYTES
+        )
+        return (
+            FILE_HEADER_BYTES
+            + piece_index * piece_bytes
+            + waveform_header_bytes
+        )
 
-    @staticmethod
-    def _timestamp_offset(piece_index: int) -> int:
-        return FILE_HEADER_BYTES + piece_index * PIECE_BYTES + _TIMESTAMP_OFFSET
+    def _timestamp_offset(self, file_index: int, piece_index: int) -> int:
+        return (
+            FILE_HEADER_BYTES
+            + piece_index * self.piece_bytes_per_file[file_index]
+            + _TIMESTAMP_OFFSET
+        )
 
     def read_piece(self, global_index: int) -> np.ndarray:
         """Read one waveform as float32 without caching its payload."""
         file_index, piece_index = self._locate(global_index)
         handle = self._get_file_handle(file_index)
-        handle.seek(self._waveform_offset(piece_index))
+        handle.seek(self._waveform_offset(file_index, piece_index))
         raw = handle.read(WAVEFORM_BYTES)
         if len(raw) != WAVEFORM_BYTES:
             raise LigFormatError(
@@ -238,7 +275,7 @@ class LigFileIndex:
         for file_index, positions in groups.items():
             handle = self._get_file_handle(file_index)
             for order, piece_index in sorted(positions, key=lambda item: item[1]):
-                handle.seek(self._waveform_offset(piece_index))
+                handle.seek(self._waveform_offset(file_index, piece_index))
                 raw = handle.read(WAVEFORM_BYTES)
                 if len(raw) != WAVEFORM_BYTES:
                     raise LigFormatError(
@@ -247,8 +284,13 @@ class LigFileIndex:
                 results[order] = np.frombuffer(raw, dtype="<u2").astype(np.float32)
         return [result for result in results if result is not None]
 
-    def read_timestamps_batch(self, global_indices: Iterable[int]) -> list[datetime]:
-        """Read piece timestamps in a batch without loading waveform payloads."""
+    def read_timestamps_batch(
+        self,
+        global_indices: Iterable[int],
+        *,
+        allow_invalid: bool = False,
+    ) -> list[datetime | None]:
+        """Read timestamps, optionally retaining invalid entries as ``None``."""
         indices = [int(index) for index in global_indices]
         groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
         for order, global_index in enumerate(indices):
@@ -259,12 +301,17 @@ class LigFileIndex:
         for file_index, positions in groups.items():
             handle = self._get_file_handle(file_index)
             for order, piece_index in sorted(positions, key=lambda item: item[1]):
-                handle.seek(self._timestamp_offset(piece_index))
+                handle.seek(self._timestamp_offset(file_index, piece_index))
                 raw = handle.read(_TIMESTAMP_BYTES)
-                results[order] = _decode_timestamp(
-                    raw, self.filepaths[file_index], piece_index
-                )
-        return [result for result in results if result is not None]
+                try:
+                    results[order] = _decode_timestamp(
+                        raw, self.filepaths[file_index], piece_index
+                    )
+                except LigFormatError:
+                    if not allow_invalid:
+                        raise
+                    results[order] = None
+        return results
 
     def close(self) -> None:
         """Close every cached file handle."""
@@ -274,3 +321,114 @@ class LigFileIndex:
 
     def __del__(self) -> None:
         self.close()
+
+
+def iter_lig_batches(
+    path: Path,
+    batch_size: int,
+    *,
+    allow_invalid_timestamps: bool = False,
+):
+    """Yield bounded waveforms, timestamps, and byte-exact raw pieces."""
+    with LigFileIndex([path], validate=True) as index, path.open("rb") as raw:
+        piece_bytes = index.piece_bytes_per_file[0]
+        for start in range(0, len(index), batch_size):
+            stop = min(start + batch_size, len(index))
+            positions = range(start, stop)
+            waveforms = np.stack(index.read_pieces_batch(positions), axis=0)
+            timestamps = index.read_timestamps_batch(
+                positions,
+                allow_invalid=allow_invalid_timestamps,
+            )
+            raw.seek(FILE_HEADER_BYTES + start * piece_bytes)
+            pieces = [raw.read(piece_bytes) for _ in positions]
+            if any(len(piece) != piece_bytes for piece in pieces):
+                raise LigFormatError(f"short raw piece batch: {path}")
+            yield start, waveforms, timestamps, pieces
+
+
+@dataclass
+class _OutputBuffer:
+    relative_path: str
+    source_header: bytes
+    raw_pieces: list[bytes] = field(default_factory=list)
+
+
+class LigOutputRegrouper:
+    """Write byte-exact 512-piece LIG groups with timestamp names."""
+
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+        self._buffers: dict[str, _OutputBuffer] = {}
+        self._reserved: set[str] = set()
+
+    def _new_buffer(
+        self,
+        output_class: str,
+        header: bytes,
+        timestamp: datetime | None,
+    ) -> _OutputBuffer:
+        stem = (
+            "GZ_unknown"
+            if timestamp is None
+            else timestamp.strftime("GZ_%Y%m%d%H%M%S")
+        )
+        suffix = 1
+        while True:
+            name = f"{stem}.lig" if suffix == 1 else f"{stem}_{suffix:03d}.lig"
+            relative = (Path(output_class) / name).as_posix()
+            if (
+                relative not in self._reserved
+                and not (self.output_dir / relative).exists()
+            ):
+                break
+            suffix += 1
+        self._reserved.add(relative)
+        buffer = _OutputBuffer(relative, header)
+        self._buffers[output_class] = buffer
+        return buffer
+
+    def add(
+        self,
+        output_class: str,
+        source_header: bytes,
+        raw_piece: bytes,
+        timestamp: datetime | None,
+    ) -> str:
+        """Buffer one complete piece and return its assigned relative path."""
+        if len(raw_piece) not in SUPPORTED_PIECE_BYTES:
+            raise LigFormatError("refusing to buffer a reconstructed piece")
+        if timestamp is not None and not isinstance(timestamp, datetime):
+            raise LigFormatError("output piece timestamp is invalid")
+        buffer = self._buffers.get(output_class)
+        if (
+            buffer is not None
+            and buffer.raw_pieces
+            and len(buffer.raw_pieces[0]) != len(raw_piece)
+        ):
+            self._flush(output_class)
+            buffer = None
+        if buffer is None:
+            buffer = self._new_buffer(
+                output_class, source_header, timestamp
+            )
+        buffer.raw_pieces.append(raw_piece)
+        relative = buffer.relative_path
+        if len(buffer.raw_pieces) == MAX_PIECES_PER_FILE:
+            self._flush(output_class)
+        return relative
+
+    def _flush(self, output_class: str) -> None:
+        buffer = self._buffers.pop(output_class, None)
+        if buffer is None or not buffer.raw_pieces:
+            return
+        destination = self.output_dir / buffer.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        write_lig_file(
+            destination, buffer.source_header, buffer.raw_pieces
+        )
+
+    def flush_all(self) -> None:
+        """Flush partial groups in deterministic leaf order."""
+        for output_class in sorted(tuple(self._buffers)):
+            self._flush(output_class)

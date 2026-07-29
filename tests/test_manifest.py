@@ -38,6 +38,18 @@ def test_manifest_rejects_non_ic_file_without_exact_interval(tmp_path):
         build_piece_table(tmp_path)
 
 
+def test_classification_only_manifest_accepts_flat_non_ic_files(tmp_path):
+    source = tmp_path / "PCG" / "sample.lig"
+    source.parent.mkdir(parents=True)
+    write_source(source, [make_piece(1), make_piece(2)])
+
+    table, diagnostics = build_piece_table(tmp_path, require_distance=False)
+
+    assert table.type_index.tolist() == [3, 3]
+    assert table.distance_bin.tolist() == [-1, -1]
+    assert diagnostics == {"files": 1, "pieces": 2}
+
+
 def test_manifest_rejects_interval_wider_than_100_km(tmp_path):
     source = tmp_path / "PCG" / "night" / "0-300km" / "sample.lig"
     source.parent.mkdir(parents=True)

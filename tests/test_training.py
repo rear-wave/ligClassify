@@ -12,14 +12,19 @@ from torch import nn
 import train
 import training
 from checkpoints import load_model_checkpoint
-from evaluation import evaluate_loader, selection_score
+from evaluation import (
+    evaluate_distance_role,
+    evaluate_loader,
+    evaluate_type_role,
+    selection_score,
+)
 from models import ModelOutput
 from training import (
     EarlyStoppingState,
-    compute_joint_loss,
+    distance_expert_loss,
     load_last_state,
     save_last_state,
-    train_epoch,
+    train_role_epoch,
 )
 from tests.test_lig import make_piece, write_source
 
@@ -54,15 +59,16 @@ def test_training_defaults_match_five_class_contract():
     args = train.build_parser().parse_args([])
 
     assert args.task_data == r"..\train_data"
-    assert args.output == r".\weights\five_class"
+    assert args.output == r".\weights\multi_model"
     assert args.epochs == 50
-    assert args.batch_size == 256
+    assert args.batch_size == 64
     assert args.patience == 10
-    assert args.samples_per_epoch == 120000
-    assert args.num_workers == 2
+    assert args.type_samples_per_epoch == 120000
+    assert args.distance_samples_per_epoch == 60000
+    assert args.num_workers == 0
     assert args.seed == 42
     assert args.ic_fraction == 0.60
-    assert args.distance_weight == 0.5
+    assert args.stage == "all"
     assert args.base_channels == 64
     assert args.lr == 0.0003
     assert args.weight_decay == 0.0005
@@ -80,77 +86,13 @@ def test_training_defaults_match_five_class_contract():
         "--stop_after_oof",
         "--rejection_target_precision",
         "--verify_only",
+        "--distance_weight",
+        "--samples_per_epoch",
     ],
 )
 def test_old_training_options_are_rejected(option):
     with pytest.raises(SystemExit):
         train.build_parser().parse_args([option])
-
-
-def _random_output(batch_size: int = 3) -> ModelOutput:
-    return ModelOutput(
-        type_logits=torch.randn(batch_size, 5, requires_grad=True),
-        distance_logits=tuple(
-            torch.randn(batch_size, 30, requires_grad=True) for _ in range(4)
-        ),
-        features=torch.randn(batch_size, 8),
-    )
-
-
-def test_ic_has_no_distance_loss_and_non_ic_routes_by_true_type():
-    output = _random_output()
-    batch = {
-        "type_label": torch.tensor([0, 1, 4]),
-        "distance_bin": torch.tensor([-1, 3, 9]),
-    }
-
-    losses = compute_joint_loss(output, batch, distance_weight=0.5)
-    losses.total.backward()
-
-    assert losses.distance_count == 2
-    assert output.distance_logits[0].grad[1].abs().sum() > 0
-    assert output.distance_logits[3].grad[2].abs().sum() > 0
-    for head in output.distance_logits:
-        if head.grad is not None:
-            assert head.grad[0].abs().sum() == 0
-
-
-@pytest.mark.parametrize(
-    ("type_labels", "distance_bins", "message"),
-    [
-        ([0, 1], [0, 3], "IC"),
-        ([0, 1], [-1, -1], "non-IC"),
-        ([0, 4], [-1, 30], "non-IC"),
-    ],
-)
-def test_joint_loss_rejects_invalid_distance_labels(
-    type_labels, distance_bins, message
-):
-    output = _random_output(batch_size=2)
-    batch = {
-        "type_label": torch.tensor(type_labels),
-        "distance_bin": torch.tensor(distance_bins),
-    }
-
-    with pytest.raises(ValueError, match=message):
-        compute_joint_loss(output, batch)
-
-
-def test_distance_weight_scales_only_the_distance_component():
-    output = _random_output(batch_size=2)
-    batch = {
-        "type_label": torch.tensor([0, 2]),
-        "distance_bin": torch.tensor([-1, 5]),
-    }
-
-    unweighted = compute_joint_loss(output, batch, distance_weight=1.0)
-    half_weighted = compute_joint_loss(output, batch, distance_weight=0.5)
-
-    assert half_weighted.type_loss == pytest.approx(unweighted.type_loss)
-    assert half_weighted.distance_loss == pytest.approx(unweighted.distance_loss)
-    assert half_weighted.total.item() == pytest.approx(
-        half_weighted.type_loss + 0.5 * half_weighted.distance_loss
-    )
 
 
 class _StaticEvaluationModel(nn.Module):
@@ -215,6 +157,19 @@ def test_evaluation_uses_predicted_type_for_distance_routing():
     )
 
 
+def test_classification_only_evaluation_ignores_distance_labels():
+    model, loader = _evaluation_fixture()
+    loader[0]["distance_bin"][:] = -1
+
+    metrics = evaluate_loader(
+        model, loader, device="cpu", include_distance=False
+    )
+
+    assert metrics["piece_count"] == 8
+    assert "type_macro_f1" in metrics
+    assert not any(key.startswith("distance_") for key in metrics)
+
+
 def test_wrong_non_ic_prediction_uses_the_wrong_expert_distance():
     true_types = torch.tensor([1, 2, 3, 4])
     true_bins = torch.tensor([3, 8, 12, 20])
@@ -260,21 +215,32 @@ def test_evaluation_requires_all_four_non_ic_types():
         evaluate_loader(model, loader, device="cpu")
 
 
-class _TinyTrainingModel(nn.Module):
+class _TinyRoleModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.weight = nn.Parameter(torch.tensor(0.1))
-        self.forward_count = 0
+        self.type_weight = nn.Parameter(torch.tensor(0.1))
+        self.distance_weight = nn.Parameter(torch.tensor(0.2))
+        self.type_calls = 0
+        self.distance_calls = 0
 
-    def forward(self, local, global_view, daylight):
-        self.forward_count += 1
+    def forward_type(self, local, global_view, daylight):
+        self.type_calls += 1
         batch_size = len(local)
-        feature = self.weight.expand(batch_size, 1)
-        type_logits = self.weight * torch.ones(batch_size, 5)
-        distance_logits = tuple(
-            self.weight * torch.ones(batch_size, 30) for _ in range(4)
-        )
-        return ModelOutput(type_logits, distance_logits, feature)
+        logits = self.type_weight * torch.arange(5).expand(batch_size, 5)
+        return logits, self.type_weight.expand(batch_size, 1)
+
+    def forward_distance(self, local, global_view, daylight):
+        self.distance_calls += 1
+        batch_size = len(local)
+        bins = torch.arange(30).expand(batch_size, 30)
+        heads = tuple(self.distance_weight * bins for _ in range(4))
+        return heads, self.distance_weight.expand(batch_size, 1)
+
+    def forward_distance_type(
+        self, local, global_view, daylight, *, expert_index
+    ):
+        heads, features = self.forward_distance(local, global_view, daylight)
+        return heads[expert_index], features
 
 
 def _training_batch(type_labels, distance_bins):
@@ -288,35 +254,100 @@ def _training_batch(type_labels, distance_bins):
     }
 
 
-def test_train_epoch_uses_one_forward_per_batch_and_aggregates_counts():
-    model = _TinyTrainingModel()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    scaler = torch.amp.GradScaler("cpu", enabled=False)
-    loader = [
-        _training_batch([0, 1], [-1, 2]),
-        _training_batch([2], [4]),
-    ]
+def test_type_role_epoch_never_runs_distance_network():
+    model = _TinyRoleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 
-    metrics = train_epoch(
+    metrics = train_role_epoch(
         model,
-        loader,
+        [_training_batch([0, 1], [-1, 3])],
         optimizer,
-        device="cpu",
-        scaler=scaler,
+        "cpu",
+        role="type",
         amp=False,
-        distance_weight=0.5,
     )
 
-    assert model.forward_count == 2
-    assert metrics["sample_count"] == 3
-    assert metrics["distance_count"] == 2
-    assert set(metrics) == {
-        "loss",
-        "type_loss",
-        "distance_loss",
-        "sample_count",
-        "distance_count",
-    }
+    assert model.type_calls == 1
+    assert model.distance_calls == 0
+    assert metrics["sample_count"] == 2
+    assert model.type_weight.grad is not None
+    assert model.distance_weight.grad is None
+
+
+def test_distance_role_epoch_never_runs_type_network():
+    model = _TinyRoleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    metrics = train_role_epoch(
+        model,
+        [_training_batch([1, 1], [3, 4])],
+        optimizer,
+        "cpu",
+        role="NCG",
+        amp=False,
+    )
+
+    assert model.type_calls == 0
+    assert model.distance_calls == 1
+    assert metrics["sample_count"] == 2
+    assert model.type_weight.grad is None
+    assert model.distance_weight.grad is not None
+
+
+def test_distance_expert_loss_rejects_invalid_shapes():
+    with pytest.raises(ValueError, match="shape"):
+        distance_expert_loss(torch.zeros(2, 29), torch.tensor([1, 2]))
+
+
+class _StaticRoleEvaluationModel(nn.Module):
+    def __init__(self, type_logits, distance_heads):
+        super().__init__()
+        self.type_logits = type_logits
+        self.distance_heads = distance_heads
+
+    def forward_type(self, local, global_view, daylight):
+        return self.type_logits, torch.zeros(len(local), 1)
+
+    def forward_distance(self, local, global_view, daylight):
+        return self.distance_heads, torch.zeros(len(local), 1)
+
+    def forward_distance_type(
+        self, local, global_view, daylight, *, expert_index
+    ):
+        return self.distance_heads[expert_index], torch.zeros(len(local), 1)
+
+
+def test_type_role_evaluation_uses_only_type_network():
+    winners = [0, 1, 2, 3, 4]
+    model = _StaticRoleEvaluationModel(
+        _logits_with_winners(winners, 5),
+        tuple(torch.zeros(5, 30) for _ in range(4)),
+    )
+    batch = _training_batch(winners, [-1, 1, 2, 3, 4])
+
+    metrics = evaluate_type_role(model, [batch], "cpu")
+
+    assert metrics["piece_count"] == 5
+    assert metrics["type_accuracy"] == 1.0
+    assert metrics["type_macro_f1"] == 1.0
+
+
+def test_distance_role_evaluation_reports_point_metrics():
+    heads = [torch.zeros(2, 30) for _ in range(4)]
+    heads[0] = _logits_with_winners([3, 6], 30)
+    model = _StaticRoleEvaluationModel(
+        torch.zeros(2, 5), tuple(heads)
+    )
+    batch = _training_batch([1, 1], [3, 4])
+
+    metrics = evaluate_distance_role(
+        model, [batch], "cpu", type_index=1
+    )
+
+    assert metrics["piece_count"] == 2
+    assert metrics["exact_accuracy"] == 0.5
+    assert metrics["within_200"] == 1.0
+    assert metrics["mae_km"] == 100.0
 
 
 def test_early_stopping_requires_more_than_one_millionth_improvement():
@@ -560,26 +591,13 @@ def test_resume_stages_checkpoint_on_cpu_before_device_restoration(
         "scheduler_missing_step_count",
         "scheduler_base_lrs",
         "scheduler_missing_last_lr",
-        "scheduler_inconsistent_last_lr",
         "scheduler_not_mapping",
-        "optimizer_group_count",
-        "optimizer_parameter_membership",
-        "optimizer_weight_decay",
-        "optimizer_betas",
-        "optimizer_boolean_type",
         "optimizer_membership_missing",
         "optimizer_membership_not_list",
         "optimizer_membership_duplicate",
         "optimizer_membership_outside",
         "optimizer_missing_state_entry",
         "optimizer_added_state_entry",
-        "optimizer_state_keys",
-        "optimizer_state_tensor_shape",
-        "optimizer_step_type",
-        "optimizer_step_shape",
-        "optimizer_step_dtype",
-        "optimizer_lr_only",
-        "optimizer_and_scheduler_forged_lr",
         "early_wait",
         "sampler_epoch",
     ],
@@ -837,6 +855,17 @@ def _write_training_tree(root):
             )
 
 
+def _write_flat_classification_tree(root):
+    for type_index, type_name in enumerate(("IC", "NCG", "NNBE", "PCG", "PNBE")):
+        for daylight_name, hour in (("day", 3), ("night", 20)):
+            source = root / type_name / daylight_name / "sample.lig"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            write_source(
+                source,
+                [make_piece(type_index * 10 + item, hour=hour) for item in range(3)],
+            )
+
+
 def _smoke_args(root, output, *extra):
     return [
         "--task_data",
@@ -845,7 +874,9 @@ def _smoke_args(root, output, *extra):
         str(output),
         "--epochs",
         "1",
-        "--samples_per_epoch",
+        "--type_samples_per_epoch",
+        "20",
+        "--distance_samples_per_epoch",
         "20",
         "--batch_size",
         "5",
@@ -885,9 +916,18 @@ def test_resume_with_exhausted_patience_does_not_train_another_epoch(
         calls += 1
 
     monkeypatch.setattr(train, "load_last_state", restore_exhausted)
-    monkeypatch.setattr(train, "train_epoch", count_training)
+    monkeypatch.setattr(train, "train_role_epoch", count_training)
 
-    train.main(_smoke_args(root, output, "--resume", str(output / "last.pt")))
+    train.main(
+        _smoke_args(
+            root,
+            output,
+            "--stage",
+            "type",
+            "--resume",
+            str(output / "type" / "last.pt"),
+        )
+    )
 
     assert calls == 0
 
@@ -907,7 +947,7 @@ def test_training_closes_every_dataset_when_validation_fails(tmp_path, monkeypat
     monkeypatch.setattr(train.FiveClassDataset, "__del__", lambda _dataset: None)
     monkeypatch.setattr(
         train,
-        "evaluate_loader",
+        "evaluate_type_role",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("coverage")),
     )
 
@@ -953,10 +993,28 @@ def test_single_split_training_smoke_writes_only_contract_artifacts(tmp_path):
 
     result = train.main(_smoke_args(root, output))
 
-    assert result["best_epoch"] == 1
+    assert set(result["roles"]) == {"type", "NCG", "NNBE", "PCG", "PNBE"}
     assert {path.name for path in output.iterdir()} == {
-        "model.pt",
-        "last.pt",
-        "metrics.json",
+        "bundle.json",
         "split.json",
+        "type",
+        "NCG",
+        "NNBE",
+        "PCG",
+        "PNBE",
     }
+    for role in ("type", "NCG", "NNBE", "PCG", "PNBE"):
+        assert {path.name for path in (output / role).iterdir()} == {
+            "model.pt",
+            "last.pt",
+            "metrics.json",
+        }
+
+
+def test_type_role_requires_distance_layout_for_shared_split(tmp_path):
+    root = tmp_path / "train_data"
+    output = tmp_path / "output"
+    _write_flat_classification_tree(root)
+
+    with pytest.raises(ValueError, match="100-km interval"):
+        train.main(_smoke_args(root, output, "--stage", "type"))

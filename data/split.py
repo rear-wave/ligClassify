@@ -137,8 +137,8 @@ def _stratum_name(key: tuple[int, bool, int]) -> str:
     if not 0 <= type_index < len(TYPE_NAMES):
         raise ValueError(f"invalid type index: {type_index}")
     light_name = "day" if daylight else "night"
-    if type_index == 0:
-        return f"IC|{light_name}"
+    if type_index == 0 or distance_bin < 0:
+        return f"{TYPE_NAMES[type_index]}|{light_name}"
     low = distance_bin * 100
     return f"{TYPE_NAMES[type_index]}|{light_name}|{low}-{low + 100}km"
 

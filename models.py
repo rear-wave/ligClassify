@@ -1,17 +1,25 @@
-"""Focused five-class and retained legacy waveform models."""
+"""Two-stage waveform cascade and retained legacy inference model."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from typing import Literal
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 
-TYPE_COUNT = 5
-DISTANCE_EXPERT_COUNT = 4
+TYPE_NAMES = ("IC", "NCG", "NNBE", "PCG", "PNBE")
+DISTANCE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
+TYPE_COUNT = len(TYPE_NAMES)
+DISTANCE_EXPERT_COUNT = len(DISTANCE_NAMES)
 DISTANCE_BIN_COUNT = 30
 LOCAL_LENGTH = 8000
 GLOBAL_LENGTH = 2000
+CASCADE_ARCHITECTURE = "five_class_v1"
+MODEL_VARIANT = "type_then_prototype_distance_v1"
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -47,7 +55,7 @@ class ResidualBlock(nn.Module):
 
 
 class LegacyMultiTaskResNet(nn.Module):
-    """Architecture retained solely for legacy five-class checkpoint loading."""
+    """Exact architecture retained for ``weights/old/model.pt`` only."""
 
     def __init__(
         self,
@@ -90,14 +98,27 @@ class LegacyMultiTaskResNet(nn.Module):
         values = self.layer3(values)
         return self.gap(values).squeeze(-1)
 
-    def forward(
+    def extract_type_features(self, values: torch.Tensor) -> torch.Tensor:
+        return self._encode(values)
+
+    def forward_type(self, values: torch.Tensor) -> torch.Tensor:
+        return self.type_head(self.extract_type_features(values))
+
+    def forward_with_features(
         self, values: torch.Tensor
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
         features = self._encode(values)
         return (
+            features,
             self.type_head(features),
             tuple(head(features) for head in self.d_heads),
         )
+
+    def forward(
+        self, values: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        _, type_logits, distance_logits = self.forward_with_features(values)
+        return type_logits, distance_logits
 
 
 class MultiScaleResidualBlock(nn.Module):
@@ -134,7 +155,7 @@ class MultiScaleResidualBlock(nn.Module):
         return F.gelu(values + mixed)
 
 
-class WaveformBranch(nn.Module):
+class _FullResolutionWaveformBranch(nn.Module):
     """Encode one signed local or global waveform view."""
 
     def __init__(self, base: int):
@@ -160,17 +181,157 @@ class WaveformBranch(nn.Module):
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         encoded = self.network(values)
         return torch.cat(
-            [
+            (
                 self.average(encoded).squeeze(-1),
                 self.maximum(encoded).squeeze(-1),
-            ],
+            ),
             dim=1,
+        )
+
+
+class WaveformBranch(_FullResolutionWaveformBranch):
+    """Memory-bounded waveform branch with signed anti-alias downsampling."""
+
+    downsample_factor = 1
+
+    def __init__(self, *args: object, **kwargs: object):
+        super().__init__(*args, **kwargs)
+        encoded_dim = self.output_dim // 2
+        width = max(8, min(32, encoded_dim // 4))
+        self.network = nn.Sequential(
+            nn.Conv1d(
+                1,
+                width,
+                kernel_size=17,
+                stride=8,
+                padding=8,
+                bias=False,
+            ),
+            nn.GroupNorm(1, width),
+            nn.GELU(),
+            nn.Conv1d(
+                width,
+                width * 2,
+                kernel_size=9,
+                stride=4,
+                padding=4,
+                bias=False,
+            ),
+            nn.GroupNorm(1, width * 2),
+            nn.GELU(),
+            nn.Conv1d(
+                width * 2,
+                encoded_dim,
+                kernel_size=7,
+                stride=2,
+                padding=3,
+                bias=False,
+            ),
+            nn.GroupNorm(1, encoded_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        if values.ndim not in (2, 3):
+            raise ValueError(
+                "waveform input must have shape [batch, length] or "
+                "[batch, channels, length]"
+            )
+        restore_channel = values.ndim == 2
+        pooled = values.unsqueeze(1) if restore_channel else values
+        if pooled.shape[-1] >= self.downsample_factor * 32:
+            pooled = F.avg_pool1d(
+                pooled,
+                kernel_size=self.downsample_factor,
+                stride=self.downsample_factor,
+            )
+        if restore_channel:
+            pooled = pooled.squeeze(1)
+        return super().forward(pooled)
+
+
+class DualViewEncoder(nn.Module):
+    """Encode local/global views and daylight into one task-specific vector."""
+
+    def __init__(self, base_channels: int):
+        super().__init__()
+        self.local_branch = WaveformBranch(base_channels)
+        self.global_branch = WaveformBranch(base_channels)
+        fusion_input = (
+            self.local_branch.output_dim + self.global_branch.output_dim + 1
+        )
+        self.output_dim = base_channels * 4
+        self.fusion = nn.Sequential(
+            nn.LayerNorm(fusion_input),
+            nn.Linear(fusion_input, self.output_dim),
+            nn.GELU(),
+        )
+
+    def forward(
+        self,
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.fusion(
+            torch.cat(
+                (
+                    self.local_branch(local),
+                    self.global_branch(global_view),
+                    daylight,
+                ),
+                dim=1,
+            )
+        )
+
+
+class PrototypeDistanceMatcher(nn.Module):
+    """Match distance features to ordered, class-specific 100-km prototypes."""
+
+    def __init__(self, feature_dim: int):
+        super().__init__()
+        self.prototypes = nn.Parameter(
+            torch.empty(
+                DISTANCE_EXPERT_COUNT,
+                DISTANCE_BIN_COUNT,
+                feature_dim,
+            )
+        )
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.prototypes, mean=0.0, std=0.02)
+        with torch.no_grad():
+            distance_axis = torch.linspace(
+                -1.0, 1.0, DISTANCE_BIN_COUNT
+            )[None, :, None]
+            self.prototypes[:, :, :1].add_(distance_axis)
+
+    def _normalized(self) -> torch.Tensor:
+        return F.normalize(self.prototypes, dim=-1, eps=1e-6)
+
+    def match_type(
+        self, features: torch.Tensor, expert_index: int
+    ) -> torch.Tensor:
+        if not 0 <= int(expert_index) < DISTANCE_EXPERT_COUNT:
+            raise ValueError("expert_index must be in 0..3")
+        normalized_features = F.normalize(features, dim=-1, eps=1e-6)
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        return scale * normalized_features @ self._normalized()[
+            int(expert_index)
+        ].transpose(0, 1)
+
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            self.match_type(features, expert_index)
+            for expert_index in range(DISTANCE_EXPERT_COUNT)
         )
 
 
 @dataclass(frozen=True)
 class ModelOutput:
-    """Immutable predictions and shared representation from ``FiveClassNet``."""
+    """Training output for type classification and distance matching."""
 
     type_logits: torch.Tensor
     distance_logits: tuple[torch.Tensor, ...]
@@ -178,29 +339,21 @@ class ModelOutput:
 
 
 class FiveClassNet(nn.Module):
-    """Dual-view five-class network with four non-IC distance experts."""
+    """Two-stage type classifier and class-conditional distance matcher."""
+
+    architecture = CASCADE_ARCHITECTURE
+    model_variant = MODEL_VARIANT
 
     def __init__(self, base_channels: int = 64):
         super().__init__()
         if type(base_channels) is not int or base_channels <= 0:
             raise ValueError("base_channels must be a positive integer")
         self.base_channels = base_channels
-        self.local_branch = WaveformBranch(base_channels)
-        self.global_branch = WaveformBranch(base_channels)
-        feature_dim = base_channels * 4
-        fusion_input_dim = (
-            self.local_branch.output_dim + self.global_branch.output_dim + 1
-        )
-        self.fusion = nn.Sequential(
-            nn.LayerNorm(fusion_input_dim),
-            nn.Linear(fusion_input_dim, feature_dim),
-            nn.GELU(),
-        )
-        self.feature_dim = feature_dim
-        self.type_head = nn.Linear(feature_dim, TYPE_COUNT)
-        self.distance_heads = nn.ModuleList(
-            nn.Linear(feature_dim, DISTANCE_BIN_COUNT)
-            for _ in range(DISTANCE_EXPERT_COUNT)
+        self.type_encoder = DualViewEncoder(base_channels)
+        self.distance_encoder = DualViewEncoder(base_channels)
+        self.type_head = nn.Linear(self.type_encoder.output_dim, TYPE_COUNT)
+        self.distance_matcher = PrototypeDistanceMatcher(
+            self.distance_encoder.output_dim
         )
 
     @staticmethod
@@ -221,28 +374,119 @@ class FiveClassNet(nn.Module):
         if not (len(local) == len(global_view) == len(daylight)):
             raise ValueError("model inputs must have the same batch size")
 
+    def forward_type(
+        self,
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_inputs(local, global_view, daylight)
+        features = self.type_encoder(local, global_view, daylight)
+        return self.type_head(features), features
+
+    def forward_distance(
+        self,
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        self._validate_inputs(local, global_view, daylight)
+        features = self.distance_encoder(local, global_view, daylight)
+        return self.distance_matcher(features), features
+
+    def forward_distance_type(
+        self,
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+        *,
+        expert_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate one class-specific distance matcher."""
+        self._validate_inputs(local, global_view, daylight)
+        features = self.distance_encoder(local, global_view, daylight)
+        return self.distance_matcher.match_type(features, expert_index), features
+
     def forward(
         self,
         local: torch.Tensor,
         global_view: torch.Tensor,
         daylight: torch.Tensor,
     ) -> ModelOutput:
-        self._validate_inputs(local, global_view, daylight)
-        local_features = self.local_branch(local)
-        global_features = self.global_branch(global_view)
-        features = self.fusion(
-            torch.cat([local_features, global_features, daylight], dim=1)
+        type_logits, type_features = self.forward_type(
+            local, global_view, daylight
         )
-        return ModelOutput(
-            type_logits=self.type_head(features),
-            distance_logits=tuple(
-                head(features) for head in self.distance_heads
-            ),
-            features=features,
+        distance_logits, _ = self.forward_distance(
+            local, global_view, daylight
         )
+        return ModelOutput(type_logits, distance_logits, type_features)
+
+    def predict_cascade(
+        self,
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+    ) -> ModelOutput:
+        """Classify first and evaluate only the selected non-IC matchers."""
+        type_logits, type_features = self.forward_type(
+            local, global_view, daylight
+        )
+        predicted_types = type_logits.argmax(dim=1)
+        routed = tuple(
+            type_logits.new_zeros((len(type_logits), DISTANCE_BIN_COUNT))
+            for _ in range(DISTANCE_EXPERT_COUNT)
+        )
+        known_positions = torch.nonzero(
+            predicted_types != 0, as_tuple=False
+        ).flatten()
+        if len(known_positions):
+            distance_features = self.distance_encoder(
+                local[known_positions],
+                global_view[known_positions],
+                daylight[known_positions],
+            )
+            known_types = predicted_types[known_positions]
+            for expert_index in range(DISTANCE_EXPERT_COUNT):
+                selected = known_types == expert_index + 1
+                if torch.any(selected):
+                    rows = known_positions[selected]
+                    logits = self.distance_matcher.match_type(
+                        distance_features[selected], expert_index
+                    )
+                    routed[expert_index].index_copy_(0, rows, logits)
+        return ModelOutput(type_logits, routed, type_features)
+
+    def set_training_stage(
+        self, stage: Literal["type", "distance", "joint"]
+    ) -> None:
+        """Freeze the other stage so sequential training cannot corrupt it."""
+        if stage not in {"type", "distance", "joint"}:
+            raise ValueError("stage must be type, distance, or joint")
+        type_enabled = stage in {"type", "joint"}
+        distance_enabled = stage in {"distance", "joint"}
+        for parameter in self.type_encoder.parameters():
+            parameter.requires_grad_(type_enabled)
+        for parameter in self.type_head.parameters():
+            parameter.requires_grad_(type_enabled)
+        for parameter in self.distance_encoder.parameters():
+            parameter.requires_grad_(distance_enabled)
+        for parameter in self.distance_matcher.parameters():
+            parameter.requires_grad_(distance_enabled)
+
+    def set_training_role(self, role: str) -> int | None:
+        """Enable only the network used by one independently saved role."""
+        if role == "type":
+            self.set_training_stage("type")
+            return None
+        if role not in DISTANCE_NAMES:
+            raise ValueError(
+                f"role must be one of {('type', *DISTANCE_NAMES)}"
+            )
+        self.set_training_stage("distance")
+        return DISTANCE_NAMES.index(role)
 
 
 def create_five_class_model(base_channels: int = 64) -> FiveClassNet:
-    """Create a randomly initialized five-class model."""
+    """Create a randomly initialized two-stage cascade."""
 
     return FiveClassNet(base_channels=base_channels)

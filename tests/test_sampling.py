@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from data.manifest import PieceTable, SourceRecord
-from data.sampling import FiveClassSampler
+from data.sampling import DistanceExpertSampler, FiveClassSampler
 
 
 def test_sampler_uses_exact_60_10_10_10_10_prior(piece_table):
@@ -20,6 +20,22 @@ def test_sampler_uses_exact_60_10_10_10_10_prior(piece_table):
 
     assert counts == {0: 600, 1: 100, 2: 100, 3: 100, 4: 100}
     assert len({item.augmentation_seed for item in requests}) == 1000
+
+
+def test_classification_only_sampler_accepts_missing_distance_bins(piece_table):
+    piece_table.distance_bin[:] = -1
+    sampler = FiveClassSampler(
+        piece_table,
+        positions=range(len(piece_table)),
+        num_samples=1000,
+        seed=9,
+        balance_distance=False,
+    )
+
+    requests = list(sampler)
+    counts = Counter(piece_table.type_index[item.position] for item in requests)
+
+    assert counts == {0: 600, 1: 100, 2: 100, 3: 100, 4: 100}
 
 
 def test_sampler_balances_daylight_before_distance_bins(piece_table):
@@ -113,4 +129,61 @@ def test_sampler_rejects_missing_types_invalid_arguments_and_distance_bins(
     with pytest.raises(ValueError, match="distance_bin"):
         FiveClassSampler(
             piece_table, range(len(piece_table)), num_samples=10, seed=1
+        )
+
+
+def test_distance_expert_sampler_draws_only_requested_type(piece_table):
+    sampler = DistanceExpertSampler(
+        piece_table,
+        range(len(piece_table)),
+        type_index=1,
+        num_samples=120,
+        seed=7,
+    )
+
+    draws = list(sampler)
+
+    assert len(draws) == 120
+    assert {
+        int(piece_table.type_index[item.position]) for item in draws
+    } == {1}
+    assert len({item.augmentation_seed for item in draws}) == 120
+
+
+def test_distance_expert_sampler_balances_observed_cells(piece_table):
+    type_two = np.flatnonzero(piece_table.type_index == 2)
+    piece_table.distance_bin[type_two] = (
+        np.arange(len(type_two), dtype=np.int8) % 3
+    )
+    sampler = DistanceExpertSampler(
+        piece_table,
+        range(len(piece_table)),
+        type_index=2,
+        num_samples=120,
+        seed=7,
+    )
+
+    cells = Counter(
+        (
+            bool(piece_table.daylight[item.position]),
+            int(piece_table.distance_bin[item.position]),
+        )
+        for item in sampler
+    )
+
+    assert len(cells) == 6
+    assert max(cells.values()) - min(cells.values()) <= 1
+
+
+@pytest.mark.parametrize("type_index", [0, 5, True])
+def test_distance_expert_sampler_rejects_invalid_type(
+    piece_table, type_index
+):
+    with pytest.raises(ValueError, match="type_index"):
+        DistanceExpertSampler(
+            piece_table,
+            range(len(piece_table)),
+            type_index=type_index,
+            num_samples=10,
+            seed=1,
         )
