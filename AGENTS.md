@@ -28,7 +28,7 @@ or four-class type-training code.
 python audit_data.py --task_data ..\train_data
 python train.py --task_data ..\train_data --output .\weights\multi_model
 python train.py --task_data ..\train_data --output .\weights\multi_model --stage NCG --resume .\weights\multi_model\NCG\last.pt
-python classify.py --input_root "D:\" --start_date 20160702 --end_date 20160709 --output_dir .\classified --model_dir .\weights\multi_model
+python classify.py --input_root "D:/" --start_date 20160702 --end_date 20160709 --output_dir .\classified --model_dir .\weights\multi_model
 python classify.py --input_dir <lig-dir> --output_dir .\classified --model <model.pt>
 python -m pytest -q
 python -m compileall -q .

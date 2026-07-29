@@ -44,7 +44,7 @@ This command reads the inclusive range `GZ_20160702` through `GZ_20160709`
 below `D:\` and never reads matching `Index` directories:
 
 ```cmd
-python -u classify.py --input_root "D:\" --start_date 20160702 --end_date 20160709 --output_dir "E:\Guoxing Yang\typhoon_classified\2016.0702-2016.0709" --model_dir .\weights\multi_model --batch_size 256 --device cuda
+python -u classify.py --input_root "D:/" --start_date 20160702 --end_date 20160709 --output_dir .\classified\2016.0702-2016.0709 --model_dir .\weights\multi_model --batch_size 256 --device cuda
 ```
 
 Output is grouped as `TYPE/LLLL-HHHHkm/`; IC has no distance level. Each output
