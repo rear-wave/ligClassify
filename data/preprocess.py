@@ -17,6 +17,8 @@ class PreprocessConfig:
     use_filter: bool = True
     cutoff_hz: float = 120_000.0
     sample_rate_hz: float = 5_000_000.0
+    local_center_mode: str = "peak_abs_v1"
+    local_energy_window: int = 128
 
 
 @dataclass(frozen=True)
@@ -113,6 +115,19 @@ def _validate_preprocess(config: PreprocessConfig) -> None:
         or config.cutoff_hz >= config.sample_rate_hz / 2
     ):
         raise ValueError("cutoff_hz must lie below the Nyquist frequency")
+    if config.local_center_mode not in {
+        "peak_abs_v1",
+        "energy_envelope_v2",
+    }:
+        raise ValueError(
+            "local_center_mode must be peak_abs_v1 or energy_envelope_v2"
+        )
+    if (
+        isinstance(config.local_energy_window, bool)
+        or int(config.local_energy_window) != config.local_energy_window
+        or config.local_energy_window <= 0
+    ):
+        raise ValueError("local_energy_window must be a positive integer")
 
 
 def _filter_batch(values: np.ndarray, config: PreprocessConfig) -> np.ndarray:
@@ -129,17 +144,41 @@ def _filter_batch(values: np.ndarray, config: PreprocessConfig) -> np.ndarray:
     return sosfiltfilt(sos, values, axis=-1).astype(np.float32)
 
 
-def _local_view(values: np.ndarray, target_length: int) -> np.ndarray:
+def _energy_centers(values: np.ndarray, window: int) -> np.ndarray:
+    centered = values - np.median(values, axis=1, keepdims=True)
+    width = min(int(window), values.shape[1])
+    squared = np.square(centered, dtype=np.float64)
+    cumulative = np.pad(
+        np.cumsum(squared, axis=1),
+        ((0, 0), (1, 0)),
+        mode="constant",
+    )
+    energy = cumulative[:, width:] - cumulative[:, :-width]
+    return np.argmax(energy, axis=1) + width // 2
+
+
+def _local_view(
+    values: np.ndarray,
+    target_length: int,
+    center_mode: str,
+    energy_window: int,
+) -> np.ndarray:
     rows, source_length = values.shape
     result = np.zeros((rows, target_length), dtype=np.float32)
-    centered = values - np.median(values, axis=1, keepdims=True)
-    peaks = np.argmax(np.abs(centered), axis=1)
+    if center_mode == "peak_abs_v1":
+        centered = values - np.median(values, axis=1, keepdims=True)
+        centers = np.argmax(np.abs(centered), axis=1)
+    else:
+        centers = _energy_centers(values, energy_window)
     before = target_length // 4
-    for row_index, peak in enumerate(peaks):
+    for row_index, center in enumerate(centers):
         if source_length <= target_length:
             result[row_index, :source_length] = values[row_index]
             continue
-        start = min(max(int(peak) - before, 0), source_length - target_length)
+        start = min(
+            max(int(center) - before, 0),
+            source_length - target_length,
+        )
         result[row_index] = values[row_index, start:start + target_length]
     return result
 
@@ -178,7 +217,12 @@ def preprocess_views(
         raise ValueError("waveforms must be a non-empty two-dimensional batch")
     _validate_preprocess(config)
     signed_source = _filter_batch(waveforms, config)
-    local = _local_view(signed_source, config.local_length)
+    local = _local_view(
+        signed_source,
+        config.local_length,
+        config.local_center_mode,
+        config.local_energy_window,
+    )
     global_view = _global_view(signed_source, config.global_length)
     return _robust_normalize(local), _robust_normalize(global_view)
 

@@ -7,19 +7,31 @@ from data.manifest import PieceTable, SourceRecord
 from data.sampling import DistanceExpertSampler, FiveClassSampler
 
 
-def test_sampler_uses_exact_60_10_10_10_10_prior(piece_table):
+def test_sampler_uses_equal_prior_without_replacement(piece_table):
     sampler = FiveClassSampler(
         piece_table,
         positions=range(len(piece_table)),
-        num_samples=1000,
+        num_samples=100,
         seed=9,
     )
 
     requests = list(sampler)
     counts = Counter(piece_table.type_index[item.position] for item in requests)
 
-    assert counts == {0: 600, 1: 100, 2: 100, 3: 100, 4: 100}
-    assert len({item.augmentation_seed for item in requests}) == 1000
+    assert counts == {0: 20, 1: 20, 2: 20, 3: 20, 4: 20}
+    assert len({item.position for item in requests}) == 100
+    assert all(len(item.augmentation_seeds) == 2 for item in requests)
+    assert all(
+        item.augmentation_seeds[0] != item.augmentation_seeds[1]
+        for item in requests
+    )
+    assert len(
+        {
+            seed
+            for item in requests
+            for seed in item.augmentation_seeds
+        }
+    ) == 200
 
 
 def test_classification_only_sampler_accepts_missing_distance_bins(piece_table):
@@ -27,7 +39,7 @@ def test_classification_only_sampler_accepts_missing_distance_bins(piece_table):
     sampler = FiveClassSampler(
         piece_table,
         positions=range(len(piece_table)),
-        num_samples=1000,
+        num_samples=100,
         seed=9,
         balance_distance=False,
     )
@@ -35,7 +47,7 @@ def test_classification_only_sampler_accepts_missing_distance_bins(piece_table):
     requests = list(sampler)
     counts = Counter(piece_table.type_index[item.position] for item in requests)
 
-    assert counts == {0: 600, 1: 100, 2: 100, 3: 100, 4: 100}
+    assert counts == {0: 20, 1: 20, 2: 20, 3: 20, 4: 20}
 
 
 def test_sampler_balances_daylight_before_distance_bins(piece_table):
@@ -49,7 +61,7 @@ def test_sampler_balances_daylight_before_distance_bins(piece_table):
     sampler = FiveClassSampler(
         piece_table,
         positions=range(len(piece_table)),
-        num_samples=1000,
+        num_samples=200,
         seed=11,
     )
 
@@ -71,20 +83,17 @@ def test_sampler_balances_daylight_before_distance_bins(piece_table):
     assert max(day_bin_counts.values()) - min(day_bin_counts.values()) <= 1
 
 
-def test_sampler_allows_replacement_and_is_deterministic_by_seed_and_epoch(
+def test_sampler_is_no_replacement_and_deterministic_by_seed_and_epoch(
     piece_table,
 ):
-    positions = [
-        int(np.flatnonzero(piece_table.type_index == index)[0])
-        for index in range(5)
-    ]
-    first = FiveClassSampler(piece_table, positions, num_samples=20, seed=3)
-    second = FiveClassSampler(piece_table, positions, num_samples=20, seed=3)
+    positions = range(len(piece_table))
+    first = FiveClassSampler(piece_table, positions, num_samples=100, seed=3)
+    second = FiveClassSampler(piece_table, positions, num_samples=100, seed=3)
 
     epoch_one = list(first)
 
     assert epoch_one == list(second)
-    assert len({item.position for item in epoch_one}) == 5
+    assert len({item.position for item in epoch_one}) == len(epoch_one)
     first.set_epoch(2)
     second.set_epoch(2)
     assert list(first) == list(second)
@@ -104,6 +113,14 @@ def test_sampler_rejects_missing_types_invalid_arguments_and_distance_bins(
     with pytest.raises(ValueError, match="num_samples"):
         FiveClassSampler(
             piece_table, range(len(piece_table)), num_samples=10.5, seed=1
+        )
+    with pytest.raises(ValueError, match="divisible by five"):
+        FiveClassSampler(
+            piece_table, range(len(piece_table)), num_samples=11, seed=1
+        )
+    with pytest.raises(ValueError, match="without replacement"):
+        FiveClassSampler(
+            piece_table, range(len(piece_table)), num_samples=205, seed=1
         )
     with pytest.raises(ValueError, match="seed"):
         FiveClassSampler(
@@ -147,7 +164,13 @@ def test_distance_expert_sampler_draws_only_requested_type(piece_table):
     assert {
         int(piece_table.type_index[item.position]) for item in draws
     } == {1}
-    assert len({item.augmentation_seed for item in draws}) == 120
+    assert len(
+        {
+            seed
+            for item in draws
+            for seed in item.augmentation_seeds
+        }
+    ) == 240
 
 
 def test_distance_expert_sampler_balances_observed_cells(piece_table):

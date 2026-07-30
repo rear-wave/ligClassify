@@ -13,15 +13,15 @@ import numpy as np
 from .manifest import PieceTable, TYPE_NAMES
 
 
-TYPE_PRIOR = (0.60, 0.10, 0.10, 0.10, 0.10)
+TYPE_PRIOR = (0.20, 0.20, 0.20, 0.20, 0.20)
 
 
 @dataclass(frozen=True)
 class SampleRequest:
-    """One table position and its deterministic augmentation seed."""
+    """One table position and two deterministic augmentation seeds."""
 
     position: int
-    augmentation_seed: int
+    augmentation_seeds: tuple[int, int]
 
 
 def _largest_remainders(total: int, weights: Sequence[float]) -> list[int]:
@@ -40,14 +40,37 @@ def _largest_remainders(total: int, weights: Sequence[float]) -> list[int]:
     return quotas
 
 
+def _bounded_equal_quotas(total: int, capacities: Sequence[int]) -> list[int]:
+    """Distribute a quota evenly without exceeding any source cell."""
+    normalized = [int(capacity) for capacity in capacities]
+    if (
+        total < 0
+        or not normalized
+        or any(capacity < 0 for capacity in normalized)
+        or total > sum(normalized)
+    ):
+        raise ValueError("quota exceeds available samples")
+    quotas = [0] * len(normalized)
+    for _ in range(total):
+        available = [
+            index
+            for index, capacity in enumerate(normalized)
+            if quotas[index] < capacity
+        ]
+        selected = min(available, key=lambda index: (quotas[index], index))
+        quotas[selected] += 1
+    return quotas
+
+
 def _augmentation_seed(
     seed: int,
     epoch: int,
     draw_index: int,
     position: int,
+    view: int,
     attempt: int = 0,
 ) -> int:
-    payload = f"{seed}|{epoch}|{draw_index}|{position}"
+    payload = f"{seed}|{epoch}|{draw_index}|{position}|view={view}"
     if attempt:
         payload += f"|{attempt}"
     return int.from_bytes(
@@ -55,8 +78,36 @@ def _augmentation_seed(
     )
 
 
+def _paired_seeds(
+    seed: int,
+    epoch: int,
+    draw_index: int,
+    position: int,
+    used_seeds: set[int],
+) -> tuple[int, int]:
+    values: list[int] = []
+    for view in range(2):
+        attempt = 0
+        value = _augmentation_seed(
+            seed, epoch, draw_index, position, view
+        )
+        while value in used_seeds:
+            attempt += 1
+            value = _augmentation_seed(
+                seed,
+                epoch,
+                draw_index,
+                position,
+                view,
+                attempt,
+            )
+        used_seeds.add(value)
+        values.append(value)
+    return values[0], values[1]
+
+
 class FiveClassSampler:
-    """Sample type/daylight and optionally distance cells with replacement."""
+    """Sample equal type quotas without replacement within an epoch."""
 
     def __init__(
         self,
@@ -86,6 +137,8 @@ class FiveClassSampler:
 
         if self.num_samples <= 0:
             raise ValueError("num_samples must be positive")
+        if self.num_samples % len(TYPE_NAMES):
+            raise ValueError("num_samples must be divisible by five")
         if self.seed < 0:
             raise ValueError("seed must be non-negative")
         if not self.positions:
@@ -101,6 +154,15 @@ class FiveClassSampler:
         for type_index, type_name in enumerate(TYPE_NAMES):
             if type_index not in available_types:
                 raise ValueError(f"missing required type: {type_name}")
+            available = sum(
+                int(table.type_index[position]) == type_index
+                for position in self.positions
+            )
+            if self.num_samples // len(TYPE_NAMES) > available:
+                raise ValueError(
+                    "num_samples cannot be drawn without replacement; "
+                    f"{type_name} has only {available} pieces"
+                )
         if self.balance_distance:
             for position in self.positions:
                 type_index = int(table.type_index[position])
@@ -124,7 +186,7 @@ class FiveClassSampler:
         rng = np.random.default_rng(
             np.random.SeedSequence([self.seed, self.epoch])
         )
-        type_quotas = _largest_remainders(self.num_samples, TYPE_PRIOR)
+        type_quotas = [self.num_samples // len(TYPE_NAMES)] * len(TYPE_NAMES)
         draws: list[int] = []
         for type_index, type_quota in enumerate(type_quotas):
             type_positions = [
@@ -135,17 +197,20 @@ class FiveClassSampler:
             daylight_values = sorted(
                 {bool(self.table.daylight[position]) for position in type_positions}
             )
-            daylight_quotas = _largest_remainders(
-                type_quota, [1.0] * len(daylight_values)
-            )
-            for daylight, daylight_quota in zip(
-                daylight_values, daylight_quotas
-            ):
-                daylight_positions = [
+            daylight_groups = [
+                [
                     position
                     for position in type_positions
                     if bool(self.table.daylight[position]) == daylight
                 ]
+                for daylight in daylight_values
+            ]
+            daylight_quotas = _bounded_equal_quotas(
+                type_quota, [len(group) for group in daylight_groups]
+            )
+            for daylight_positions, daylight_quota in zip(
+                daylight_groups, daylight_quotas
+            ):
                 if type_index == 0 or not self.balance_distance:
                     leaves = [daylight_positions]
                 else:
@@ -163,12 +228,14 @@ class FiveClassSampler:
                         ]
                         for distance_bin in distance_bins
                     ]
-                leaf_quotas = _largest_remainders(
-                    daylight_quota, [1.0] * len(leaves)
+                leaf_quotas = _bounded_equal_quotas(
+                    daylight_quota, [len(leaf) for leaf in leaves]
                 )
                 for leaf, leaf_quota in zip(leaves, leaf_quotas):
                     if leaf_quota:
-                        selected = rng.choice(leaf, size=leaf_quota, replace=True)
+                        selected = rng.choice(
+                            leaf, size=leaf_quota, replace=False
+                        )
                         draws.extend(int(position) for position in selected)
         if len(draws) != self.num_samples:
             raise RuntimeError("sampler quota allocation did not sum to epoch size")
@@ -179,17 +246,14 @@ class FiveClassSampler:
         requests: list[SampleRequest] = []
         used_seeds: set[int] = set()
         for draw_index, position in enumerate(positions):
-            attempt = 0
-            augmentation_seed = _augmentation_seed(
-                self.seed, self.epoch, draw_index, position
+            seeds = _paired_seeds(
+                self.seed,
+                self.epoch,
+                draw_index,
+                position,
+                used_seeds,
             )
-            while augmentation_seed in used_seeds:
-                attempt += 1
-                augmentation_seed = _augmentation_seed(
-                    self.seed, self.epoch, draw_index, position, attempt
-                )
-            used_seeds.add(augmentation_seed)
-            requests.append(SampleRequest(position, augmentation_seed))
+            requests.append(SampleRequest(position, seeds))
 
         rng = np.random.default_rng(
             np.random.SeedSequence([self.seed, self.epoch, 0x53485546])
@@ -294,21 +358,14 @@ class DistanceExpertSampler:
         requests: list[SampleRequest] = []
         used_seeds: set[int] = set()
         for draw_index, position in enumerate(positions):
-            attempt = 0
-            augmentation_seed = _augmentation_seed(
-                self.seed, self.epoch, draw_index, position
+            seeds = _paired_seeds(
+                self.seed,
+                self.epoch,
+                draw_index,
+                position,
+                used_seeds,
             )
-            while augmentation_seed in used_seeds:
-                attempt += 1
-                augmentation_seed = _augmentation_seed(
-                    self.seed,
-                    self.epoch,
-                    draw_index,
-                    position,
-                    attempt,
-                )
-            used_seeds.add(augmentation_seed)
-            requests.append(SampleRequest(position, augmentation_seed))
+            requests.append(SampleRequest(position, seeds))
         rng = np.random.default_rng(
             np.random.SeedSequence([self.seed, self.epoch, 0x53485546])
         )

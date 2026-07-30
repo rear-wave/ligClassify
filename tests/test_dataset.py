@@ -1,6 +1,7 @@
 import struct
 
 import numpy as np
+import pytest
 import torch
 
 from data.dataset import FiveClassDataset, collate_batch
@@ -106,16 +107,37 @@ def test_only_seeded_training_requests_are_augmented(tmp_path):
     validation = FiveClassDataset(table, [1], split="validation", **kwargs)
 
     unseeded_training = training[0]
-    seeded_training = training[SampleRequest(position=1, augmentation_seed=77)]
+    seeded_training = training[
+        SampleRequest(position=1, augmentation_seeds=(77, 88))
+    ]
     unseeded_validation = validation[0]
     seeded_validation = validation[
-        SampleRequest(position=1, augmentation_seed=77)
+        SampleRequest(position=1, augmentation_seeds=(77, 88))
     ]
 
     assert torch.equal(unseeded_training["local"], unseeded_validation["local"])
     assert not torch.equal(seeded_training["local"], unseeded_training["local"])
+    assert set(seeded_training) == {
+        "local",
+        "global",
+        "local_alt",
+        "global_alt",
+        "daylight",
+        "type_label",
+        "distance_bin",
+        "source_path",
+        "piece_index",
+        "piece_key",
+    }
+    assert not torch.equal(
+        seeded_training["local"], seeded_training["local_alt"]
+    )
+    assert seeded_training["local_alt"].shape == (1, 8000)
+    assert seeded_training["global_alt"].shape == (1, 2000)
     assert torch.equal(seeded_validation["local"], unseeded_validation["local"])
     assert torch.equal(seeded_validation["global"], unseeded_validation["global"])
+    assert "local_alt" not in seeded_validation
+    assert "global_alt" not in seeded_validation
 
 
 def test_collation_retains_piece_identity(tmp_path):
@@ -141,3 +163,27 @@ def test_collation_retains_piece_identity(tmp_path):
         "NCG/0-100km/selected.lig#0",
         "NCG/0-100km/selected.lig#0",
     ]
+
+
+def test_collation_stacks_paired_views_and_rejects_partial_pairs(tmp_path):
+    table = _selected_piece_table(tmp_path)
+    dataset = FiveClassDataset(
+        table,
+        positions=[1],
+        split="train",
+        preprocess_config=PreprocessConfig(use_filter=False),
+        augmentation_config=AugmentationConfig(),
+    )
+    paired = dataset[
+        SampleRequest(position=1, augmentation_seeds=(17, 19))
+    ]
+
+    batch = collate_batch([paired, paired])
+
+    assert batch["local_alt"].shape == (2, 1, 8000)
+    assert batch["global_alt"].shape == (2, 1, 2000)
+    partial = dict(paired)
+    partial.pop("local_alt")
+    partial.pop("global_alt")
+    with pytest.raises(ValueError, match="paired views"):
+        collate_batch([paired, partial])
