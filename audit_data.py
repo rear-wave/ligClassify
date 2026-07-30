@@ -21,11 +21,11 @@ from data.split import (
 
 
 TRAINING_PRIOR = {
-    "IC": 0.60,
-    "NCG": 0.10,
-    "NNBE": 0.10,
-    "PCG": 0.10,
-    "PNBE": 0.10,
+    "IC": 0.20,
+    "NCG": 0.20,
+    "NNBE": 0.20,
+    "PCG": 0.20,
+    "PNBE": 0.20,
 }
 
 
@@ -109,18 +109,19 @@ def audit_dataset(
             "night": int(np.count_nonzero(~table.daylight)),
         },
         "distance_bin_counts": _distance_bin_counts(table),
-        "small_strata": sorted(
+        "evaluation_limited_strata": sorted(
             name
             for name, counts in strata.items()
             if isinstance(counts, dict)
-            and int(counts.get("insufficient_for_evaluation", 0)) > 0
+            and int(counts.get("insufficient_source_groups", 0)) > 0
         ),
         "split_schema": artifact["schema"],
         "split_seed": artifact["seed"],
         "split_ratios": artifact["ratios"],
         "manifest_hash": artifact["manifest_hash"],
         "split_hashes": artifact["partition_hashes"],
-        "split_counts": artifact["counts"],
+        "split_counts": artifact["piece_counts"],
+        "split_source_counts": artifact["source_counts"],
         "strata_counts": strata,
         "training_prior": dict(TRAINING_PRIOR),
     }

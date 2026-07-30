@@ -11,22 +11,23 @@ from tests.test_lig import make_piece, write_source
 
 def _write_audit_corpus(root):
     for type_index, type_name in enumerate(TYPE_NAMES):
-        distance = "" if type_name == "IC" else f"/{type_index * 100}-{(type_index + 1) * 100}km"
-        source = root / type_name / "mixed"
-        if distance:
-            source = root / type_name / "mixed" / distance.removeprefix("/")
-        source.mkdir(parents=True)
-        write_source(
-            source / "source.lig",
-            [
-                make_piece(type_index * 10 + 1, hour=0),
-                make_piece(type_index * 10 + 2, hour=16),
-                make_piece(type_index * 10 + 3, hour=0),
-                make_piece(type_index * 10 + 4, hour=16),
-                make_piece(type_index * 10 + 5, hour=0),
-                make_piece(type_index * 10 + 6, hour=16),
-            ],
+        distance = (
+            ""
+            if type_name == "IC"
+            else f"/{type_index * 100}-{(type_index + 1) * 100}km"
         )
+        directory = root / type_name / "mixed"
+        if distance:
+            directory = directory / distance.removeprefix("/")
+        directory.mkdir(parents=True)
+        for file_index in range(3):
+            write_source(
+                directory / f"source_{file_index}.lig",
+                [
+                    make_piece(type_index * 10 + file_index * 2 + 1, hour=0),
+                    make_piece(type_index * 10 + file_index * 2 + 2, hour=16),
+                ],
+            )
 
 
 def test_audit_reports_piece_split_and_training_prior(tmp_path, monkeypatch):
@@ -39,8 +40,8 @@ def test_audit_reports_piece_split_and_training_prior(tmp_path, monkeypatch):
     monkeypatch.setattr(audit_data, "audit_duplicate_waveforms", fail_if_called)
     report = audit_dataset(root, seed=42)
 
-    assert report["split_schema"] == "piece_stratified_split_v1"
-    assert report["files"] == 5
+    assert report["split_schema"] == "source_grouped_stratified_split_v2"
+    assert report["files"] == 15
     assert report["pieces"] == 30
     assert report["type_counts"] == {name: 6 for name in TYPE_NAMES}
     assert report["daylight_counts"] == {"day": 15, "night": 15}
@@ -54,24 +55,27 @@ def test_audit_reports_piece_split_and_training_prior(tmp_path, monkeypatch):
     assert report["split_counts"]["train"] > 0
     assert set(report["split_hashes"]) == set(PARTITION_NAMES)
     assert len(report["manifest_hash"]) == 64
-    assert report["small_strata"] == []
+    assert report["evaluation_limited_strata"] == []
     assert report["training_prior"] == {
-        "IC": 0.60,
-        "NCG": 0.10,
-        "NNBE": 0.10,
-        "PCG": 0.10,
-        "PNBE": 0.10,
+        "IC": 0.20,
+        "NCG": 0.20,
+        "NNBE": 0.20,
+        "PCG": 0.20,
+        "PNBE": 0.20,
     }
+    assert sum(report["split_source_counts"].values()) == 15
     assert "duplicate_waveforms" not in report
 
 
 def test_duplicate_audit_rejects_identical_bytes_across_splits(tmp_path):
-    root = tmp_path / "train_data"
-    source = root / "NCG" / "day" / "0-100km" / "duplicate.lig"
-    source.parent.mkdir(parents=True)
+    directory = (
+        tmp_path / "train_data" / "NCG" / "day" / "0-100km"
+    )
+    directory.mkdir(parents=True)
     raw = make_piece(17, hour=8)
-    write_source(source, [raw, raw, raw, raw])
-    table, _ = build_piece_table(root)
+    for index in range(3):
+        write_source(directory / f"duplicate_{index}.lig", [raw])
+    table, _ = build_piece_table(tmp_path / "train_data")
     assignment = assign_piece_splits(table, seed=42)
 
     with pytest.raises(ValueError, match="duplicate waveform crosses partitions"):
