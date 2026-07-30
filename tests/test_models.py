@@ -7,7 +7,9 @@ from models import (
     CASCADE_ARCHITECTURE,
     DISTANCE_BIN_COUNT,
     DISTANCE_EXPERT_COUNT,
+    HIERARCHICAL_TYPE_ARCHITECTURE,
     create_five_class_model,
+    create_hierarchical_type_model,
 )
 
 
@@ -201,3 +203,88 @@ def test_single_distance_role_forward_matches_selected_head():
     selected, _ = model.forward_distance_type(*inputs, expert_index=2)
 
     assert torch.allclose(selected, all_heads[2])
+
+
+def test_hierarchical_type_model_returns_complete_probability_contract():
+    model = create_hierarchical_type_model(
+        base_channels=8,
+        embedding_dim=32,
+        prototypes_per_class=3,
+    )
+
+    output = model(*_inputs(batch_size=2))
+
+    assert model.architecture == HIERARCHICAL_TYPE_ARCHITECTURE
+    assert output.type_logits.shape == (2, 5)
+    assert output.gate_logits.shape == (2, 2)
+    assert output.known_logits.shape == (2, 4)
+    assert output.prototype_logits.shape == (2, 4, 3)
+    assert output.prototype_scores.shape == (2, 4)
+    assert output.local_known_logits.shape == (2, 4)
+    assert output.global_known_logits.shape == (2, 4)
+    assert output.embedding.shape == (2, 32)
+    assert torch.allclose(
+        output.type_logits.exp().sum(dim=1),
+        torch.ones(2),
+        atol=1e-6,
+    )
+
+    type_logits, features = model.forward_type(*_inputs(batch_size=2))
+    assert type_logits.shape == (2, 5)
+    assert features.shape == (2, 32)
+
+
+def test_hierarchical_type_gradients_reach_both_scales_and_prototypes():
+    model = create_hierarchical_type_model(
+        base_channels=8,
+        embedding_dim=32,
+        prototypes_per_class=4,
+    )
+    local, global_view, daylight = _inputs(batch_size=2)
+    local.requires_grad_(True)
+    global_view.requires_grad_(True)
+
+    output = model(local, global_view, daylight)
+    loss = (
+        output.type_logits.square().mean()
+        + output.local_known_logits.square().mean()
+        + output.global_known_logits.square().mean()
+    )
+    loss.backward()
+
+    assert local.grad is not None and local.grad.abs().sum() > 0
+    assert global_view.grad is not None and global_view.grad.abs().sum() > 0
+    assert model.prototype_matcher.prototypes.grad is not None
+    assert model.prototype_matcher.prototypes.grad.abs().sum() > 0
+    normalized = model.prototype_matcher.normalized_prototypes()
+    assert torch.allclose(
+        normalized.norm(dim=-1),
+        torch.ones(4, 4),
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"base_channels": 0},
+        {"embedding_dim": 0},
+        {"prototypes_per_class": 0},
+        {"prototype_logit_weight": -0.1},
+    ],
+)
+def test_hierarchical_type_model_rejects_invalid_configuration(kwargs):
+    with pytest.raises(ValueError):
+        create_hierarchical_type_model(**kwargs)
+
+
+def test_hierarchical_type_model_rejects_malformed_inputs():
+    model = create_hierarchical_type_model(base_channels=8)
+    local, global_view, daylight = _inputs(batch_size=2)
+
+    with pytest.raises(ValueError, match="local"):
+        model(local[:, :, :-1], global_view, daylight)
+    with pytest.raises(ValueError, match="global_view"):
+        model(local, global_view[:, :, :-1], daylight)
+    with pytest.raises(ValueError, match="daylight"):
+        model(local, global_view, daylight[:, 0])

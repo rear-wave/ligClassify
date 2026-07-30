@@ -20,6 +20,8 @@ LOCAL_LENGTH = 8000
 GLOBAL_LENGTH = 2000
 CASCADE_ARCHITECTURE = "five_class_v1"
 MODEL_VARIANT = "type_then_prototype_distance_v1"
+HIERARCHICAL_TYPE_ARCHITECTURE = "hierarchical_five_class_v2"
+HIERARCHICAL_TYPE_VARIANT = "ic_gate_known_prototypes_v2"
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -285,6 +287,98 @@ class DualViewEncoder(nn.Module):
         )
 
 
+class GatedDualViewEncoder(nn.Module):
+    """Fuse local/global waveform evidence with learned per-piece weights."""
+
+    def __init__(self, base_channels: int):
+        super().__init__()
+        self.local_branch = WaveformBranch(base_channels)
+        self.global_branch = WaveformBranch(base_channels)
+        self.output_dim = base_channels * 4
+        self.local_projection = nn.Sequential(
+            nn.LayerNorm(self.local_branch.output_dim),
+            nn.Linear(self.local_branch.output_dim, self.output_dim),
+            nn.GELU(),
+        )
+        self.global_projection = nn.Sequential(
+            nn.LayerNorm(self.global_branch.output_dim),
+            nn.Linear(self.global_branch.output_dim, self.output_dim),
+            nn.GELU(),
+        )
+        self.fusion_gate = nn.Linear(self.output_dim * 2 + 1, 2)
+        self.daylight_projection = nn.Linear(1, self.output_dim, bias=False)
+        self.fusion = nn.Sequential(
+            nn.LayerNorm(self.output_dim),
+            nn.Linear(self.output_dim, self.output_dim),
+            nn.GELU(),
+        )
+
+    def forward(
+        self,
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        local_features = self.local_projection(self.local_branch(local))
+        global_features = self.global_projection(
+            self.global_branch(global_view)
+        )
+        weights = self.fusion_gate(
+            torch.cat((local_features, global_features, daylight), dim=1)
+        ).softmax(dim=1)
+        fused = (
+            weights[:, :1] * local_features
+            + weights[:, 1:] * global_features
+            + self.daylight_projection(daylight)
+        )
+        return local_features, global_features, self.fusion(fused)
+
+
+class KnownPrototypeMatcher(nn.Module):
+    """Match known-class embeddings against multiple learned prototypes."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        prototypes_per_class: int,
+    ):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.prototypes_per_class = prototypes_per_class
+        self.prototypes = nn.Parameter(
+            torch.empty(
+                DISTANCE_EXPERT_COUNT,
+                prototypes_per_class,
+                embedding_dim,
+            )
+        )
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.prototypes, mean=0.0, std=0.02)
+
+    def normalized_prototypes(self) -> torch.Tensor:
+        """Return unit prototypes used by cosine matching."""
+        return F.normalize(self.prototypes, dim=-1, eps=1e-6)
+
+    def forward(
+        self, embedding: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        normalized_embedding = F.normalize(embedding, dim=-1, eps=1e-6)
+        cosine = torch.einsum(
+            "bd,ckd->bck",
+            normalized_embedding,
+            self.normalized_prototypes(),
+        )
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        logits = cosine * scale
+        aggregated = torch.logsumexp(logits, dim=2) - math.log(
+            self.prototypes_per_class
+        )
+        return logits, aggregated, cosine.max(dim=2).values
+
+
 class PrototypeDistanceMatcher(nn.Module):
     """Match distance features to ordered, class-specific 100-km prototypes."""
 
@@ -336,6 +430,20 @@ class ModelOutput:
     type_logits: torch.Tensor
     distance_logits: tuple[torch.Tensor, ...]
     features: torch.Tensor
+
+
+@dataclass(frozen=True)
+class HierarchicalTypeOutput:
+    """Complete evidence produced by the hierarchical type classifier."""
+
+    type_logits: torch.Tensor
+    gate_logits: torch.Tensor
+    known_logits: torch.Tensor
+    prototype_logits: torch.Tensor
+    prototype_scores: torch.Tensor
+    local_known_logits: torch.Tensor
+    global_known_logits: torch.Tensor
+    embedding: torch.Tensor
 
 
 class FiveClassNet(nn.Module):
@@ -486,7 +594,148 @@ class FiveClassNet(nn.Module):
         return DISTANCE_NAMES.index(role)
 
 
+class HierarchicalTypeNet(nn.Module):
+    """Five-class type model with an IC gate and known-class evidence."""
+
+    architecture = HIERARCHICAL_TYPE_ARCHITECTURE
+    model_variant = HIERARCHICAL_TYPE_VARIANT
+
+    def __init__(
+        self,
+        base_channels: int = 64,
+        embedding_dim: int = 128,
+        prototypes_per_class: int = 4,
+        prototype_logit_weight: float = 0.25,
+    ):
+        super().__init__()
+        if type(base_channels) is not int or base_channels <= 0:
+            raise ValueError("base_channels must be a positive integer")
+        if type(embedding_dim) is not int or embedding_dim <= 0:
+            raise ValueError("embedding_dim must be a positive integer")
+        if (
+            type(prototypes_per_class) is not int
+            or prototypes_per_class <= 0
+        ):
+            raise ValueError(
+                "prototypes_per_class must be a positive integer"
+            )
+        if (
+            isinstance(prototype_logit_weight, bool)
+            or not math.isfinite(float(prototype_logit_weight))
+            or float(prototype_logit_weight) < 0.0
+        ):
+            raise ValueError(
+                "prototype_logit_weight must be finite and non-negative"
+            )
+        self.base_channels = base_channels
+        self.embedding_dim = embedding_dim
+        self.prototypes_per_class = prototypes_per_class
+        self.prototype_logit_weight = float(prototype_logit_weight)
+        self.encoder = GatedDualViewEncoder(base_channels)
+        feature_dim = self.encoder.output_dim
+        self.gate_head = nn.Linear(feature_dim, 2)
+        self.known_head = nn.Linear(feature_dim, DISTANCE_EXPERT_COUNT)
+        self.local_known_head = nn.Linear(
+            feature_dim, DISTANCE_EXPERT_COUNT
+        )
+        self.global_known_head = nn.Linear(
+            feature_dim, DISTANCE_EXPERT_COUNT
+        )
+        self.embedding_head = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, embedding_dim),
+        )
+        self.prototype_matcher = KnownPrototypeMatcher(
+            embedding_dim,
+            prototypes_per_class,
+        )
+
+    @staticmethod
+    def _validate_inputs(
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+    ) -> None:
+        FiveClassNet._validate_inputs(local, global_view, daylight)
+
+    def forward_hierarchical(
+        self,
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+    ) -> HierarchicalTypeOutput:
+        """Return gate, known-head, prototype, and joint type evidence."""
+        self._validate_inputs(local, global_view, daylight)
+        local_features, global_features, fused = self.encoder(
+            local, global_view, daylight
+        )
+        gate_logits = self.gate_head(fused)
+        embedding = F.normalize(
+            self.embedding_head(fused), dim=1, eps=1e-6
+        )
+        prototype_logits, prototype_evidence, prototype_scores = (
+            self.prototype_matcher(embedding)
+        )
+        known_logits = (
+            self.known_head(fused)
+            + self.prototype_logit_weight * prototype_evidence
+        )
+        gate_log_probabilities = F.log_softmax(gate_logits, dim=1)
+        known_log_probabilities = F.log_softmax(known_logits, dim=1)
+        type_logits = torch.cat(
+            (
+                gate_log_probabilities[:, :1],
+                gate_log_probabilities[:, 1:]
+                + known_log_probabilities,
+            ),
+            dim=1,
+        )
+        return HierarchicalTypeOutput(
+            type_logits=type_logits,
+            gate_logits=gate_logits,
+            known_logits=known_logits,
+            prototype_logits=prototype_logits,
+            prototype_scores=prototype_scores,
+            local_known_logits=self.local_known_head(local_features),
+            global_known_logits=self.global_known_head(global_features),
+            embedding=embedding,
+        )
+
+    def forward_type(
+        self,
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return joint five-class log probabilities and metric features."""
+        output = self.forward_hierarchical(local, global_view, daylight)
+        return output.type_logits, output.embedding
+
+    def forward(
+        self,
+        local: torch.Tensor,
+        global_view: torch.Tensor,
+        daylight: torch.Tensor,
+    ) -> HierarchicalTypeOutput:
+        return self.forward_hierarchical(local, global_view, daylight)
+
+
 def create_five_class_model(base_channels: int = 64) -> FiveClassNet:
     """Create a randomly initialized two-stage cascade."""
 
     return FiveClassNet(base_channels=base_channels)
+
+
+def create_hierarchical_type_model(
+    base_channels: int = 64,
+    embedding_dim: int = 128,
+    prototypes_per_class: int = 4,
+    prototype_logit_weight: float = 0.25,
+) -> HierarchicalTypeNet:
+    """Create a randomly initialized hierarchical five-class type model."""
+    return HierarchicalTypeNet(
+        base_channels=base_channels,
+        embedding_dim=embedding_dim,
+        prototypes_per_class=prototypes_per_class,
+        prototype_logit_weight=prototype_logit_weight,
+    )
