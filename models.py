@@ -123,81 +123,12 @@ class LegacyMultiTaskResNet(nn.Module):
         return type_logits, distance_logits
 
 
-class MultiScaleResidualBlock(nn.Module):
-    """Fuse short, medium, and long temporal filters."""
-
-    def __init__(
-        self, channels: int, kernels: tuple[int, ...] = (7, 31, 127)
-    ):
-        super().__init__()
-        self.branches = nn.ModuleList(
-            nn.Sequential(
-                nn.Conv1d(
-                    channels,
-                    channels,
-                    kernel_size,
-                    padding=kernel_size // 2,
-                    groups=channels,
-                    bias=False,
-                ),
-                _group_norm(channels),
-                nn.GELU(),
-            )
-            for kernel_size in kernels
-        )
-        self.fuse = nn.Sequential(
-            nn.Conv1d(channels * len(kernels), channels, 1, bias=False),
-            _group_norm(channels),
-        )
-
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
-        mixed = self.fuse(
-            torch.cat([branch(values) for branch in self.branches], dim=1)
-        )
-        return F.gelu(values + mixed)
-
-
-class _FullResolutionWaveformBranch(nn.Module):
-    """Encode one signed local or global waveform view."""
+class WaveformBranch(nn.Module):
+    """Memory-bounded encoder for one signed waveform view."""
 
     def __init__(self, base: int):
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Conv1d(1, base, 15, stride=4, padding=7, bias=False),
-            _group_norm(base),
-            nn.GELU(),
-            MultiScaleResidualBlock(base),
-            nn.Conv1d(base, base * 2, 7, stride=2, padding=3, bias=False),
-            _group_norm(base * 2),
-            nn.GELU(),
-            MultiScaleResidualBlock(base * 2),
-            nn.Conv1d(base * 2, base * 4, 7, stride=2, padding=3, bias=False),
-            _group_norm(base * 4),
-            nn.GELU(),
-            MultiScaleResidualBlock(base * 4),
-        )
-        self.average = nn.AdaptiveAvgPool1d(1)
-        self.maximum = nn.AdaptiveMaxPool1d(1)
         self.output_dim = base * 8
-
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
-        encoded = self.network(values)
-        return torch.cat(
-            (
-                self.average(encoded).squeeze(-1),
-                self.maximum(encoded).squeeze(-1),
-            ),
-            dim=1,
-        )
-
-
-class WaveformBranch(_FullResolutionWaveformBranch):
-    """Memory-bounded waveform branch with signed anti-alias downsampling."""
-
-    downsample_factor = 1
-
-    def __init__(self, *args: object, **kwargs: object):
-        super().__init__(*args, **kwargs)
         encoded_dim = self.output_dim // 2
         width = max(8, min(32, encoded_dim // 4))
         self.network = nn.Sequential(
@@ -232,6 +163,8 @@ class WaveformBranch(_FullResolutionWaveformBranch):
             nn.GroupNorm(1, encoded_dim),
             nn.GELU(),
         )
+        self.average = nn.AdaptiveAvgPool1d(1)
+        self.maximum = nn.AdaptiveMaxPool1d(1)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         if values.ndim not in (2, 3):
@@ -239,17 +172,16 @@ class WaveformBranch(_FullResolutionWaveformBranch):
                 "waveform input must have shape [batch, length] or "
                 "[batch, channels, length]"
             )
-        restore_channel = values.ndim == 2
-        pooled = values.unsqueeze(1) if restore_channel else values
-        if pooled.shape[-1] >= self.downsample_factor * 32:
-            pooled = F.avg_pool1d(
-                pooled,
-                kernel_size=self.downsample_factor,
-                stride=self.downsample_factor,
-            )
-        if restore_channel:
-            pooled = pooled.squeeze(1)
-        return super().forward(pooled)
+        encoded = self.network(
+            values.unsqueeze(1) if values.ndim == 2 else values
+        )
+        return torch.cat(
+            (
+                self.average(encoded).squeeze(-1),
+                self.maximum(encoded).squeeze(-1),
+            ),
+            dim=1,
+        )
 
 
 class DualViewEncoder(nn.Module):

@@ -105,6 +105,7 @@ def _decode_prediction(
     distance_logits: Sequence[torch.Tensor],
     *,
     type_only: bool = False,
+    forced_type_index: int | None = None,
 ) -> Prediction:
     if type_logits.ndim != 1 or type_logits.numel() != len(TYPE_NAMES):
         raise ValueError("type_logits must contain exactly five values")
@@ -112,7 +113,13 @@ def _decode_prediction(
         raise ValueError("distance_logits must contain exactly four experts")
 
     type_probabilities_tensor = torch.softmax(type_logits.detach().float(), dim=0)
-    type_index = int(type_probabilities_tensor.argmax().item())
+    type_index = (
+        int(type_probabilities_tensor.argmax().item())
+        if forced_type_index is None
+        else int(forced_type_index)
+    )
+    if not 0 <= type_index < len(TYPE_NAMES):
+        raise ValueError("forced_type_index is outside the type label range")
     type_probabilities = tuple(
         float(value) for value in type_probabilities_tensor.cpu().tolist()
     )
@@ -216,6 +223,35 @@ def _new_preprocess_config(checkpoint: LoadedCheckpoint) -> PreprocessConfig:
         use_filter=bool(config.get("use_filter", True)),
         cutoff_hz=float(config.get("cutoff_hz", 120_000.0)),
         sample_rate_hz=float(config.get("sample_rate_hz", 5_000_000.0)),
+        local_center_mode=str(
+            config.get("local_center_mode", "peak_abs_v1")
+        ),
+        local_energy_window=int(config.get("local_energy_window", 128)),
+    )
+
+
+def _hierarchical_type_inference(
+    checkpoint: LoadedCheckpoint,
+    local: torch.Tensor,
+    global_view: torch.Tensor,
+    daylight: torch.Tensor,
+    alternate_daylight: torch.Tensor | None,
+    missing: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Adapt a validated checkpoint to shared hierarchical inference."""
+    from evaluation import infer_hierarchical_types
+
+    raw_config = checkpoint.metadata.get("decision_config")
+    if not isinstance(raw_config, dict):
+        raise ValueError("hierarchical checkpoint has no decision_config")
+    return infer_hierarchical_types(
+        checkpoint.model,
+        raw_config,
+        local,
+        global_view,
+        daylight,
+        alternate_daylight,
+        missing,
     )
 
 
@@ -226,9 +262,14 @@ def predict_batch(
     *,
     device: torch.device,
     type_only: bool,
+    direct_type: bool = False,
 ) -> list[Prediction]:
     """Run one bounded batch through its schema-specific input adapter."""
-    if checkpoint.schema not in SUPPORTED_SCHEMAS:
+    hierarchical_schema = "hierarchical_five_class_v2"
+    if (
+        checkpoint.schema not in SUPPORTED_SCHEMAS
+        and checkpoint.schema != hierarchical_schema
+    ):
         raise ValueError(f"unsupported checkpoint schema: {checkpoint.schema!r}")
     values = np.asarray(waveforms, dtype=np.float32)
     if values.ndim != 2 or len(values) == 0:
@@ -237,8 +278,43 @@ def predict_batch(
         raise ValueError("waveforms and timestamps must be aligned")
 
     checkpoint.model.eval()
+    forced_type_indices: torch.Tensor | None = None
     with torch.inference_mode():
-        if checkpoint.schema == FIVE_CLASS_SCHEMA:
+        if checkpoint.schema == hierarchical_schema:
+            if not type_only:
+                raise ValueError(
+                    "a hierarchical type checkpoint requires --type_only; "
+                    "use --model_dir for type and distance inference"
+                )
+            local, global_view = preprocess_views(
+                values, _new_preprocess_config(checkpoint)
+            )
+            local_tensor = torch.from_numpy(local).unsqueeze(1).to(device)
+            global_tensor = (
+                torch.from_numpy(global_view).unsqueeze(1).to(device)
+            )
+            daylight_tensor, alternate_daylight, missing = _daylight_inputs(
+                timestamps,
+                device,
+            )
+            type_logits, forced_type_indices = _hierarchical_type_inference(
+                checkpoint,
+                local_tensor,
+                global_tensor,
+                daylight_tensor,
+                alternate_daylight,
+                missing,
+            )
+            if direct_type:
+                forced_type_indices = None
+            distance_logits = tuple(
+                type_logits.new_zeros(
+                    (len(values), len(DISTANCE_BINS_KM))
+                )
+                for _ in DISTANCE_NAMES
+            )
+            decoder = decode_new_prediction
+        elif checkpoint.schema == FIVE_CLASS_SCHEMA:
             local, global_view = preprocess_views(
                 values, _new_preprocess_config(checkpoint)
             )
@@ -313,13 +389,76 @@ def predict_batch(
     ):
         raise ValueError("model returned malformed distance logits")
     return [
-        decoder(
-            type_logits[row_index],
-            [head[row_index] for head in distance_logits],
-            type_only=type_only,
+        (
+            decoder(
+                type_logits[row_index],
+                [head[row_index] for head in distance_logits],
+                type_only=type_only,
+            )
+            if forced_type_indices is None
+            else decoder(
+                type_logits[row_index],
+                [head[row_index] for head in distance_logits],
+                type_only=type_only,
+                forced_type_index=int(
+                    forced_type_indices[row_index].item()
+                ),
+            )
         )
         for row_index in range(len(values))
     ]
+
+
+def _route_distance_heads(
+    bundle: LoadedModelBundle,
+    local: torch.Tensor,
+    global_view: torch.Tensor,
+    daylight: torch.Tensor,
+    alternate_daylight: torch.Tensor | None,
+    missing: torch.Tensor,
+    final_type: torch.Tensor,
+    *,
+    type_only: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Run only the distance model selected by the stable type decision."""
+    heads = [
+        local.new_zeros((len(local), len(DISTANCE_BINS_KM)))
+        for _ in DISTANCE_NAMES
+    ]
+    if type_only:
+        return tuple(heads)
+    for type_index, checkpoint in enumerate(
+        bundle.distance_checkpoints, start=1
+    ):
+        selected = final_type.eq(type_index)
+        if not torch.any(selected):
+            continue
+        checkpoint.model.eval()
+        logits, _ = checkpoint.model.forward_distance_type(
+            local[selected],
+            global_view[selected],
+            daylight[selected],
+            expert_index=type_index - 1,
+        )
+        if alternate_daylight is not None:
+            alternate_logits, _ = checkpoint.model.forward_distance_type(
+                local[selected],
+                global_view[selected],
+                alternate_daylight[selected],
+                expert_index=type_index - 1,
+            )
+            logits = _average_unknown_logits(
+                logits,
+                alternate_logits,
+                missing[selected],
+            )
+        expected = (int(selected.sum().item()), len(DISTANCE_BINS_KM))
+        if tuple(logits.shape) != expected:
+            raise ValueError(
+                f"{TYPE_NAMES[type_index]} model returned malformed logits"
+            )
+        heads[type_index - 1][selected] = logits
+    return tuple(heads)
 
 
 def predict_bundle_batch(
@@ -346,43 +485,75 @@ def predict_bundle_batch(
         timestamps,
         device,
     )
+    forced_type_indices: torch.Tensor | None = None
     with torch.inference_mode():
-        type_logits, heads = forward_model_bundle(
-            bundle,
-            local_tensor,
-            global_tensor,
-            daylight,
-            type_only=type_only,
-        )
-        if alternate_daylight is not None:
-            alternate_type_logits, alternate_heads = forward_model_bundle(
+        if checkpoint.schema == "hierarchical_five_class_v2":
+            type_logits, forced_type_indices = _hierarchical_type_inference(
+                checkpoint,
+                local_tensor,
+                global_tensor,
+                daylight,
+                alternate_daylight,
+                missing,
+            )
+            heads = _route_distance_heads(
                 bundle,
                 local_tensor,
                 global_tensor,
+                daylight,
                 alternate_daylight,
+                missing,
+                forced_type_indices,
                 type_only=type_only,
             )
-            type_logits = _average_unknown_logits(
-                type_logits,
-                alternate_type_logits,
-                missing,
+        else:
+            type_logits, heads = forward_model_bundle(
+                bundle,
+                local_tensor,
+                global_tensor,
+                daylight,
+                type_only=type_only,
             )
-            heads = tuple(
-                _average_unknown_logits(
-                    primary_head,
-                    alternate_head,
+            if alternate_daylight is not None:
+                alternate_type_logits, alternate_heads = (
+                    forward_model_bundle(
+                        bundle,
+                        local_tensor,
+                        global_tensor,
+                        alternate_daylight,
+                        type_only=type_only,
+                    )
+                )
+                type_logits = _average_unknown_logits(
+                    type_logits,
+                    alternate_type_logits,
                     missing,
                 )
-                for primary_head, alternate_head in zip(
-                    heads,
-                    alternate_heads,
+                heads = tuple(
+                    _average_unknown_logits(
+                        primary_head,
+                        alternate_head,
+                        missing,
+                    )
+                    for primary_head, alternate_head in zip(
+                        heads,
+                        alternate_heads,
+                    )
                 )
-            )
     return [
-        decode_new_prediction(
-            type_logits[row],
-            [head[row] for head in heads],
-            type_only=type_only,
+        (
+            decode_new_prediction(
+                type_logits[row],
+                [head[row] for head in heads],
+                type_only=type_only,
+            )
+            if forced_type_indices is None
+            else decode_new_prediction(
+                type_logits[row],
+                [head[row] for head in heads],
+                type_only=type_only,
+                forced_type_index=int(forced_type_indices[row].item()),
+            )
         )
         for row in range(len(values))
     ]
@@ -542,6 +713,7 @@ def classify_directory(
     *,
     batch_size: int = 256,
     type_only: bool = False,
+    direct_type: bool = False,
     device: str | torch.device = "auto",
 ) -> Path:
     """Classify a directory recursively with bounded byte-exact regrouping."""
@@ -556,7 +728,10 @@ def classify_directory(
 
     runtime_device = _resolve_device(device)
     checkpoint = load_model_checkpoint(checkpoint_path, runtime_device)
-    if checkpoint.schema not in SUPPORTED_SCHEMAS:
+    if (
+        checkpoint.schema not in SUPPORTED_SCHEMAS
+        and checkpoint.schema != "hierarchical_five_class_v2"
+    ):
         raise ValueError(f"unsupported checkpoint schema: {checkpoint.schema!r}")
     checkpoint.model.eval()
     checkpoint_hash = model_sha256(checkpoint_path)
@@ -570,6 +745,7 @@ def classify_directory(
             timestamps,
             device=runtime_device,
             type_only=type_only,
+            direct_type=direct_type,
         ),
         checkpoint_schema=checkpoint.schema,
         checkpoint_hash=checkpoint_hash,
@@ -640,6 +816,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_dir")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--type_only", action="store_true")
+    parser.add_argument("--direct_type", action="store_true")
     parser.add_argument("--device", default="auto")
     return parser
 
@@ -676,6 +853,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
         args.model,
         batch_size=args.batch_size,
         type_only=args.type_only,
+        direct_type=args.direct_type,
         device=args.device,
     )
 

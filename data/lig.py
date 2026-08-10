@@ -62,6 +62,15 @@ def _validate_source(path: str | os.PathLike[str], piece_count: int) -> int:
     elif payload_size >= 0 and payload_size % piece_count == 0:
         piece_bytes = payload_size // piece_count
         if piece_bytes in SUPPORTED_PIECE_BYTES:
+            # Some files have a size that divides evenly as 32208 but are
+            # actually laid out with the 32464 variant (256-byte extra piece
+            # header). Disambiguate by checking whether piece #1's timestamp
+            # is valid under each layout; the correct layout yields a valid
+            # timestamp, the wrong one reads waveform bytes as a timestamp.
+            if piece_bytes == PIECE_BYTES and piece_count >= 2:
+                for candidate in (PIECE_BYTES + 256, PIECE_BYTES):
+                    if _piece1_timestamp_valid(path, candidate):
+                        return candidate
             return piece_bytes
     expected = ", ".join(
         str(FILE_HEADER_BYTES + piece_count * size)
@@ -71,6 +80,20 @@ def _validate_source(path: str | os.PathLike[str], piece_count: int) -> int:
         f"LIG size mismatch: {path}: expected one of [{expected}], "
         f"got {actual_size}"
     )
+
+
+def _piece1_timestamp_valid(path: str | os.PathLike[str], piece_bytes: int) -> bool:
+    """Return True if piece #1's timestamp decodes as a plausible datetime."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(FILE_HEADER_BYTES + piece_bytes + _TIMESTAMP_OFFSET)
+            raw = handle.read(_TIMESTAMP_BYTES)
+        year, month, day = struct.unpack_from("<3i", raw, 0)
+        if year < 100:
+            year += 2000
+        return 2000 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31
+    except (OSError, struct.error):
+        return False
 
 
 def _source_piece_bytes(path: str | os.PathLike[str]) -> tuple[int, int]:
@@ -194,6 +217,12 @@ class LigFileIndex:
                 piece_bytes = _validate_source(path, piece_count)
             else:
                 piece_bytes = PIECE_BYTES
+            # When the file uses the larger piece variant, the declared count
+            # may overstate how many pieces actually fit; clamp to the number
+            # of complete pieces the payload can hold.
+            if piece_bytes > PIECE_BYTES:
+                payload = os.path.getsize(path) - FILE_HEADER_BYTES
+                piece_count = min(piece_count, payload // piece_bytes)
             self.filepaths.append(path)
             self.num_pieces_per_file.append(piece_count)
             self.piece_bytes_per_file.append(piece_bytes)

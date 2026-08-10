@@ -268,8 +268,15 @@ def _fit_role(
     role_seed = args.seed + TRAINING_ROLES.index(role)
     _seed_everything(role_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_five_class_model(args.base_channels).to(device)
-    model.set_training_role(role)
+    if role == "type":
+        from models import create_hierarchical_type_model
+
+        model = create_hierarchical_type_model(
+            base_channels=args.base_channels
+        ).to(device)
+    else:
+        model = create_five_class_model(args.base_channels).to(device)
+        model.set_training_role(role)
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         parameters, lr=args.lr, weight_decay=args.weight_decay
@@ -305,10 +312,35 @@ def _fit_role(
             stack.callback(dataset.close)
             datasets[split] = dataset
         if role == "type":
+            type_counts = np.bincount(
+                table.type_index[
+                    _role_positions(
+                        table, split_positions["train"], role
+                    )
+                ],
+                minlength=5,
+            )
+            maximum_type_samples = 5 * int(type_counts.min())
+            effective_type_samples = min(
+                int(args.type_samples_per_epoch),
+                maximum_type_samples,
+            )
+            effective_type_samples -= effective_type_samples % 5
+            if effective_type_samples <= 0:
+                raise ValueError(
+                    "type training requires at least one piece per class"
+                )
+            if effective_type_samples < int(args.type_samples_per_epoch):
+                print(
+                    "type samples per epoch capped at "
+                    f"{effective_type_samples} "
+                    f"({effective_type_samples // 5} per class; "
+                    "no replacement)"
+                )
             sampler = FiveClassSampler(
                 table,
                 split_positions["train"],
-                num_samples=args.type_samples_per_epoch,
+            num_samples=effective_type_samples,
                 seed=role_seed,
                 balance_distance=False,
             )
@@ -390,18 +422,66 @@ def _fit_role(
         if stopping.best_state is None:
             raise ValueError(f"{role} training selected no model")
         model.load_state_dict(stopping.best_state, strict=True)
+        decision_config = None
+        if role == "type":
+            from evaluation import (
+                decision_config_dict,
+                evaluate_hierarchical_type_role,
+            )
+
+            validation, calibrated_config = (
+                evaluate_hierarchical_type_role(
+                    model, loaders["validation"], device
+                )
+            )
+            test, _ = evaluate_hierarchical_type_role(
+                model,
+                loaders["test"],
+                device,
+                decision_config=calibrated_config,
+            )
+            decision_config = decision_config_dict(calibrated_config)
+        else:
+            validation = _evaluate_role(
+                model, loaders["validation"], device, role
+            )
+            test = _evaluate_role(model, loaders["test"], device, role)
         save_model_checkpoint(
             role_output / "model.pt",
             model,
-            model_config={"base_channels": args.base_channels},
+            model_config={
+                "base_channels": args.base_channels,
+                **(
+                    {
+                        "embedding_dim": int(
+                            next(
+                                value
+                                for name, value in model.state_dict().items()
+                                if name.endswith("prototypes")
+                                and value.ndim == 3
+                            ).shape[-1]
+                        ),
+                        "prototypes_per_class": int(
+                            next(
+                                value
+                                for name, value in model.state_dict().items()
+                                if name.endswith("prototypes")
+                                and value.ndim == 3
+                            ).shape[-2]
+                        ),
+                        "prototype_logit_weight": float(
+                            model.prototype_logit_weight
+                        ),
+                    }
+                    if role == "type"
+                    else {}
+                ),
+            },
             preprocess_config=asdict(preprocess_config),
             split_hash=split_hash,
             training_config=config,
+            decision_config=decision_config,
         )
-        validation = _evaluate_role(
-            model, loaders["validation"], device, role
-        )
-        test = _evaluate_role(model, loaders["test"], device, role)
 
     metrics = {
         "schema": "five_class_role_metrics_v1",
@@ -445,7 +525,9 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         split: assignment.positions(split)
         for split in ("train", "validation", "test")
     }
-    preprocess_config = PreprocessConfig()
+    preprocess_config = PreprocessConfig(
+        local_center_mode="energy_envelope_v2"
+    )
     results: dict[str, Any] = {}
     for role in roles:
         results[role] = _fit_role(

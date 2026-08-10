@@ -6,7 +6,7 @@ import audit_data
 from audit_data import audit_dataset, audit_duplicate_waveforms
 from data.manifest import TYPE_NAMES, build_piece_table
 from data.split import PARTITION_NAMES, assign_piece_splits
-from tests.test_lig import make_piece, write_source
+from .test_lig import make_piece, write_source
 
 
 def _write_audit_corpus(root):

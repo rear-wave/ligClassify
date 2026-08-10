@@ -15,16 +15,23 @@ from typing import Any
 import torch
 from torch import nn
 
-from models import LegacyMultiTaskResNet, create_five_class_model
+from models import (
+    HIERARCHICAL_TYPE_ARCHITECTURE,
+    LegacyMultiTaskResNet,
+    create_five_class_model,
+    create_hierarchical_type_model,
+)
 
 
 FIVE_CLASS_SCHEMA = "five_class_v1"
+HIERARCHICAL_FIVE_CLASS_SCHEMA = "hierarchical_five_class_v2"
 TRAINING_STATE_SCHEMA = "five_class_training_state_v1"
 LEGACY_FIVE_CLASS_SCHEMA = "legacy_five_class"
 TYPE_NAMES = ("IC", "NCG", "NNBE", "PCG", "PNBE")
 DISTANCE_NAMES = ("NCG", "NNBE", "PCG", "PNBE")
 DISTANCE_BINS_KM = tuple(range(0, 3000, 100))
 MODEL_BUNDLE_SCHEMA = "five_class_model_bundle_v1"
+HIERARCHICAL_MODEL_BUNDLE_SCHEMA = "hierarchical_model_bundle_v2"
 BUNDLE_ROLES = ("type", *DISTANCE_NAMES)
 
 _NEW_REQUIRED_FIELDS = frozenset(
@@ -40,6 +47,7 @@ _NEW_REQUIRED_FIELDS = frozenset(
         "training_config",
     }
 )
+_HIERARCHICAL_REQUIRED_FIELDS = _NEW_REQUIRED_FIELDS | {"decision_config"}
 _LEGACY_REQUIRED_FIELDS = frozenset(
     {
         "model_name",
@@ -59,6 +67,8 @@ _NEW_PREPROCESS_KEYS = frozenset(
         "use_filter",
         "cutoff_hz",
         "sample_rate_hz",
+        "local_center_mode",
+        "local_energy_window",
     }
 )
 
@@ -173,6 +183,101 @@ def _base_channels(config: Mapping[str, Any]) -> int:
     return value
 
 
+def _hierarchical_model_config(value: object) -> dict[str, Any]:
+    config = _mapping(value, "model_config")
+    required = {
+        "base_channels",
+        "embedding_dim",
+        "prototypes_per_class",
+        "prototype_logit_weight",
+    }
+    if set(config) != required:
+        raise ValueError("checkpoint hierarchical model_config is invalid")
+    for name in ("base_channels", "embedding_dim", "prototypes_per_class"):
+        if type(config[name]) is not int or config[name] <= 0:
+            raise ValueError(f"checkpoint {name} must be a positive integer")
+    weight = config["prototype_logit_weight"]
+    if (
+        isinstance(weight, bool)
+        or not isinstance(weight, Real)
+        or not math.isfinite(float(weight))
+        or float(weight) < 0.0
+    ):
+        raise ValueError("checkpoint prototype_logit_weight is invalid")
+    return config
+
+
+def _decision_config(value: object) -> dict[str, Any]:
+    config = _mapping(value, "decision_config")
+    required = {
+        "known_probability_thresholds",
+        "prototype_similarity_thresholds",
+        "max_js_divergence",
+        "min_branch_votes",
+    }
+    optional = {"max_ic_gate_probabilities"}
+    if not required.issubset(config) or set(config) - required - optional:
+        raise ValueError("checkpoint decision_config fields are invalid")
+    probability = config["known_probability_thresholds"]
+    similarity = config["prototype_similarity_thresholds"]
+    gate_probability = config.get(
+        "max_ic_gate_probabilities", [0.5, 0.5, 0.5, 0.5]
+    )
+    if (
+        not isinstance(probability, (list, tuple))
+        or len(probability) != 4
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, Real)
+            or not 0.0 <= float(item) <= 1.0
+            for item in probability
+        )
+    ):
+        raise ValueError("checkpoint known probability thresholds are invalid")
+    if (
+        not isinstance(similarity, (list, tuple))
+        or len(similarity) != 4
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, Real)
+            or not -1.0 <= float(item) <= 1.0
+            for item in similarity
+        )
+    ):
+        raise ValueError("checkpoint prototype thresholds are invalid")
+    if (
+        not isinstance(gate_probability, (list, tuple))
+        or len(gate_probability) != 4
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, Real)
+            or not 0.0 <= float(item) <= 1.0
+            for item in gate_probability
+        )
+    ):
+        raise ValueError("checkpoint IC gate thresholds are invalid")
+    divergence = config["max_js_divergence"]
+    votes = config["min_branch_votes"]
+    if (
+        isinstance(divergence, bool)
+        or not isinstance(divergence, Real)
+        or not math.isfinite(float(divergence))
+        or not 0.0 <= float(divergence) <= math.log(2.0) + 1e-6
+    ):
+        raise ValueError("checkpoint max_js_divergence is invalid")
+    if type(votes) is not int or not 1 <= votes <= 4:
+        raise ValueError("checkpoint min_branch_votes is invalid")
+    return {
+        "known_probability_thresholds": [float(item) for item in probability],
+        "prototype_similarity_thresholds": [float(item) for item in similarity],
+        "max_ic_gate_probabilities": [
+            float(item) for item in gate_probability
+        ],
+        "max_js_divergence": float(divergence),
+        "min_branch_votes": votes,
+    }
+
+
 def _state_mapping(value: object) -> dict[str, torch.Tensor]:
     state = _mapping(value, "model state")
     if not state or not all(
@@ -219,6 +324,16 @@ def _new_preprocess_config(value: object) -> dict[str, Any]:
         raise ValueError(
             "checkpoint preprocess_config cutoff_hz must be below Nyquist"
         )
+    center_mode = config.get("local_center_mode", "peak_abs_v1")
+    energy_window = config.get("local_energy_window", 128)
+    if center_mode not in {"peak_abs_v1", "energy_envelope_v2"}:
+        raise ValueError("checkpoint local_center_mode is invalid")
+    if type(energy_window) is not int or energy_window <= 0:
+        raise ValueError("checkpoint local_energy_window is invalid")
+    if "local_center_mode" in config:
+        config["local_center_mode"] = center_mode
+    if "local_energy_window" in config:
+        config["local_energy_window"] = energy_window
     return config
 
 
@@ -303,6 +418,44 @@ def _load_new(
     )
 
 
+def _load_hierarchical(
+    checkpoint: Mapping[str, Any], device: torch.device | str
+) -> LoadedCheckpoint:
+    _required_fields(checkpoint, _HIERARCHICAL_REQUIRED_FIELDS)
+    if set(checkpoint) != set(_HIERARCHICAL_REQUIRED_FIELDS):
+        raise ValueError("hierarchical checkpoint fields are invalid")
+    type_names = _ordered_names(checkpoint["type_names"], TYPE_NAMES, "type")
+    distance_names = _ordered_names(
+        checkpoint["distance_names"], DISTANCE_NAMES, "distance-name"
+    )
+    distance_bins = _distance_bins(checkpoint["distance_bins_km"])
+    model_config = _hierarchical_model_config(checkpoint["model_config"])
+    preprocess_config = _new_preprocess_config(
+        checkpoint["preprocess_config"]
+    )
+    _decision_config(checkpoint["decision_config"])
+    training = _mapping(checkpoint["training_config"], "training_config")
+    if training.get("role") != "type":
+        raise ValueError("hierarchical checkpoint role must be type")
+    if not isinstance(checkpoint["split_hash"], str) or not checkpoint[
+        "split_hash"
+    ]:
+        raise ValueError("checkpoint split_hash is invalid")
+    model = create_hierarchical_type_model(**model_config)
+    model = _strict_load_model(
+        model, _state_mapping(checkpoint["model_state"]), device
+    )
+    return LoadedCheckpoint(
+        model=model,
+        schema=HIERARCHICAL_FIVE_CLASS_SCHEMA,
+        type_names=type_names,
+        distance_names=distance_names,
+        distance_bins_km=distance_bins,
+        preprocess_config=preprocess_config,
+        metadata=_inference_metadata(checkpoint),
+    )
+
+
 def _load_legacy(
     checkpoint: Mapping[str, Any], device: torch.device | str
 ) -> LoadedCheckpoint:
@@ -350,6 +503,8 @@ def load_model_checkpoint(
     schema = checkpoint.get("schema")
     if schema == FIVE_CLASS_SCHEMA:
         return _load_new(checkpoint, device)
+    if schema == HIERARCHICAL_FIVE_CLASS_SCHEMA:
+        return _load_hierarchical(checkpoint, device)
     if schema == LEGACY_FIVE_CLASS_SCHEMA or (
         schema is None and checkpoint.get("model_name") == "mtl_resnet"
     ):
@@ -367,14 +522,20 @@ def save_model_checkpoint(
     preprocess_config: Mapping[str, Any],
     split_hash: str,
     training_config: Mapping[str, Any],
+    decision_config: Mapping[str, Any] | None = None,
 ) -> None:
-    """Atomically save a validated ``five_class_v1`` inference checkpoint."""
+    """Atomically save one strictly validated inference checkpoint."""
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(f"{destination}.tmp")
+    hierarchical = (
+        getattr(model, "architecture", None)
+        == HIERARCHICAL_TYPE_ARCHITECTURE
+    )
+    schema = HIERARCHICAL_FIVE_CLASS_SCHEMA if hierarchical else FIVE_CLASS_SCHEMA
     checkpoint = {
-        "schema": FIVE_CLASS_SCHEMA,
+        "schema": schema,
         "model_config": dict(model_config),
         "model_state": {
             name: tensor.detach().cpu()
@@ -387,6 +548,19 @@ def save_model_checkpoint(
         "split_hash": split_hash,
         "training_config": dict(training_config),
     }
+    if hierarchical:
+        if decision_config is None:
+            from evaluation import (
+                conservative_hierarchical_config,
+                decision_config_dict,
+            )
+
+            decision_config = decision_config_dict(
+                conservative_hierarchical_config()
+            )
+        checkpoint["decision_config"] = _decision_config(decision_config)
+    elif decision_config is not None:
+        raise ValueError("flat checkpoint cannot store decision_config")
     try:
         torch.save(checkpoint, temporary)
         load_model_checkpoint(temporary, "cpu")
@@ -431,12 +605,19 @@ def save_model_bundle(
     preprocess = _new_preprocess_config(preprocess_config)
     roles: dict[str, dict[str, str]] = {}
     split_hashes: set[str] = set()
+    bundle_schema = MODEL_BUNDLE_SCHEMA
     for role, path in paths.items():
         checkpoint = load_model_checkpoint(path, "cpu")
         training = checkpoint.metadata.get("training_config")
         split_hash = checkpoint.metadata.get("split_hash")
+        expected_schema = (
+            HIERARCHICAL_FIVE_CLASS_SCHEMA
+            if role == "type"
+            and checkpoint.schema == HIERARCHICAL_FIVE_CLASS_SCHEMA
+            else FIVE_CLASS_SCHEMA
+        )
         if (
-            checkpoint.schema != FIVE_CLASS_SCHEMA
+            checkpoint.schema != expected_schema
             or checkpoint.preprocess_config != preprocess
             or not isinstance(training, Mapping)
             or training.get("role") != role
@@ -444,6 +625,10 @@ def save_model_bundle(
             or not split_hash
         ):
             raise ValueError(f"bundle role {role} checkpoint is incompatible")
+        if role != "type" and checkpoint.schema != FIVE_CLASS_SCHEMA:
+            raise ValueError("distance bundle roles must use five_class_v1")
+        if role == "type" and checkpoint.schema == HIERARCHICAL_FIVE_CLASS_SCHEMA:
+            bundle_schema = HIERARCHICAL_MODEL_BUNDLE_SCHEMA
         split_hashes.add(split_hash)
         roles[role] = {
             "path": path.relative_to(root.resolve()).as_posix(),
@@ -452,7 +637,7 @@ def save_model_bundle(
     if len(split_hashes) != 1:
         raise ValueError("bundle role checkpoints use different split hashes")
     payload = {
-        "schema": MODEL_BUNDLE_SCHEMA,
+        "schema": bundle_schema,
         "roles": roles,
         "type_names": list(TYPE_NAMES),
         "distance_names": list(DISTANCE_NAMES),
@@ -498,7 +683,10 @@ def load_model_bundle(
     }
     if not isinstance(payload, Mapping) or set(payload) != required:
         raise ValueError("model bundle manifest fields are invalid")
-    if payload["schema"] != MODEL_BUNDLE_SCHEMA:
+    if payload["schema"] not in {
+        MODEL_BUNDLE_SCHEMA,
+        HIERARCHICAL_MODEL_BUNDLE_SCHEMA,
+    }:
         raise ValueError("model bundle schema is invalid")
     _ordered_names(payload["type_names"], TYPE_NAMES, "bundle type")
     _ordered_names(
@@ -539,8 +727,14 @@ def load_model_bundle(
             raise ValueError(f"model bundle role {role} hash mismatch")
         checkpoint = load_model_checkpoint(path, device)
         training = checkpoint.metadata.get("training_config")
+        expected_schema = (
+            HIERARCHICAL_FIVE_CLASS_SCHEMA
+            if payload["schema"] == HIERARCHICAL_MODEL_BUNDLE_SCHEMA
+            and role == "type"
+            else FIVE_CLASS_SCHEMA
+        )
         if (
-            checkpoint.schema != FIVE_CLASS_SCHEMA
+            checkpoint.schema != expected_schema
             or checkpoint.preprocess_config != preprocess
             or not isinstance(training, Mapping)
             or training.get("role") != role

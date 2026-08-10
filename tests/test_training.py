@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import random
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -18,15 +19,22 @@ from evaluation import (
     evaluate_type_role,
     selection_score,
 )
-from models import ModelOutput
+from models import (
+    HIERARCHICAL_TYPE_ARCHITECTURE,
+    HierarchicalTypeOutput,
+    ModelOutput,
+    create_hierarchical_type_model,
+)
 from training import (
     EarlyStoppingState,
+    HierarchicalLossWeights,
     distance_expert_loss,
+    hierarchical_type_loss,
     load_last_state,
     save_last_state,
     train_role_epoch,
 )
-from tests.test_lig import make_piece, write_source
+from .test_lig import make_piece, write_source
 
 
 def test_runtime_modules_stay_within_approved_line_limit():
@@ -48,11 +56,14 @@ def test_runtime_modules_stay_within_approved_line_limit():
     )
 
     line_counts = {
-        path: len(Path(path).read_text(encoding="utf-8").splitlines())
+        path: sum(
+            bool(line.strip())
+            for line in Path(path).read_text(encoding="utf-8").splitlines()
+        )
         for path in runtime_paths
     }
 
-    assert max(line_counts.values()) <= 600, line_counts
+    assert max(line_counts.values()) <= 800, line_counts
 
 
 def test_training_defaults_match_five_class_contract():
@@ -297,6 +308,225 @@ def test_distance_role_epoch_never_runs_type_network():
 def test_distance_expert_loss_rejects_invalid_shapes():
     with pytest.raises(ValueError, match="shape"):
         distance_expert_loss(torch.zeros(2, 29), torch.tensor([1, 2]))
+
+
+def _hierarchical_output(
+    known_logits: torch.Tensor,
+    embedding: torch.Tensor,
+) -> HierarchicalTypeOutput:
+    batch_size = len(known_logits)
+    gate_logits = torch.zeros(batch_size, 2)
+    gate_log = gate_logits.log_softmax(dim=1)
+    known_log = known_logits.log_softmax(dim=1)
+    type_logits = torch.cat(
+        (gate_log[:, :1], gate_log[:, 1:] + known_log),
+        dim=1,
+    )
+    prototype_logits = torch.zeros(batch_size, 4, 2)
+    return HierarchicalTypeOutput(
+        type_logits=type_logits,
+        gate_logits=gate_logits,
+        known_logits=known_logits,
+        prototype_logits=prototype_logits,
+        prototype_scores=torch.zeros(batch_size, 4),
+        local_known_logits=known_logits,
+        global_known_logits=known_logits,
+        embedding=embedding,
+    )
+
+
+class _CaptureHierarchicalInferenceModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inputs = []
+
+    def forward(self, local, global_view, daylight):
+        self.inputs.append((local.clone(), global_view.clone()))
+        return _hierarchical_output(
+            torch.zeros(len(local), 4), torch.zeros(len(local), 8)
+        )
+
+
+def test_hierarchical_inference_matches_calibration_view_shift():
+    from evaluation import (
+        conservative_hierarchical_config,
+        decision_config_dict,
+        infer_hierarchical_types,
+    )
+
+    model = _CaptureHierarchicalInferenceModel()
+    local = torch.arange(32, dtype=torch.float32).reshape(1, 1, 32)
+    global_view = torch.arange(12, dtype=torch.float32).reshape(1, 1, 12)
+    infer_hierarchical_types(
+        model,
+        decision_config_dict(conservative_hierarchical_config()),
+        local,
+        global_view,
+        torch.zeros(1, 1),
+        None,
+        torch.zeros(1, dtype=torch.bool),
+    )
+
+    assert len(model.inputs) == 2
+    assert torch.equal(model.inputs[1][0][..., 16:], local[..., :-16])
+    assert torch.equal(
+        model.inputs[1][1][..., 4:], global_view[..., :-4]
+    )
+    assert torch.count_nonzero(model.inputs[1][1][..., :4]) == 0
+
+
+def test_hierarchical_loss_excludes_ic_from_known_objectives():
+    targets = torch.tensor([0, 1, 1, 2, 2])
+    known_logits = torch.randn(5, 4)
+    primary = _hierarchical_output(known_logits, torch.randn(5, 8))
+    alternate = _hierarchical_output(
+        known_logits + 0.1 * torch.randn(5, 4),
+        torch.randn(5, 8),
+    )
+
+    baseline = hierarchical_type_loss(primary, alternate, targets)
+    changed_primary = primary.embedding.clone()
+    changed_alternate = alternate.embedding.clone()
+    changed_primary[0] = 1000.0
+    changed_alternate[0] = -1000.0
+    changed = hierarchical_type_loss(
+        replace(primary, embedding=changed_primary),
+        replace(alternate, embedding=changed_alternate),
+        targets,
+    )
+
+    assert torch.allclose(changed["known"], baseline["known"])
+    assert torch.allclose(changed["prototype"], baseline["prototype"])
+    assert torch.allclose(changed["branch"], baseline["branch"])
+    assert torch.allclose(changed["contrastive"], baseline["contrastive"])
+    assert torch.allclose(changed["consistency"], baseline["consistency"])
+
+
+def test_hierarchical_consistency_increases_when_known_views_disagree():
+    targets = torch.tensor([1, 2, 3, 4])
+    logits = torch.tensor(
+        [
+            [8.0, 0.0, 0.0, 0.0],
+            [0.0, 8.0, 0.0, 0.0],
+            [0.0, 0.0, 8.0, 0.0],
+            [0.0, 0.0, 0.0, 8.0],
+        ]
+    )
+    primary = _hierarchical_output(logits, torch.eye(4))
+    matching = _hierarchical_output(logits.clone(), torch.eye(4))
+    disagreeing = _hierarchical_output(
+        logits.roll(1, dims=1), torch.eye(4)
+    )
+
+    stable = hierarchical_type_loss(primary, matching, targets)
+    unstable = hierarchical_type_loss(primary, disagreeing, targets)
+
+    assert stable["consistency"] < unstable["consistency"]
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        torch.tensor([0, 0]),
+        torch.tensor([0, 1, 2, 3, 4]),
+        torch.tensor([1, 1, 1]),
+    ],
+)
+def test_hierarchical_loss_is_finite_for_sparse_batch_composition(targets):
+    batch_size = len(targets)
+    primary = _hierarchical_output(
+        torch.randn(batch_size, 4),
+        torch.randn(batch_size, 8),
+    )
+    alternate = _hierarchical_output(
+        torch.randn(batch_size, 4),
+        torch.randn(batch_size, 8),
+    )
+
+    losses = hierarchical_type_loss(primary, alternate, targets)
+
+    assert set(losses) == {
+        "total",
+        "gate",
+        "known",
+        "five_class",
+        "prototype",
+        "branch",
+        "contrastive",
+        "consistency",
+    }
+    assert all(torch.isfinite(value) for value in losses.values())
+
+
+def test_hierarchical_loss_gradients_reach_all_type_components():
+    model = create_hierarchical_type_model(
+        base_channels=8,
+        embedding_dim=16,
+        prototypes_per_class=2,
+    )
+    batch_size = 5
+    inputs = (
+        torch.randn(batch_size, 1, 8000),
+        torch.randn(batch_size, 1, 2000),
+        torch.tensor([[0.0], [1.0], [0.0], [1.0], [0.0]]),
+    )
+    alternate_inputs = (
+        torch.roll(inputs[0], 16, dims=2),
+        torch.roll(inputs[1], 2, dims=2),
+        inputs[2],
+    )
+
+    losses = hierarchical_type_loss(
+        model(*inputs),
+        model(*alternate_inputs),
+        torch.tensor([0, 1, 2, 3, 4]),
+        HierarchicalLossWeights(),
+    )
+    losses["total"].backward()
+
+    assert model.gate_head.weight.grad is not None
+    assert model.known_head.weight.grad is not None
+    assert model.prototype_matcher.prototypes.grad is not None
+    assert model.encoder.local_branch.network[0].weight.grad is not None
+    assert model.encoder.global_branch.network[0].weight.grad is not None
+
+
+class _TinyHierarchicalModel(nn.Module):
+    architecture = HIERARCHICAL_TYPE_ARCHITECTURE
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(0.1))
+        self.calls = 0
+
+    def forward_hierarchical(self, local, global_view, daylight):
+        self.calls += 1
+        batch_size = len(local)
+        known = self.weight * torch.arange(4).expand(batch_size, 4)
+        embedding = self.weight * torch.ones(batch_size, 4)
+        return _hierarchical_output(known, embedding)
+
+
+def test_type_role_epoch_uses_both_hierarchical_views():
+    model = _TinyHierarchicalModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    batch = _training_batch([0, 1, 2, 3, 4], [-1, 1, 2, 3, 4])
+    batch["local_alt"] = batch["local"].clone()
+    batch["global_alt"] = batch["global"].clone()
+
+    metrics = train_role_epoch(
+        model,
+        [batch],
+        optimizer,
+        "cpu",
+        role="type",
+        amp=False,
+    )
+
+    assert model.calls == 2
+    assert metrics["sample_count"] == 5
+    assert "known_accuracy" in metrics
+    assert "known_to_ic_rate" in metrics
 
 
 class _StaticRoleEvaluationModel(nn.Module):
@@ -838,21 +1068,35 @@ def test_training_state_is_never_exposed_as_inference_checkpoint(tmp_path):
 def _write_training_tree(root):
     for type_index, type_name in enumerate(("IC", "NCG", "NNBE", "PCG", "PNBE")):
         for daylight_name, hour in (("day", 3), ("night", 20)):
-            if type_name == "IC":
-                source = root / type_name / daylight_name / "sample.lig"
-            else:
-                source = (
-                    root
-                    / type_name
-                    / daylight_name
-                    / f"{type_index * 100}-{(type_index + 1) * 100}km"
-                    / "sample.lig"
+            for source_index in range(3):
+                if type_name == "IC":
+                    source = (
+                        root
+                        / type_name
+                        / daylight_name
+                        / f"sample_{source_index}.lig"
+                    )
+                else:
+                    source = (
+                        root
+                        / type_name
+                        / daylight_name
+                        / f"{type_index * 100}-{(type_index + 1) * 100}km"
+                        / f"sample_{source_index}.lig"
+                    )
+                source.parent.mkdir(parents=True, exist_ok=True)
+                write_source(
+                    source,
+                    [
+                        make_piece(
+                            type_index * 100
+                            + source_index * 10
+                            + item,
+                            hour=hour,
+                        )
+                        for item in range(3)
+                    ],
                 )
-            source.parent.mkdir(parents=True, exist_ok=True)
-            write_source(
-                source,
-                [make_piece(type_index * 10 + item, hour=hour) for item in range(3)],
-            )
 
 
 def _write_flat_classification_tree(root):

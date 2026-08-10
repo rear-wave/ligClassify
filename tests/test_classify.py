@@ -446,9 +446,10 @@ def test_cli_is_compact_and_path_validation_rejects_unsafe_nesting(tmp_path):
         "output_dir",
         "model",
         "model_dir",
-        "batch_size",
-        "type_only",
-        "device",
+            "batch_size",
+            "type_only",
+            "direct_type",
+            "device",
     }
 
     parent = tmp_path / "parent"
@@ -513,6 +514,155 @@ def test_bundle_prediction_routes_to_matching_distance_model():
     )
     waveforms = np.zeros((2, WAVEFORM_SAMPLES), dtype=np.float32)
 
+    predictions = classify.predict_bundle_batch(
+        bundle,
+        waveforms,
+        [datetime(2016, 7, 8, 1), datetime(2016, 7, 8, 2)],
+        device=torch.device("cpu"),
+        type_only=False,
+    )
+
+    assert [item.final_type for item in predictions] == ["NNBE", "NNBE"]
+    assert [item.distance_bin for item in predictions] == [7, 7]
+
+
+def _loaded_hierarchical_type_checkpoint():
+    from checkpoints import (
+        HIERARCHICAL_FIVE_CLASS_SCHEMA,
+        LoadedCheckpoint,
+    )
+    from evaluation import (
+        conservative_hierarchical_config,
+        decision_config_dict,
+    )
+    from models import create_hierarchical_type_model
+
+    return LoadedCheckpoint(
+        model=create_hierarchical_type_model(
+            base_channels=8,
+            embedding_dim=16,
+            prototypes_per_class=2,
+        ),
+        schema=HIERARCHICAL_FIVE_CLASS_SCHEMA,
+        type_names=tuple(classify.TYPE_NAMES),
+        distance_names=tuple(classify.DISTANCE_NAMES),
+        distance_bins_km=tuple(classify.DISTANCE_BINS_KM),
+        preprocess_config={
+            "local_length": 8000,
+            "global_length": 2000,
+            "local_center_mode": "energy_envelope_v2",
+            "local_energy_window": 128,
+        },
+        metadata={
+            "decision_config": decision_config_dict(
+                conservative_hierarchical_config()
+            )
+        },
+    )
+
+
+def test_hierarchical_checkpoint_preserves_preprocess_contract():
+    config = classify._new_preprocess_config(
+        _loaded_hierarchical_type_checkpoint()
+    )
+
+    assert config.local_center_mode == "energy_envelope_v2"
+    assert config.local_energy_window == 128
+
+
+def test_hierarchical_single_checkpoint_rejects_to_ic():
+    checkpoint = _loaded_hierarchical_type_checkpoint()
+    waveforms = np.zeros((2, WAVEFORM_SAMPLES), dtype=np.float32)
+
+    predictions = classify.predict_batch(
+        checkpoint,
+        waveforms,
+        [datetime(2016, 7, 8, 1), datetime(2016, 7, 8, 2)],
+        device=torch.device("cpu"),
+        type_only=True,
+    )
+
+    assert [item.final_type for item in predictions] == ["IC", "IC"]
+    with pytest.raises(ValueError, match="requires --type_only"):
+        classify.predict_batch(
+            checkpoint,
+            waveforms,
+            [datetime(2016, 7, 8, 1), datetime(2016, 7, 8, 2)],
+            device=torch.device("cpu"),
+            type_only=False,
+        )
+
+
+def test_hierarchical_direct_type_uses_five_class_argmax(monkeypatch):
+    checkpoint = _loaded_hierarchical_type_checkpoint()
+
+    def rejected_known(
+        _checkpoint,
+        local,
+        _global_view,
+        _daylight,
+        _alternate_daylight,
+        _missing,
+    ):
+        logits = local.new_zeros((len(local), 5))
+        logits[:, 2] = 10.0
+        return logits, torch.zeros(
+            len(local), dtype=torch.long, device=local.device
+        )
+
+    monkeypatch.setattr(
+        classify, "_hierarchical_type_inference", rejected_known
+    )
+    predictions = classify.predict_batch(
+        checkpoint,
+        np.zeros((2, WAVEFORM_SAMPLES), dtype=np.float32),
+        [datetime(2016, 7, 8, 1), datetime(2016, 7, 8, 2)],
+        device=torch.device("cpu"),
+        type_only=True,
+        direct_type=True,
+    )
+
+    assert [item.final_type for item in predictions] == ["NNBE", "NNBE"]
+
+
+def test_hierarchical_bundle_routes_stable_known_type(monkeypatch):
+    type_checkpoint = _loaded_hierarchical_type_checkpoint()
+    distances = tuple(
+        loaded_new(
+            ConstantNewModel(
+                type_index=type_index,
+                distance_bin=type_index + 5,
+            )
+        )
+        for type_index in range(1, 5)
+    )
+    bundle = LoadedModelBundle(
+        type_checkpoint=type_checkpoint,
+        distance_checkpoints=distances,
+        hashes={
+            role: role.lower()
+            for role in ("type", "NCG", "NNBE", "PCG", "PNBE")
+        },
+    )
+
+    def stable_nbbe(
+        _checkpoint,
+        local,
+        _global_view,
+        _daylight,
+        _alternate_daylight,
+        _missing,
+    ):
+        logits = local.new_zeros((len(local), 5))
+        logits[:, 2] = 10.0
+        return logits, torch.full(
+            (len(local),), 2, dtype=torch.long, device=local.device
+        )
+
+    monkeypatch.setattr(
+        classify, "_hierarchical_type_inference", stable_nbbe
+    )
+    waveforms = np.zeros((2, WAVEFORM_SAMPLES), dtype=np.float32)
     predictions = classify.predict_bundle_batch(
         bundle,
         waveforms,

@@ -19,7 +19,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from checkpoints import TRAINING_STATE_SCHEMA
-from models import DISTANCE_BIN_COUNT, DISTANCE_NAMES
+from models import DISTANCE_BIN_COUNT, DISTANCE_NAMES, HIERARCHICAL_TYPE_ARCHITECTURE, HierarchicalTypeOutput
 
 
 def _move_training_batch(
@@ -31,6 +31,15 @@ def _move_training_batch(
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"batch field {key!r} must be a tensor")
         moved[key] = value.to(device)
+    paired = ("local_alt" in moved, "global_alt" in moved)
+    if any(paired) and not all(paired):
+        raise ValueError("training batch has incomplete paired views")
+    for key in ("local_alt", "global_alt"):
+        if key in moved:
+            value = moved[key]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"batch field {key!r} must be a tensor")
+            moved[key] = value.to(device)
     return moved
 
 
@@ -55,6 +64,138 @@ def distance_expert_loss(
     return categorical + 0.2 * ordered
 
 
+@dataclass(frozen=True)
+class HierarchicalLossWeights:
+    """Weights for gate, known-class, metric, and consistency objectives."""
+
+    gate: float = 1.0
+    known: float = 1.0
+    five_class: float = 0.25
+    prototype: float = 0.25
+    branch: float = 0.10
+    contrastive: float = 0.10
+    consistency: float = 0.10
+    label_smoothing: float = 0.05
+    temperature: float = 0.10
+
+
+def _paired_average(function: Any, primary: torch.Tensor, alternate: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (function(primary) + function(alternate))
+
+
+def _supervised_contrastive_loss(
+    primary: torch.Tensor, alternate: torch.Tensor, labels: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    known = labels > 0
+    if not torch.any(known):
+        return primary.sum() * 0.0
+    features = torch.cat((primary[known], alternate[known]), dim=0)
+    features = F.normalize(features, dim=1, eps=1e-6)
+    known_labels = torch.cat((labels[known], labels[known]), dim=0)
+    similarity = features @ features.transpose(0, 1) / temperature
+    valid = ~torch.eye(len(features), dtype=torch.bool, device=features.device)
+    similarity = similarity - similarity.max(dim=1, keepdim=True).values.detach()
+    log_denominator = torch.logsumexp(
+        similarity.masked_fill(~valid, float("-inf")), dim=1
+    )
+    positive = (known_labels[:, None] == known_labels[None, :]) & valid
+    log_probability = similarity - log_denominator[:, None]
+    positive_log = log_probability.masked_fill(~positive, 0.0).sum(dim=1)
+    return -(positive_log / positive.sum(dim=1).clamp_min(1)).mean()
+
+
+def _known_consistency(primary: torch.Tensor, alternate: torch.Tensor,
+                       labels: torch.Tensor) -> torch.Tensor:
+    known = labels > 0
+    if not torch.any(known):
+        return primary.sum() * 0.0
+    first = primary[known].log_softmax(dim=1)
+    second = alternate[known].log_softmax(dim=1)
+    return 0.5 * (
+        F.kl_div(first, second.exp(), reduction="batchmean")
+        + F.kl_div(second, first.exp(), reduction="batchmean")
+    )
+
+
+def hierarchical_type_loss(
+    primary: HierarchicalTypeOutput, alternate: HierarchicalTypeOutput,
+    targets: torch.Tensor, weights: HierarchicalLossWeights = HierarchicalLossWeights(),
+) -> dict[str, torch.Tensor]:
+    """Compute two-view hierarchical losses without compacting IC."""
+    if targets.ndim != 1 or len(targets) != len(primary.type_logits):
+        raise ValueError("type targets must have shape [batch]")
+    gate_targets = (targets > 0).long()
+    gate = _paired_average(
+        lambda logits: F.cross_entropy(
+            logits,
+            gate_targets,
+            label_smoothing=weights.label_smoothing,
+        ),
+        primary.gate_logits,
+        alternate.gate_logits,
+    )
+    five_class = _paired_average(
+        lambda logits: F.cross_entropy(
+            logits,
+            targets,
+            label_smoothing=weights.label_smoothing,
+        ),
+        primary.type_logits,
+        alternate.type_logits,
+    )
+    known_mask = targets > 0
+    zero = primary.known_logits.sum() * 0.0
+    if torch.any(known_mask):
+        known_targets = targets[known_mask] - 1
+        def average_ce(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+            first_loss = F.cross_entropy(first[known_mask], known_targets)
+            return 0.5 * (
+                first_loss + F.cross_entropy(second[known_mask], known_targets)
+            )
+        known = average_ce(primary.known_logits, alternate.known_logits)
+        primary_prototypes = (
+            torch.logsumexp(primary.prototype_logits, dim=2)
+            - math.log(primary.prototype_logits.shape[2])
+        )
+        alternate_prototypes = (
+            torch.logsumexp(alternate.prototype_logits, dim=2)
+            - math.log(alternate.prototype_logits.shape[2])
+        )
+        prototype = average_ce(primary_prototypes, alternate_prototypes)
+        local = average_ce(
+            primary.local_known_logits, alternate.local_known_logits
+        )
+        branch = 0.5 * (local + average_ce(
+            primary.global_known_logits, alternate.global_known_logits
+        ))
+    else:
+        known = prototype = branch = zero
+    contrastive = _supervised_contrastive_loss(
+        primary.embedding,
+        alternate.embedding,
+        targets,
+        weights.temperature,
+    )
+    consistency = _known_consistency(
+        primary.known_logits, alternate.known_logits, targets
+    )
+    components = {
+        "gate": gate,
+        "known": known,
+        "five_class": five_class,
+        "prototype": prototype,
+        "branch": branch,
+        "contrastive": contrastive,
+        "consistency": consistency,
+    }
+    total = sum(
+        components[name] * float(getattr(weights, name))
+        for name in components
+    )
+    return {"total": total, **components}
+
+
 def train_role_epoch(
     model: nn.Module,
     loader: Iterable[Mapping[str, object]],
@@ -73,9 +214,9 @@ def train_role_epoch(
     if scaler is None:
         scaler = torch.amp.GradScaler(target_device.type, enabled=amp_enabled)
     model.train()
-    sample_count = 0
+    sample_count = correct = 0
     loss_sum = 0.0
-    correct = 0
+    known_count = known_correct = known_to_ic = 0
     progress = tqdm(
         loader,
         desc=f"{role} Epoch",
@@ -91,11 +232,33 @@ def train_role_epoch(
             enabled=amp_enabled,
         ):
             if role == "type":
-                logits, _ = model.forward_type(
-                    batch["local"], batch["global"], batch["daylight"]
-                )
                 targets = batch["type_label"].long()
-                loss = F.cross_entropy(logits, targets)
+                if (
+                    getattr(model, "architecture", None)
+                    == HIERARCHICAL_TYPE_ARCHITECTURE
+                ):
+                    if "local_alt" not in batch or "global_alt" not in batch:
+                        raise ValueError(
+                            "hierarchical type training requires paired views"
+                        )
+                    primary = model.forward_hierarchical(
+                        batch["local"], batch["global"], batch["daylight"]
+                    )
+                    alternate = model.forward_hierarchical(
+                        batch["local_alt"],
+                        batch["global_alt"],
+                        batch["daylight"],
+                    )
+                    loss_parts = hierarchical_type_loss(
+                        primary, alternate, targets
+                    )
+                    loss = loss_parts["total"]
+                    logits = primary.type_logits
+                else:
+                    logits, _ = model.forward_type(
+                        batch["local"], batch["global"], batch["daylight"]
+                    )
+                    loss = F.cross_entropy(logits, targets)
             else:
                 expert_index = DISTANCE_NAMES.index(role)
                 expected_type = expert_index + 1
@@ -120,6 +283,14 @@ def train_role_epoch(
         sample_count += count
         loss_sum += float(loss.detach().item()) * count
         correct += int(logits.detach().argmax(dim=1).eq(targets).sum().item())
+        if role == "type":
+            known = targets > 0
+            predictions = logits.detach().argmax(dim=1)
+            known_count += int(known.sum().item())
+            known_correct += int(
+                predictions[known].eq(targets[known]).sum().item()
+            )
+            known_to_ic += int(predictions[known].eq(0).sum().item())
         progress.set_postfix(
             loss=f"{loss_sum / sample_count:.4f}",
             acc=f"{correct / sample_count:.4f}",
@@ -127,12 +298,20 @@ def train_role_epoch(
         )
     if sample_count == 0:
         raise ValueError("training loader produced no samples")
-    return {
+    metrics: dict[str, float | int | str] = {
         "role": role,
         "loss": loss_sum / sample_count,
         "accuracy": correct / sample_count,
         "sample_count": sample_count,
     }
+    if role == "type":
+        metrics["known_accuracy"] = (
+            known_correct / known_count if known_count else 0.0
+        )
+        metrics["known_to_ic_rate"] = (
+            known_to_ic / known_count if known_count else 0.0
+        )
+    return metrics
 
 
 @dataclass
