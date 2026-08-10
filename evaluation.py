@@ -576,6 +576,8 @@ def evaluate_distance_role(
         raise ValueError("type_index must be in 1..4")
     target_device = torch.device(device)
     errors: list[int] = []
+    expected_errors: list[float] = []
+    expected_biases: list[float] = []
     model.eval()
     with torch.no_grad():
         for batch in loader:
@@ -603,12 +605,24 @@ def evaluate_distance_role(
                     "distance logits must have shape [batch, 30]"
                 )
             predictions = logits.argmax(dim=1)
+            probabilities = logits.softmax(dim=1)
+            bin_indices = torch.arange(
+                DISTANCE_BIN_COUNT,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            expected_bins = probabilities @ bin_indices
             errors.extend(
                 torch.abs(predictions - targets).cpu().tolist()
             )
+            biases = expected_bins - targets.to(logits.dtype)
+            expected_biases.extend(biases.cpu().tolist())
+            expected_errors.extend(torch.abs(biases).cpu().tolist())
     if not errors:
         raise ValueError("evaluation loader produced no samples")
     values = np.asarray(errors, dtype=np.float64)
+    expected_values = np.asarray(expected_errors, dtype=np.float64)
+    expected_bias = np.asarray(expected_biases, dtype=np.float64)
     return {
         "piece_count": len(errors),
         "exact_accuracy": float(np.mean(values == 0)),
@@ -616,7 +630,110 @@ def evaluate_distance_role(
         "within_200": float(np.mean(values <= 2)),
         "mae_bins": float(values.mean()),
         "mae_km": float(values.mean() * 100.0),
+        "expected_within_100": float(np.mean(expected_values <= 1.0 + 1e-6)),
+        "expected_within_200": float(np.mean(expected_values <= 2.0 + 1e-6)),
+        "expected_mae_bins": float(expected_values.mean()),
+        "expected_mae_km": float(expected_values.mean() * 100.0),
+        "expected_rmse_km": float(
+            np.sqrt(np.mean(np.square(expected_values))) * 100.0
+        ),
+        "expected_bias_km": float(expected_bias.mean() * 100.0),
     }
+
+
+def evaluate_model_bundle(bundle: object, loader: Iterable[Mapping[str, object]],
+                          device: torch.device | str) -> dict[str, object]:
+    """Evaluate the five checkpoints with deployment-equivalent routing."""
+    from checkpoints import HIERARCHICAL_FIVE_CLASS_SCHEMA, forward_model_bundle
+
+    target_device = torch.device(device)
+    confusion = np.zeros((TYPE_COUNT, TYPE_COUNT), dtype=np.int64)
+    true_types: list[int] = []
+    covered: list[bool] = []
+    errors: list[float] = []
+    exact: list[bool] = []
+    type_checkpoint = bundle.type_checkpoint
+    models = (type_checkpoint.model,) + tuple(
+        item.model for item in bundle.distance_checkpoints)
+    for model in models:
+        model.eval()
+    with torch.inference_mode():
+        for batch in loader:
+            tensors = _evaluation_tensors(batch, target_device)
+            labels = tensors["type_label"].long()
+            distance_bins = tensors["distance_bin"].long()
+            if type_checkpoint.schema == HIERARCHICAL_FIVE_CLASS_SCHEMA:
+                config = type_checkpoint.metadata.get("decision_config")
+                if not isinstance(config, dict):
+                    raise ValueError("hierarchical bundle has no decision_config")
+                type_logits, predictions = infer_hierarchical_types(
+                    type_checkpoint.model, config, tensors["local"],
+                    tensors["global"], tensors["daylight"], None,
+                    torch.zeros(len(labels), dtype=torch.bool, device=target_device),
+                )
+                heads = [
+                    type_logits.new_zeros((len(labels), DISTANCE_BIN_COUNT))
+                    for _ in range(TYPE_COUNT - 1)]
+                for type_index, checkpoint in enumerate(
+                    bundle.distance_checkpoints, start=1):
+                    selected = predictions == type_index
+                    if torch.any(selected):
+                        heads[type_index - 1][selected] = checkpoint.model.forward_distance_type(
+                                tensors["local"][selected],
+                                tensors["global"][selected],
+                                tensors["daylight"][selected],
+                                expert_index=type_index - 1,
+                            )[0]
+            else:
+                type_logits, raw_heads = forward_model_bundle(
+                    bundle, tensors["local"], tensors["global"],
+                    tensors["daylight"])
+                predictions = type_logits.argmax(dim=1)
+                heads = list(raw_heads)
+            pairs = zip(labels.cpu().tolist(), predictions.cpu().tolist())
+            for row, (truth, prediction) in enumerate(pairs):
+                confusion[int(truth), int(prediction)] += 1
+                if truth == 0:
+                    continue
+                true_types.append(int(truth))
+                is_covered = prediction != 0
+                covered.append(is_covered)
+                if not is_covered:
+                    errors.append(float("inf"))
+                    exact.append(False)
+                    continue
+                probabilities = heads[prediction - 1][row].softmax(dim=0)
+                indices = torch.arange(DISTANCE_BIN_COUNT, device=target_device,
+                                       dtype=probabilities.dtype)
+                expected_bin = float((probabilities @ indices).item())
+                true_bin = int(distance_bins[row].item())
+                errors.append(abs(expected_bin - true_bin) * 100.0)
+                exact.append(int(probabilities.argmax().item()) == true_bin)
+    if not int(confusion.sum()):
+        raise ValueError("evaluation loader produced no samples")
+    values = np.asarray(errors, dtype=np.float64)
+    coverage = np.asarray(covered, dtype=bool)
+    metrics = _type_metrics(confusion)
+    metrics.update(
+        {
+            "piece_count": int(confusion.sum()),
+            "distance_count": len(values),
+            "distance_prediction_count": int(coverage.sum()),
+            "distance_coverage": float(coverage.mean()),
+            "distance_exact_accuracy": float(np.mean(exact)),
+            "distance_expected_mae_km": (
+                float(values[coverage].mean()) if coverage.any() else 0.0
+            ),
+            "distance_expected_within_100": float(np.mean(values <= 100.0)),
+            "distance_expected_within_200": float(np.mean(values <= 200.0)),
+            "known_macro_recall": float(np.mean(metrics["type_recall"][1:])),
+            "max_known_false_to_ic": max(
+                _ratio(confusion[index, 0], confusion[index].sum())
+                for index in range(1, TYPE_COUNT)
+            ),
+        }
+    )
+    return metrics
 
 
 def evaluate_loader(

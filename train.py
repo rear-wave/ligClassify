@@ -16,28 +16,38 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from checkpoints import save_model_bundle, save_model_checkpoint
+from checkpoints import (
+    load_model_bundle,
+    save_model_bundle,
+    save_model_checkpoint,
+)
 from data.dataset import FiveClassDataset, collate_batch
 from data.manifest import PieceTable, build_piece_table
 from data.preprocess import AugmentationConfig, PreprocessConfig
-from data.sampling import DistanceExpertSampler, FiveClassSampler
+from data.sampling import DistanceExpertSampler, FiveClassSampler, TYPE_PRIOR
 from data.split import (
     assign_piece_splits,
     split_artifact,
     validate_piece_split,
     write_split_json,
 )
-from evaluation import evaluate_distance_role, evaluate_type_role
+from evaluation import (
+    evaluate_distance_role,
+    evaluate_model_bundle,
+    evaluate_type_role,
+    hierarchical_selection_score,
+)
 from models import DISTANCE_NAMES, create_five_class_model
 from training import (
+    DistanceLossWeights,
     EarlyStoppingState,
+    HierarchicalLossWeights,
     load_last_state,
     save_last_state,
     train_role_epoch,
 )
 
 
-FIXED_IC_FRACTION = 0.60
 TRAINING_ROLES = ("type", *DISTANCE_NAMES)
 
 
@@ -47,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task_data", default=r"..\train_data")
     parser.add_argument("--output", default=r".\weights\multi_model")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=60)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--type_samples_per_epoch", type=int, default=120000)
     parser.add_argument(
@@ -55,7 +65,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--ic_fraction", type=float, default=FIXED_IC_FRACTION)
     parser.add_argument(
         "--stage", choices=("all", *TRAINING_ROLES), default="all"
     )
@@ -84,10 +93,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num_workers must be a non-negative integer")
     if type(args.seed) is not int or args.seed < 0:
         raise ValueError("--seed must be a non-negative integer")
-    if float(args.ic_fraction) != FIXED_IC_FRACTION:
-        raise ValueError(
-            "--ic_fraction must be 0.60 for the fixed 60/10/10/10/10 prior"
-        )
+    if args.stage in ("all", "type") and args.batch_size % 5:
+        raise ValueError("--batch_size must be divisible by five for type training")
     for field in ("lr", "weight_decay"):
         value = float(getattr(args, field))
         if not np.isfinite(value) or value < 0.0:
@@ -103,7 +110,11 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def _training_config(
-    args: argparse.Namespace, role: str | None = None
+    args: argparse.Namespace,
+    role: str | None = None,
+    *,
+    effective_samples_per_epoch: int | None = None,
+    preprocess_config: PreprocessConfig | None = None,
 ) -> dict[str, Any]:
     selected_role = role or str(args.stage)
     role_seed = (
@@ -116,21 +127,40 @@ def _training_config(
         if selected_role == "type"
         else args.distance_samples_per_epoch
     )
-    return {
-        "schema": "five_class_role_training_v1",
+    effective_samples = (
+        int(samples)
+        if effective_samples_per_epoch is None
+        else int(effective_samples_per_epoch)
+    )
+    config = {
+        "schema": "five_class_role_training_v2",
         "role": selected_role,
         "epochs": int(args.epochs),
         "batch_size": int(args.batch_size),
         "patience": int(args.patience),
-        "samples_per_epoch": int(samples),
+        "requested_samples_per_epoch": int(samples),
+        "samples_per_epoch": effective_samples,
         "num_workers": int(args.num_workers),
         "seed": int(role_seed),
-        "ic_fraction": float(args.ic_fraction),
+        "sampling_prior": list(TYPE_PRIOR) if selected_role == "type" else None,
         "base_channels": int(args.base_channels),
         "lr": float(args.lr),
         "weight_decay": float(args.weight_decay),
         "amp": not bool(args.no_amp),
+        "hierarchical_loss": (
+            asdict(HierarchicalLossWeights())
+            if selected_role == "type"
+            else None
+        ),
+        "distance_loss": (
+            asdict(DistanceLossWeights())
+            if selected_role != "type"
+            else None
+        ),
     }
+    if preprocess_config is not None:
+        config["preprocess_config"] = asdict(preprocess_config)
+    return config
 
 
 def _canonical_hash(value: Mapping[str, Any]) -> str:
@@ -225,8 +255,10 @@ def _evaluate_role(
 
 def _selection_score(role: str, metrics: Mapping[str, object]) -> float:
     if role == "type":
-        return float(metrics["type_macro_f1"])
-    return float(metrics["within_200"]) - 1e-3 * float(metrics["mae_bins"])
+        return hierarchical_selection_score(metrics)
+    return float(metrics["expected_within_200"]) - 1e-3 * float(
+        metrics["expected_mae_bins"]
+    )
 
 
 def _epoch_summary(
@@ -239,12 +271,13 @@ def _epoch_summary(
     if role == "type":
         validation_text = (
             f"val_acc={float(validation['type_accuracy']):.4f} "
-            f"val_f1={float(validation['type_macro_f1']):.4f}"
+            f"known_recall={float(validation['known_macro_recall']):.4f} "
+            f"false_ic={float(validation['max_known_false_to_ic']):.4f}"
         )
     else:
         validation_text = (
-            f"val_w200={float(validation['within_200']):.4f} "
-            f"val_mae={float(validation['mae_km']):.0f}km"
+            f"val_w200={float(validation['expected_within_200']):.4f} "
+            f"val_mae={float(validation['expected_mae_km']):.0f}km"
         )
     return (
         f"{role} Epoch {epoch:3d} | "
@@ -287,8 +320,6 @@ def _fit_role(
     amp_enabled = device.type == "cuda" and not args.no_amp
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
     stopping = EarlyStoppingState()
-    config = _training_config(args, role)
-    config_hash = _canonical_hash(config)
     split_hash = _canonical_hash(artifact)
 
     with ExitStack() as stack:
@@ -340,10 +371,10 @@ def _fit_role(
             sampler = FiveClassSampler(
                 table,
                 split_positions["train"],
-            num_samples=effective_type_samples,
+                num_samples=effective_type_samples,
                 seed=role_seed,
-                balance_distance=False,
             )
+            effective_samples = effective_type_samples
         else:
             sampler = DistanceExpertSampler(
                 table,
@@ -352,6 +383,14 @@ def _fit_role(
                 num_samples=args.distance_samples_per_epoch,
                 seed=role_seed,
             )
+            effective_samples = int(args.distance_samples_per_epoch)
+        config = _training_config(
+            args,
+            role,
+            effective_samples_per_epoch=effective_samples,
+            preprocess_config=preprocess_config,
+        )
+        config_hash = _canonical_hash(config)
         loaders["train"] = _loader(
             datasets["train"],
             batch_size=args.batch_size,
@@ -548,7 +587,30 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             model_paths,
             preprocess_config=asdict(preprocess_config),
         )
-    return {"data": diagnostics, "roles": results}
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        bundle = load_model_bundle(output, device)
+        test_dataset = FiveClassDataset(
+            table,
+            split_positions["test"],
+            split="test",
+            preprocess_config=preprocess_config,
+        )
+        try:
+            bundle_metrics = evaluate_model_bundle(
+                bundle,
+                _loader(
+                    test_dataset,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                ),
+                device,
+            )
+        finally:
+            test_dataset.close()
+        _atomic_write_json(output / "bundle_metrics.json", bundle_metrics)
+    else:
+        bundle_metrics = None
+    return {"data": diagnostics, "roles": results, "bundle": bundle_metrics}
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:

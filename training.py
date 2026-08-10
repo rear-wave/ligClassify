@@ -22,6 +22,15 @@ from checkpoints import TRAINING_STATE_SCHEMA
 from models import DISTANCE_BIN_COUNT, DISTANCE_NAMES, HIERARCHICAL_TYPE_ARCHITECTURE, HierarchicalTypeOutput
 
 
+@dataclass(frozen=True)
+class DistanceLossWeights:
+    """Weights for categorical, ordered-CDF, and expected-bin losses."""
+
+    categorical: float = 1.0
+    ordered: float = 0.20
+    expected: float = 0.05
+
+
 def _move_training_batch(
     batch: Mapping[str, object], device: torch.device
 ) -> dict[str, object]:
@@ -44,9 +53,11 @@ def _move_training_batch(
 
 
 def distance_expert_loss(
-    logits: torch.Tensor, targets: torch.Tensor
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    weights: DistanceLossWeights = DistanceLossWeights(),
 ) -> torch.Tensor:
-    """Combine categorical and ordered losses for one distance expert."""
+    """Combine categorical, ordered, and expected-bin distance losses."""
     if logits.ndim != 2 or logits.shape[1] != DISTANCE_BIN_COUNT:
         raise ValueError("distance logits must have shape [batch, 30]")
     if targets.ndim != 1 or len(targets) != len(logits):
@@ -61,7 +72,16 @@ def distance_expert_loss(
         >= targets[:, None]
     ).to(logits.dtype)
     ordered = torch.abs(predicted_cdf - target_cdf).mean()
-    return categorical + 0.2 * ordered
+    bin_indices = torch.arange(
+        DISTANCE_BIN_COUNT, device=logits.device, dtype=logits.dtype
+    )
+    expected_bins = probabilities @ bin_indices
+    expected = F.smooth_l1_loss(expected_bins, targets.to(logits.dtype))
+    return (
+        weights.categorical * categorical
+        + weights.ordered * ordered
+        + weights.expected * expected
+    )
 
 
 @dataclass(frozen=True)
@@ -75,8 +95,14 @@ class HierarchicalLossWeights:
     branch: float = 0.10
     contrastive: float = 0.10
     consistency: float = 0.10
+    gate_consistency: float = 0.10
+    prototype_consistency: float = 0.10
+    ic_margin: float = 0.25
+    prototype_diversity: float = 0.02
     label_smoothing: float = 0.05
     temperature: float = 0.10
+    ic_similarity_margin: float = 0.25
+    prototype_diversity_margin: float = 0.20
 
 
 def _paired_average(function: Any, primary: torch.Tensor, alternate: torch.Tensor) -> torch.Tensor:
@@ -118,9 +144,54 @@ def _known_consistency(primary: torch.Tensor, alternate: torch.Tensor,
     )
 
 
+def _symmetric_consistency(
+    primary: torch.Tensor, alternate: torch.Tensor
+) -> torch.Tensor:
+    first = primary.log_softmax(dim=1)
+    second = alternate.log_softmax(dim=1)
+    return 0.5 * (
+        F.kl_div(first, second.exp(), reduction="batchmean")
+        + F.kl_div(second, first.exp(), reduction="batchmean")
+    )
+
+
+def _prototype_class_logits(output: HierarchicalTypeOutput) -> torch.Tensor:
+    return torch.logsumexp(output.prototype_logits, dim=2) - math.log(
+        output.prototype_logits.shape[2]
+    )
+
+
+def _ic_prototype_margin(
+    output: HierarchicalTypeOutput,
+    targets: torch.Tensor,
+    margin: float,
+) -> torch.Tensor:
+    ic = targets == 0
+    if not torch.any(ic):
+        return output.prototype_scores.sum() * 0.0
+    maximum_similarity = output.prototype_scores[ic].max(dim=1).values
+    return F.relu(maximum_similarity - margin).mean()
+
+
+def _prototype_diversity(
+    prototypes: torch.Tensor | None,
+    reference: torch.Tensor,
+    margin: float,
+) -> torch.Tensor:
+    if prototypes is None or prototypes.shape[1] < 2:
+        return reference.sum() * 0.0
+    normalized = F.normalize(prototypes, dim=-1, eps=1e-6)
+    similarity = normalized @ normalized.transpose(1, 2)
+    mask = ~torch.eye(
+        similarity.shape[1], dtype=torch.bool, device=similarity.device
+    )[None, :, :]
+    return F.relu(similarity[mask.expand_as(similarity)] - margin).mean()
+
+
 def hierarchical_type_loss(
     primary: HierarchicalTypeOutput, alternate: HierarchicalTypeOutput,
     targets: torch.Tensor, weights: HierarchicalLossWeights = HierarchicalLossWeights(),
+    prototype_vectors: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute two-view hierarchical losses without compacting IC."""
     if targets.ndim != 1 or len(targets) != len(primary.type_logits):
@@ -146,6 +217,8 @@ def hierarchical_type_loss(
     )
     known_mask = targets > 0
     zero = primary.known_logits.sum() * 0.0
+    primary_prototypes = _prototype_class_logits(primary)
+    alternate_prototypes = _prototype_class_logits(alternate)
     if torch.any(known_mask):
         known_targets = targets[known_mask] - 1
         def average_ce(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
@@ -154,14 +227,6 @@ def hierarchical_type_loss(
                 first_loss + F.cross_entropy(second[known_mask], known_targets)
             )
         known = average_ce(primary.known_logits, alternate.known_logits)
-        primary_prototypes = (
-            torch.logsumexp(primary.prototype_logits, dim=2)
-            - math.log(primary.prototype_logits.shape[2])
-        )
-        alternate_prototypes = (
-            torch.logsumexp(alternate.prototype_logits, dim=2)
-            - math.log(alternate.prototype_logits.shape[2])
-        )
         prototype = average_ce(primary_prototypes, alternate_prototypes)
         local = average_ce(
             primary.local_known_logits, alternate.local_known_logits
@@ -180,6 +245,25 @@ def hierarchical_type_loss(
     consistency = _known_consistency(
         primary.known_logits, alternate.known_logits, targets
     )
+    gate_consistency = _symmetric_consistency(
+        primary.gate_logits, alternate.gate_logits
+    )
+    prototype_consistency = _known_consistency(
+        primary_prototypes, alternate_prototypes, targets
+    )
+    ic_margin = 0.5 * (
+        _ic_prototype_margin(
+            primary, targets, weights.ic_similarity_margin
+        )
+        + _ic_prototype_margin(
+            alternate, targets, weights.ic_similarity_margin
+        )
+    )
+    prototype_diversity = _prototype_diversity(
+        prototype_vectors,
+        primary.prototype_logits,
+        weights.prototype_diversity_margin,
+    )
     components = {
         "gate": gate,
         "known": known,
@@ -188,6 +272,10 @@ def hierarchical_type_loss(
         "branch": branch,
         "contrastive": contrastive,
         "consistency": consistency,
+        "gate_consistency": gate_consistency,
+        "prototype_consistency": prototype_consistency,
+        "ic_margin": ic_margin,
+        "prototype_diversity": prototype_diversity,
     }
     total = sum(
         components[name] * float(getattr(weights, name))
@@ -250,7 +338,16 @@ def train_role_epoch(
                         batch["daylight"],
                     )
                     loss_parts = hierarchical_type_loss(
-                        primary, alternate, targets
+                        primary,
+                        alternate,
+                        targets,
+                        prototype_vectors=(
+                            getattr(
+                                getattr(model, "prototype_matcher", None),
+                                "prototypes",
+                                None,
+                            )
+                        ),
                     )
                     loss = loss_parts["total"]
                     logits = primary.type_logits

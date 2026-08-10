@@ -13,7 +13,7 @@ python -m compileall -q .
 python -m pytest -q
 
 # Train all five roles (type + NCG/NNBE/PCG/PNBE distance)
-python -u train.py --task_data ..\train_data --output .\weights\multi_model --epochs 50 --patience 10 --batch_size 64 --num_workers 0
+python -u train.py --task_data ..\train_data --output .\weights\multi_model --epochs 50 --patience 10 --batch_size 60 --num_workers 0
 
 # Resume a single role
 python -u train.py --task_data ..\train_data --output .\weights\multi_model --stage NCG --resume .\weights\multi_model\NCG\last.pt
@@ -55,17 +55,17 @@ The type stage (`HierarchicalTypeNet`) uses a **GatedDualViewEncoder** that fuse
 
 Final type logits combine `log_softmax(gate)` and `log_softmax(known)` so IC is always reachable. At inference, `decide_hierarchical_types()` accepts a known-class override only when two shifted views agree, multiple thresholds are met (probability, prototype similarity, JS divergence, IC gate max, branch votes), and the IC gate probability is low — otherwise the piece defaults to IC. The decision config is calibrated on the validation set via `calibrate_hierarchical_decision()` and stored in the checkpoint.
 
-The type loss (`hierarchical_type_loss`) uses paired augmented views and seven weighted objectives: gate CE, known CE, five-class CE, prototype CE, branch CE, supervised contrastive, and KL consistency — but does **not** force the heterogeneous IC class into a compact prototype.
+The type loss (`hierarchical_type_loss`) uses paired augmented views, known-class metric objectives, gate/prototype consistency, an IC-to-known-prototype margin, and a prototype diversity term. It does **not** force the heterogeneous IC class into a compact prototype.
 
 ### Distance: four independent experts
 
-Each non-IC type has its own `FiveClassNet` with an independent `DualViewEncoder` + `PrototypeDistanceMatcher` (30 learned prototypes per class, one per 100-km bin). The distance loss combines categorical CE with an ordered CDF-matching term.
+Each non-IC type has its own `FiveClassNet` with an independent `DualViewEncoder` + `PrototypeDistanceMatcher` (30 learned prototypes per class, one per 100-km bin). The distance loss combines categorical CE, ordered CDF matching, and expected-bin Smooth-L1 so training and deployment distance metrics agree.
 
 ### Training
 
 `train.py` trains five independent roles sequentially. The type role uses `HierarchicalTypeNet`; distance roles use `FiveClassNet` with `set_training_role()` which freezes the type path. Each role gets its own optimizer, scheduler, deterministic `FiveClassSampler` (type) or `DistanceExpertSampler` (distance), and early stopping. Resumable `last.pt` checkpoints save full training state including RNG seeds, with strict hash validation on resume.
 
-Type batches use a 20/20/20/20/20 prior; the 60% IC fraction is fixed and validated. Type sampling is without replacement within an epoch, stratified by type × daylight × distance-bin. Distance sampling is with replacement, uniform across daylight × distance cells.
+Every complete type batch uses a 20/20/20/20/20 prior. Type sampling is without replacement within an epoch, stratified by type × daylight × distance-bin. Distance sampling is with replacement, uniform across daylight × distance cells. Type early stopping prioritizes known recall while penalizing false rejection to IC; distance early stopping uses probability-weighted expected distance. A final `bundle_metrics.json` evaluates deployment-equivalent type-to-distance routing.
 
 ### Checkpoint schemas
 
@@ -81,7 +81,7 @@ Three inference schemas detected by `load_model_checkpoint()`:
 
 - `data/lig.py` — LIG binary format: 112-byte header, 32208 or 32464-byte pieces with 16000 uint16 samples. `_validate_source` auto-detects piece size by checking piece#1 timestamp validity. `LigFileIndex` provides lazy file handle management with batch reading; piece count is clamped to fit the payload when the larger (32464) variant is detected. `LigOutputRegrouper` writes byte-exact 512-piece output groups named by first-piece timestamp (or `GZ_unknown` for pieces with invalid timestamps).
 - `data/manifest.py` — `build_piece_table()` scans `TYPE_NAME/` directories, parses 100-km distance intervals from path names, builds a `PieceTable` with compact numpy arrays.
-- `data/split.py` — deterministic 70/15/15 train/val/test splits **grouped by source LIG file**. Stratified by type × daylight × distance-bin using greedy cost-minimizing assignment.
+- `data/split.py` — deterministic 70/15/15 train/val/test ownership at the individual-piece level, stratified by type × daylight × distance-bin. One source LIG file may cross partitions.
 - `data/preprocess.py` — `preprocess_views()` produces signed local/global views: local centers on energy envelope peak (or max-abs), global downsamples/resamples. Both are robust-normalized (median-center, divide by 95th-percentile absolute). Augmentation is polarity-safe: shift, gain, drift, noise — no sign flip.
 - `data/dataset.py` — `FiveClassDataset` wraps a `PieceTable` + split positions. `SampleRequest` indices carry deterministic paired augmentation seeds for training; plain `int` indices skip augmentation.
 - `data/sampling.py` — `FiveClassSampler` and `DistanceExpertSampler` use deterministic SHA-256-derived seeds keyed by `seed|epoch|draw_index|position`.

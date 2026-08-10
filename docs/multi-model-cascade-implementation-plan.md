@@ -24,7 +24,7 @@ reconstruction.
 - Labels remain exactly `IC`, `NCG`, `NNBE`, `PCG`, and `PNBE`.
 - All five roles use random initialization and share no trainable parameters.
 - Splits remain deterministic, waveform-piece-level, and mutually exclusive.
-- Type sampling remains fixed at 60/10/10/10/10.
+- Every complete type batch uses a fixed 20/20/20/20/20 prior.
 - Distance experts use only their assigned non-IC type and balance observed
   distance-bin/daylight cells.
 - Each output LIG file contains at most 512 complete raw pieces.
@@ -578,7 +578,7 @@ git commit -m "Write timestamp-named hierarchical LIG outputs"
 Document:
 
 ```cmd
-python -u train.py --task_data ..\train_data --output .\weights\multi_model --epochs 50 --patience 10 --batch_size 64 --num_workers 0
+python -u train.py --task_data ..\train_data --output .\weights\multi_model --epochs 50 --patience 10 --batch_size 60 --num_workers 0
 ```
 
 Single role retraining/resume:

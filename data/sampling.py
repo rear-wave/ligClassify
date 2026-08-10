@@ -187,8 +187,9 @@ class FiveClassSampler:
             np.random.SeedSequence([self.seed, self.epoch])
         )
         type_quotas = [self.num_samples // len(TYPE_NAMES)] * len(TYPE_NAMES)
-        draws: list[int] = []
+        draws_by_type: list[list[int]] = []
         for type_index, type_quota in enumerate(type_quotas):
+            type_draws: list[int] = []
             type_positions = [
                 position
                 for position in self.positions
@@ -236,7 +237,14 @@ class FiveClassSampler:
                         selected = rng.choice(
                             leaf, size=leaf_quota, replace=False
                         )
-                        draws.extend(int(position) for position in selected)
+                        type_draws.extend(int(position) for position in selected)
+            rng.shuffle(type_draws)
+            draws_by_type.append(type_draws)
+        draws = [
+            draws_by_type[type_index][row]
+            for row in range(type_quotas[0])
+            for type_index in range(len(TYPE_NAMES))
+        ]
         if len(draws) != self.num_samples:
             raise RuntimeError("sampler quota allocation did not sum to epoch size")
         return draws
@@ -255,10 +263,6 @@ class FiveClassSampler:
             )
             requests.append(SampleRequest(position, seeds))
 
-        rng = np.random.default_rng(
-            np.random.SeedSequence([self.seed, self.epoch, 0x53485546])
-        )
-        rng.shuffle(requests)
         return iter(requests)
 
 

@@ -72,13 +72,12 @@ def test_training_defaults_match_five_class_contract():
     assert args.task_data == r"..\train_data"
     assert args.output == r".\weights\multi_model"
     assert args.epochs == 50
-    assert args.batch_size == 64
+    assert args.batch_size == 60
     assert args.patience == 10
     assert args.type_samples_per_epoch == 120000
     assert args.distance_samples_per_epoch == 60000
     assert args.num_workers == 0
     assert args.seed == 42
-    assert args.ic_fraction == 0.60
     assert args.stage == "all"
     assert args.base_channels == 64
     assert args.lr == 0.0003
@@ -99,6 +98,7 @@ def test_training_defaults_match_five_class_contract():
         "--verify_only",
         "--distance_weight",
         "--samples_per_epoch",
+        "--ic_fraction",
     ],
 )
 def test_old_training_options_are_rejected(option):
@@ -424,6 +424,54 @@ def test_hierarchical_consistency_increases_when_known_views_disagree():
     assert stable["consistency"] < unstable["consistency"]
 
 
+def test_hierarchical_gate_consistency_uses_all_classes():
+    targets = torch.tensor([0, 1])
+    output = _hierarchical_output(torch.zeros(2, 4), torch.eye(2, 4))
+    changed_gate = torch.tensor([[8.0, -8.0], [-8.0, 8.0]])
+
+    stable = hierarchical_type_loss(output, output, targets)
+    unstable = hierarchical_type_loss(
+        output, replace(output, gate_logits=changed_gate), targets
+    )
+
+    assert stable["gate_consistency"] < unstable["gate_consistency"]
+
+
+def test_hierarchical_ic_margin_rejects_known_prototype_similarity():
+    targets = torch.tensor([0, 1])
+    output = _hierarchical_output(torch.zeros(2, 4), torch.eye(2, 4))
+    high_similarity = output.prototype_scores.clone()
+    high_similarity[0, 2] = 0.9
+
+    baseline = hierarchical_type_loss(output, output, targets)
+    rejected = hierarchical_type_loss(
+        replace(output, prototype_scores=high_similarity), output, targets
+    )
+
+    assert baseline["ic_margin"] == 0.0
+    assert rejected["ic_margin"] > baseline["ic_margin"]
+
+
+def test_hierarchical_prototype_diversity_penalizes_collapse():
+    targets = torch.tensor([1, 2, 3, 4])
+    output = _hierarchical_output(torch.zeros(4, 4), torch.eye(4))
+    collapsed = torch.ones(4, 2, 3)
+    separated = torch.tensor(
+        [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]] * 4
+    )
+
+    collapsed_loss = hierarchical_type_loss(
+        output, output, targets, prototype_vectors=collapsed
+    )
+    separated_loss = hierarchical_type_loss(
+        output, output, targets, prototype_vectors=separated
+    )
+
+    assert collapsed_loss["prototype_diversity"] > separated_loss[
+        "prototype_diversity"
+    ]
+
+
 @pytest.mark.parametrize(
     "targets",
     [
@@ -454,6 +502,10 @@ def test_hierarchical_loss_is_finite_for_sparse_batch_composition(targets):
         "branch",
         "contrastive",
         "consistency",
+        "gate_consistency",
+        "prototype_consistency",
+        "ic_margin",
+        "prototype_diversity",
     }
     assert all(torch.isfinite(value) for value in losses.values())
 
@@ -578,6 +630,8 @@ def test_distance_role_evaluation_reports_point_metrics():
     assert metrics["exact_accuracy"] == 0.5
     assert metrics["within_200"] == 1.0
     assert metrics["mae_km"] == 100.0
+    assert metrics["expected_within_200"] == 1.0
+    assert metrics["expected_mae_km"] == pytest.approx(100.0, abs=1e-3)
 
 
 def test_early_stopping_requires_more_than_one_millionth_improvement():
@@ -944,7 +998,7 @@ def test_resume_rejects_incoherent_metadata_before_live_state_mutation(
 @pytest.mark.parametrize(
     ("option", "changed"),
     [
-        ("--ic_fraction", "0.50"),
+        ("--batch_size", "65"),
         ("--base_channels", "16"),
         ("--seed", "43"),
     ],
@@ -1240,6 +1294,7 @@ def test_single_split_training_smoke_writes_only_contract_artifacts(tmp_path):
     assert set(result["roles"]) == {"type", "NCG", "NNBE", "PCG", "PNBE"}
     assert {path.name for path in output.iterdir()} == {
         "bundle.json",
+        "bundle_metrics.json",
         "split.json",
         "type",
         "NCG",

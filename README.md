@@ -19,8 +19,9 @@ data outside the repository:
 
 Distance folders must use aligned 100 km intervals within 0–3000 km. Splits are
 deterministic at waveform-piece level within type, daylight, and distance
-strata. Type batches use the fixed 60/10/10/10/10 prior. Every model starts
-from random initialization.
+strata; pieces from one source file may enter different partitions. Every
+complete type batch uses a 20/20/20/20/20 prior. Every model starts from
+random initialization.
 
 ## Training
 
@@ -28,11 +29,12 @@ Install `numpy`, `scipy`, `torch`, `scikit-learn`, `tqdm`, and `pytest`, then
 train the type model and four independent distance models:
 
 ```cmd
-python -u train.py --task_data ..\train_data --output .\weights\multi_model --epochs 50 --patience 10 --batch_size 64 --num_workers 0
+python -u train.py --task_data ..\train_data --output .\weights\multi_model --epochs 50 --patience 10 --batch_size 60 --num_workers 0
 ```
 
-The output contains `type/model.pt` and one model under each non-IC role plus
-`bundle.json`. Retrain or resume one role without changing the others:
+The output contains `type/model.pt`, one model under each non-IC role,
+`bundle.json`, and deployment-routed test metrics in `bundle_metrics.json`.
+Retrain or resume one role without changing the others:
 
 ```cmd
 python -u train.py --task_data ..\train_data --output .\weights\multi_model --stage NCG --resume .\weights\multi_model\NCG\last.pt

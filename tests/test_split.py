@@ -86,10 +86,10 @@ def _source_owners(table, assignment):
     }
 
 
-def test_piece_split_is_deterministic_balanced_and_keeps_files_together(
+def test_piece_split_is_deterministic_balanced_and_allows_files_to_cross(
     single_stratum_table,
 ):
-    table = _split_each_source(single_stratum_table)
+    table = single_stratum_table
     first = assign_piece_splits(table, seed=42)
     second = assign_piece_splits(table, seed=42)
 
@@ -100,7 +100,7 @@ def test_piece_split_is_deterministic_balanced_and_keeps_files_together(
     assert abs(int(counts[TRAIN]) - 14) <= 2
     assert abs(int(counts[VALIDATION]) - 3) <= 2
     assert abs(int(counts[TEST]) - 3) <= 2
-    assert all(len(owners) == 1 for owners in _source_owners(table, first).values())
+    assert any(len(owners) > 1 for owners in _source_owners(table, first).values())
     assert np.array_equal(
         first.positions("validation"),
         np.flatnonzero(first.partition == VALIDATION),
@@ -108,12 +108,12 @@ def test_piece_split_is_deterministic_balanced_and_keeps_files_together(
 
 
 def test_split_artifact_is_compact(single_stratum_table):
-    table = _split_each_source(single_stratum_table)
+    table = single_stratum_table
     assignment = assign_piece_splits(table, seed=42)
     artifact = split_artifact(table, assignment)
 
     assert "piece_rows" not in artifact
-    assert artifact["schema"] == "source_grouped_stratified_split_v2"
+    assert artifact["schema"] == "piece_stratified_split_v2"
     assert artifact["ratios"] == [0.70, 0.15, 0.15]
     assert set(artifact["partition_hashes"]) == {
         "train",
@@ -121,7 +121,11 @@ def test_split_artifact_is_compact(single_stratum_table):
         "test",
     }
     assert sum(artifact["piece_counts"].values()) == len(table)
-    assert sum(artifact["source_counts"].values()) == len(table.sources)
+    assert set(artifact["represented_source_counts"]) == {
+        "train",
+        "validation",
+        "test",
+    }
     encoded = json.dumps(artifact)
     assert str(table.root) not in encoded
     assert "one.lig#" not in encoded
@@ -188,27 +192,25 @@ def test_classification_only_split_strata_do_not_include_distance(piece_table):
     }
 
 
-def test_two_source_stratum_is_train_only_and_reported(single_stratum_table):
-    grouped = _split_each_source(single_stratum_table)
-    tiny = _reorder_table(grouped, [0, 1, 2, 3])
+def test_two_piece_stratum_is_train_only_and_reported(single_stratum_table):
+    tiny = _reorder_table(single_stratum_table, [0, 1])
 
     assignment = assign_piece_splits(tiny, seed=42)
     artifact = split_artifact(tiny, assignment)
 
-    assert assignment.partition.tolist() == [TRAIN] * 4
+    assert assignment.partition.tolist() == [TRAIN] * 2
     only_stratum = next(iter(artifact["strata"].values()))
     assert only_stratum == {
-        "train": 4,
+        "train": 2,
         "validation": 0,
         "test": 0,
-        "source_support": 2,
-        "insufficient_source_groups": 2,
+        "piece_support": 2,
+        "insufficient_pieces": 2,
     }
 
 
-def test_three_source_stratum_populates_every_partition(single_stratum_table):
-    grouped = _split_each_source(single_stratum_table)
-    smallest_evaluable = _reorder_table(grouped, [0, 1, 2, 3, 4, 5])
+def test_three_piece_stratum_populates_every_partition(single_stratum_table):
+    smallest_evaluable = _reorder_table(single_stratum_table, [0, 1, 2])
 
     assignment = assign_piece_splits(smallest_evaluable, seed=42)
 
@@ -236,24 +238,17 @@ def test_validation_rejects_invalid_ownership(single_stratum_table):
         )
 
 
-def test_validation_rejects_one_source_crossing_partitions(
+def test_validation_accepts_one_source_crossing_partitions(
     single_stratum_table,
 ):
-    table = _split_each_source(single_stratum_table)
+    table = single_stratum_table
     assignment = assign_piece_splits(table, seed=42)
-    changed = assignment.partition.copy()
-    source_positions = np.flatnonzero(table.source_index == 0)
-    changed[source_positions[0]] = (
-        VALIDATION
-        if changed[source_positions[0]] != VALIDATION
-        else TEST
-    )
 
-    with pytest.raises(ValueError, match="source file crosses partitions"):
-        validate_piece_split(
-            table,
-            SplitAssignment(changed, assignment.seed),
-        )
+    assert any(
+        len(owners) > 1
+        for owners in _source_owners(table, assignment).values()
+    )
+    validate_piece_split(table, assignment)
 
 
 def test_validation_rejects_duplicate_piece_ownership(single_stratum_table):
@@ -268,19 +263,13 @@ def test_validation_rejects_duplicate_piece_ownership(single_stratum_table):
 
 
 def test_validation_recomputes_expected_seeded_ownership(single_stratum_table):
-    table = _split_each_source(single_stratum_table)
+    table = single_stratum_table
     assignment = assign_piece_splits(table, seed=42)
     changed = assignment.partition.copy()
-    train_source = int(
-        table.source_index[np.flatnonzero(changed == TRAIN)[0]]
-    )
-    validation_source = int(
-        table.source_index[np.flatnonzero(changed == VALIDATION)[0]]
-    )
-    train_positions = table.source_index == train_source
-    validation_positions = table.source_index == validation_source
-    changed[train_positions] = VALIDATION
-    changed[validation_positions] = TRAIN
+    train_position = int(np.flatnonzero(changed == TRAIN)[0])
+    validation_position = int(np.flatnonzero(changed == VALIDATION)[0])
+    changed[train_position] = VALIDATION
+    changed[validation_position] = TRAIN
 
     with pytest.raises(ValueError, match="does not match seed"):
         validate_piece_split(

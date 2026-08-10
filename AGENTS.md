@@ -19,14 +19,15 @@ match may override the IC gate; otherwise inference returns IC. Non-IC results
 route to one of four independently initialized class-specific distance
 checkpoints. A validated `bundle.json` assigns checkpoints to roles.
 
-Evaluation splits are deterministic and grouped by source LIG file while
-retaining type, daylight, and distance stratification. Type batches use a
+Evaluation splits assign individual pieces deterministically while retaining
+type, daylight, and distance stratification. A source LIG file may contribute
+pieces to multiple partitions. Type batches use a
 20/20/20/20/20 prior and avoid repeated IC sampling within an epoch. Training
 starts from random initialization. Use supervised contrastive and augmentation
 consistency objectives for the four known classes, but do not force the
 heterogeneous IC class into one compact prototype. Candidate type models must
 report known-class recall, per-class false rejection to IC, augmentation
-consistency, and paired NBE/CG confusions on the source-isolated test set. Do
+consistency, and paired NBE/CG confusions on the piece-level test set. Do
 not add warm starts, CV/OOF pipelines, or a standalone four-class-only type
 classifier.
 

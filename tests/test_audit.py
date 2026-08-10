@@ -40,7 +40,7 @@ def test_audit_reports_piece_split_and_training_prior(tmp_path, monkeypatch):
     monkeypatch.setattr(audit_data, "audit_duplicate_waveforms", fail_if_called)
     report = audit_dataset(root, seed=42)
 
-    assert report["split_schema"] == "source_grouped_stratified_split_v2"
+    assert report["split_schema"] == "piece_stratified_split_v2"
     assert report["files"] == 15
     assert report["pieces"] == 30
     assert report["type_counts"] == {name: 6 for name in TYPE_NAMES}
@@ -63,7 +63,9 @@ def test_audit_reports_piece_split_and_training_prior(tmp_path, monkeypatch):
         "PCG": 0.20,
         "PNBE": 0.20,
     }
-    assert sum(report["split_source_counts"].values()) == 15
+    assert set(report["split_represented_source_counts"]) == set(
+        PARTITION_NAMES
+    )
     assert "duplicate_waveforms" not in report
 
 

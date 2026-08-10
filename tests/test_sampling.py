@@ -32,6 +32,11 @@ def test_sampler_uses_equal_prior_without_replacement(piece_table):
             for seed in item.augmentation_seeds
         }
     ) == 200
+    for start in range(0, len(requests), 5):
+        assert {
+            int(piece_table.type_index[item.position])
+            for item in requests[start : start + 5]
+        } == {0, 1, 2, 3, 4}
 
 
 def test_classification_only_sampler_accepts_missing_distance_bins(piece_table):

@@ -113,7 +113,7 @@ def audit_dataset(
             name
             for name, counts in strata.items()
             if isinstance(counts, dict)
-            and int(counts.get("insufficient_source_groups", 0)) > 0
+            and int(counts.get("insufficient_pieces", 0)) > 0
         ),
         "split_schema": artifact["schema"],
         "split_seed": artifact["seed"],
@@ -121,7 +121,9 @@ def audit_dataset(
         "manifest_hash": artifact["manifest_hash"],
         "split_hashes": artifact["partition_hashes"],
         "split_counts": artifact["piece_counts"],
-        "split_source_counts": artifact["source_counts"],
+        "split_represented_source_counts": artifact[
+            "represented_source_counts"
+        ],
         "strata_counts": strata,
         "training_prior": dict(TRAINING_PRIOR),
     }
