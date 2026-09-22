@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass, field, fields
 
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
-from models import DISTANCE_BIN_COUNT, ModelOutput, TYPE_COUNT
+from models import (
+    DISTANCE_BIN_COUNT,
+    HIERARCHICAL_TYPE_ARCHITECTURE,
+    HierarchicalTypeOutput,
+    ModelOutput,
+    TYPE_COUNT,
+)
 
 
 def _ratio(numerator: float, denominator: float) -> float:
@@ -25,12 +33,7 @@ def _type_metrics(confusion: np.ndarray) -> dict[str, object]:
         type_recall = _ratio(true_positive, int(confusion[type_index, :].sum()))
         precision.append(type_precision)
         recall.append(type_recall)
-        f1.append(
-            _ratio(
-                2.0 * type_precision * type_recall,
-                type_precision + type_recall,
-            )
-        )
+        f1.append(_ratio(2.0 * type_precision * type_recall, type_precision + type_recall))
     total = int(confusion.sum())
     return {
         "type_confusion": confusion.tolist(),
@@ -42,6 +45,453 @@ def _type_metrics(confusion: np.ndarray) -> dict[str, object]:
         "type_macro_recall": float(np.mean(recall)),
         "type_macro_f1": float(np.mean(f1)),
     }
+
+
+@dataclass(frozen=True)
+class HierarchicalDecisionConfig:
+    """Calibrated acceptance limits for stable known-class evidence."""
+
+    known_probability_thresholds: tuple[float, float, float, float]
+    prototype_similarity_thresholds: tuple[float, float, float, float]
+    max_js_divergences: tuple[float, float, float, float]
+    min_branch_votes: int
+    max_ic_gate_probabilities: tuple[float, float, float, float] = (0.50,) * 4
+
+
+def conservative_hierarchical_config() -> HierarchicalDecisionConfig:
+    """Return a reject-by-default configuration for uncalibrated models."""
+    return HierarchicalDecisionConfig(
+        known_probability_thresholds=(1.0,) * 4,
+        prototype_similarity_thresholds=(1.0,) * 4,
+        max_js_divergences=(0.0,) * 4, min_branch_votes=4,
+        max_ic_gate_probabilities=(0.0,) * 4,
+    )
+
+
+@dataclass(frozen=True)
+class HierarchicalDecision:
+    """Batch decisions and diagnostics shared by evaluation and inference."""
+
+    final_type: torch.Tensor
+    candidate_known_type: torch.Tensor
+    ic_gate_probability: torch.Tensor
+    known_type_probability: torch.Tensor
+    prototype_similarity: torch.Tensor
+    local_prediction: torch.Tensor
+    global_prediction: torch.Tensor
+    consistency_score: torch.Tensor
+    decision_reason: tuple[str, ...]
+    constraint_passes: Mapping[str, torch.Tensor] = field(default_factory=dict)
+
+def _js_divergence(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    first_log = F.log_softmax(first, dim=1)
+    second_log = F.log_softmax(second, dim=1)
+    midpoint = torch.logaddexp(first_log, second_log) - np.log(2.0)
+    return 0.5 * (
+        (first_log.exp() * (first_log - midpoint)).sum(dim=1)
+        + (second_log.exp() * (second_log - midpoint)).sum(dim=1)
+    )
+
+
+def decide_hierarchical_types(
+    primary: HierarchicalTypeOutput,
+    alternate: HierarchicalTypeOutput,
+    config: HierarchicalDecisionConfig,
+) -> HierarchicalDecision:
+    """Accept stable known evidence; use IC only when no match is stable."""
+    first_probability = primary.known_logits.softmax(dim=1)
+    second_probability = alternate.known_logits.softmax(dim=1)
+    mean_probability = 0.5 * (first_probability + second_probability)
+    candidate_zero = mean_probability.argmax(dim=1)
+    rows = torch.arange(len(candidate_zero), device=candidate_zero.device)
+    candidate = candidate_zero + 1
+    candidate_probability = mean_probability[rows, candidate_zero]
+    prototype = 0.5 * (
+        primary.prototype_scores[rows, candidate_zero]
+        + alternate.prototype_scores[rows, candidate_zero]
+    )
+    ic_gate_probability = 0.5 * (
+        primary.gate_logits.softmax(dim=1)[:, 0]
+        + alternate.gate_logits.softmax(dim=1)[:, 0]
+    )
+    first_candidate = first_probability.argmax(dim=1)
+    second_candidate = second_probability.argmax(dim=1)
+    local = primary.local_known_logits.argmax(dim=1) + 1
+    global_prediction = primary.global_known_logits.argmax(dim=1) + 1
+    votes = torch.stack(
+        (
+            local,
+            global_prediction,
+            alternate.local_known_logits.argmax(dim=1) + 1,
+            alternate.global_known_logits.argmax(dim=1) + 1,
+        )
+    ).eq(candidate).sum(dim=0)
+    divergence = _js_divergence(
+        primary.known_logits, alternate.known_logits
+    )
+    probability_thresholds = primary.known_logits.new_tensor(
+        config.known_probability_thresholds
+    )[candidate_zero]
+    prototype_thresholds = primary.known_logits.new_tensor(
+        config.prototype_similarity_thresholds
+    )[candidate_zero]
+    gate_thresholds = primary.known_logits.new_tensor(
+        config.max_ic_gate_probabilities
+    )[candidate_zero]
+    divergence_thresholds = primary.known_logits.new_tensor(
+        config.max_js_divergences
+    )[candidate_zero]
+    constraint_passes = {
+        "view_agreement": first_candidate.eq(second_candidate),
+        "known_probability": candidate_probability.ge(probability_thresholds),
+        "prototype_similarity": prototype.ge(prototype_thresholds),
+        "ic_gate": ic_gate_probability.le(gate_thresholds),
+        "js_divergence": divergence.le(divergence_thresholds),
+        "branch_votes": votes.ge(int(config.min_branch_votes)),
+    }
+    stable = torch.stack(list(constraint_passes.values())).all(dim=0)
+    final_type = torch.where(stable, candidate, torch.zeros_like(candidate))
+    reasons = tuple(
+        "stable_known_override"
+        if bool(value)
+        else "insufficient_known_evidence"
+        for value in stable.detach().cpu().tolist()
+    )
+    return HierarchicalDecision(final_type=final_type, candidate_known_type=candidate,
+        ic_gate_probability=ic_gate_probability, known_type_probability=candidate_probability,
+        prototype_similarity=prototype, local_prediction=local, global_prediction=global_prediction,
+        consistency_score=1.0 - divergence, decision_reason=reasons, constraint_passes=constraint_passes)
+
+
+def _quantiles(values: torch.Tensor, *, fine_upper_bound: bool = False) -> list[float]:
+    if not len(values):
+        return []
+    levels = values.new_tensor(
+        [*np.linspace(0.0, 1.0, 21), 0.975, 0.99, 0.995]
+    ).unique(sorted=True) if fine_upper_bound else torch.linspace(
+        0.0, 1.0, 11, device=values.device)
+    return sorted(set(float(value) for value in torch.quantile(values, levels)))
+
+
+def _shift_tensor_view(values: torch.Tensor, amount: int) -> torch.Tensor:
+    if amount <= 0 or amount >= values.shape[-1]:
+        raise ValueError("shift amount must be inside the waveform length")
+    shifted = torch.zeros_like(values)
+    shifted[..., amount:] = values[..., :-amount]
+    return shifted
+
+
+def infer_hierarchical_types(
+    model: Any,
+    decision_config: dict[str, Any],
+    local: torch.Tensor,
+    global_view: torch.Tensor,
+    daylight: torch.Tensor,
+    alternate_daylight: torch.Tensor | None,
+    missing: torch.Tensor,
+    *,
+    verifier: object | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply paired-view evidence and conservative unknown-time routing."""
+    config = HierarchicalDecisionConfig(**dict(decision_config))
+    shifted_local = _shift_tensor_view(local, 16)
+    shifted_global = _shift_tensor_view(global_view, 4)
+    primary = model(local, global_view, daylight)
+    alternate = model(shifted_local, shifted_global, daylight)
+    decision = decide_hierarchical_types(primary, alternate, config)
+    logits = 0.5 * (primary.type_logits + alternate.type_logits)
+    final_type = decision.final_type
+    if alternate_daylight is not None:
+        second_primary = model(local, global_view, alternate_daylight)
+        second_alternate = model(shifted_local, shifted_global, alternate_daylight)
+        second_decision = decide_hierarchical_types(second_primary, second_alternate, config)
+        second_logits = 0.5 * (second_primary.type_logits + second_alternate.type_logits)
+        logits = torch.where(missing.unsqueeze(1), 0.5 * (logits + second_logits), logits)
+        agreed = final_type.eq(second_decision.final_type)
+        unknown_final = torch.where(agreed, final_type, torch.zeros_like(final_type))
+        final_type = torch.where(missing, unknown_final, final_type)
+    if verifier is not None:
+        final_type = _guarded_verify(decision, final_type, verifier, local, global_view, daylight, missing)
+    return logits, final_type
+
+
+def _guarded_verify(decision, final_type, verifier, local, global_view, daylight, missing):
+    """Confirm only rejected, time-known candidates; retain primary probabilities."""
+    candidate = decision.candidate_known_type
+    limits = local.new_tensor(verifier.limits)[candidate - 1]
+    needed = (final_type.eq(0) & ~missing & decision.constraint_passes["view_agreement"]
+              & decision.constraint_passes["branch_votes"]
+              & decision.known_type_probability.ge(limits[:, 0])
+              & decision.ic_gate_probability.le(limits[:, 2]))
+    if not torch.any(needed):
+        return final_type
+    checkpoint = verifier.checkpoint
+    checkpoint.model.eval()
+    x, g, day = local[needed], global_view[needed], daylight[needed]
+    primary = checkpoint.model(x, g, day)
+    alternate = checkpoint.model(_shift_tensor_view(x, 16), _shift_tensor_view(g, 4), day)
+    second = decide_hierarchical_types(primary, alternate,
+        HierarchicalDecisionConfig(**checkpoint.metadata["decision_config"]))
+    accepted = (second.final_type.eq(candidate[needed])
+                & second.known_type_probability.ge(limits[needed, 1])
+                & second.ic_gate_probability.le(limits[needed, 3]))
+    result = final_type.clone()
+    result[needed] = torch.where(accepted, candidate[needed], final_type[needed])
+    return result
+
+
+def calibrate_hierarchical_decision(
+    primary: HierarchicalTypeOutput,
+    alternate: HierarchicalTypeOutput,
+    targets: torch.Tensor,
+    *,
+    minimum_precision: float = 0.90,
+    minimum_nbe_precision: float = 0.95,
+    target_ic_fraction: float | None = None,
+    maximum_ic_false_positive_rate: float = 0.01,
+    maximum_cg_to_nbe_rate: float = 0.002,
+) -> HierarchicalDecisionConfig:
+    """Maximize known recall under explicit precision and false-accept limits."""
+    if targets.ndim != 1 or len(targets) != len(primary.known_logits):
+        raise ValueError("calibration targets must align with outputs")
+    if set(targets.detach().cpu().tolist()) & {1, 2, 3, 4} != {1, 2, 3, 4}:
+        raise ValueError("calibration requires all four known classes")
+    if target_ic_fraction is not None and not 0.0 < target_ic_fraction < 1.0:
+        raise ValueError("target_ic_fraction must be between zero and one")
+    precision_limits = (("minimum_precision", minimum_precision), ("minimum_nbe_precision", minimum_nbe_precision))
+    for name, value in precision_limits:
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"{name} must be in (0, 1]")
+    if not 0.0 <= maximum_ic_false_positive_rate < 1.0:
+        raise ValueError("maximum_ic_false_positive_rate must be in [0, 1)")
+    if not 0.0 <= maximum_cg_to_nbe_rate < 1.0:
+        raise ValueError("maximum_cg_to_nbe_rate must be in [0, 1)")
+    class_counts = torch.bincount(targets, minlength=TYPE_COUNT).float()
+    if torch.any(class_counts == 0):
+        raise ValueError("calibration requires all five classes")
+    if target_ic_fraction is None:
+        sample_weights = torch.ones_like(targets, dtype=torch.float32)
+    else:
+        target_priors = targets.new_tensor(
+            [target_ic_fraction, *([(1.0 - target_ic_fraction) / 4.0] * 4)], dtype=torch.float32)
+        sample_weights = target_priors[targets] / class_counts[targets]
+    first = primary.known_logits.softmax(dim=1)
+    second = alternate.known_logits.softmax(dim=1)
+    mean = 0.5 * (first + second)
+    candidate_zero = mean.argmax(dim=1)
+    rows = torch.arange(len(targets), device=targets.device)
+    probability = mean[rows, candidate_zero]
+    prototype = 0.5 * (primary.prototype_scores[rows, candidate_zero]
+                       + alternate.prototype_scores[rows, candidate_zero])
+    gate_probability = 0.5 * (
+        primary.gate_logits.softmax(dim=1)[:, 0]
+        + alternate.gate_logits.softmax(dim=1)[:, 0]
+    )
+    divergence = _js_divergence(primary.known_logits, alternate.known_logits)
+    agreed = first.argmax(dim=1).eq(second.argmax(dim=1))
+    candidate_type = candidate_zero + 1
+    votes = torch.stack(
+        (
+            primary.local_known_logits.argmax(dim=1) + 1,
+            primary.global_known_logits.argmax(dim=1) + 1,
+            alternate.local_known_logits.argmax(dim=1) + 1,
+            alternate.global_known_logits.argmax(dim=1) + 1,
+        )
+    ).eq(candidate_type).sum(dim=0)
+    true_known = targets > 0
+    if not torch.any(agreed & votes.ge(2) & true_known):
+        raise ValueError("calibration has no stable known candidates")
+    limits: list[list[float]] = [[], [], [], []]
+    ic_count = int(targets.eq(0).sum())
+    cg_count = int((targets.eq(1) | targets.eq(3)).sum())
+    for type_index in range(1, TYPE_COUNT):
+        candidate_rows = agreed & votes.ge(2) & candidate_zero.eq(type_index - 1)
+        truth_rows = targets.eq(type_index)
+        selected = torch.nonzero(candidate_rows, as_tuple=False).flatten()
+        best: tuple[float, ...] | None = None
+        if len(selected):
+            features = (probability, prototype, gate_probability, divergence)
+            values = [item[selected].detach().cpu().numpy() for item in features]
+            selected_targets = targets[selected].detach().cpu().numpy()
+            selected_weights = sample_weights[selected].detach().cpu().numpy()
+            threshold_sets = [_quantiles(item[selected]) for item in features[:2]]
+            threshold_sets.append(_quantiles(features[2][selected], fine_upper_bound=True))
+            js_levels = np.asarray([0.90, 0.95, 0.97, 0.99, 1.0])
+            js_quantiles = np.quantile(values[3], js_levels)
+            threshold_sets.append(sorted(set(float(item) for item in js_quantiles)))
+            required_precision = minimum_nbe_precision if type_index in (2, 4) else minimum_precision
+            for probability_limit in threshold_sets[0]:
+                for prototype_limit in threshold_sets[1]:
+                    for gate_limit in threshold_sets[2]:
+                        base = ((values[0] >= probability_limit)
+                                & (values[1] >= prototype_limit)
+                                & (values[2] <= gate_limit))
+                        for js_limit in threshold_sets[3]:
+                            accepted = base & (values[3] <= js_limit)
+                            accepted_weight = float(selected_weights[accepted].sum())
+                            if accepted_weight <= 0.0:
+                                continue
+                            correct = accepted & (selected_targets == type_index)
+                            precision_score = float(selected_weights[correct].sum()) / accepted_weight
+                            recall = int(correct.sum()) / int(truth_rows.sum())
+                            ic_rate = int((accepted & (selected_targets == 0)).sum()) / ic_count
+                            cg_rate = (
+                                int((accepted & np.isin(selected_targets, (1, 3))).sum())
+                                / cg_count if type_index in (2, 4) else 0.0
+                            )
+                            score = (recall, precision_score, -ic_rate, -cg_rate,
+                                     -probability_limit, -prototype_limit, gate_limit, js_limit)
+                            if (precision_score >= required_precision and
+                                    ic_rate <= maximum_ic_false_positive_rate and
+                                    cg_rate <= maximum_cg_to_nbe_rate and
+                                    (best is None or score > best)):
+                                best = score
+        if best is None:
+            selected_limits = (1.0, 1.0, 0.0, 0.0)
+        else:
+            selected_limits = (-best[4], -best[5], best[6], best[7])
+        for output, value in zip(limits, selected_limits):
+            output.append(value)
+    return HierarchicalDecisionConfig(
+        known_probability_thresholds=tuple(limits[0]),
+        prototype_similarity_thresholds=tuple(limits[1]),
+        max_js_divergences=tuple(max(value, 1e-8) for value in limits[3]),
+        min_branch_votes=2,
+        max_ic_gate_probabilities=tuple(limits[2]),
+    )
+
+
+def decision_config_dict(
+    config: HierarchicalDecisionConfig,
+) -> dict[str, object]:
+    """Return a JSON-safe calibrated decision configuration."""
+    payload = asdict(config)
+    payload["known_probability_thresholds"] = list(
+        config.known_probability_thresholds
+    )
+    payload["prototype_similarity_thresholds"] = list(
+        config.prototype_similarity_thresholds
+    )
+    payload["max_js_divergences"] = list(config.max_js_divergences)
+    return payload
+
+
+def _shift_view(values: torch.Tensor, amount: int) -> torch.Tensor:
+    shifted = torch.zeros_like(values)
+    shifted[..., amount:] = values[..., :-amount]
+    return shifted
+
+
+def _hierarchical_outputs(
+    model: nn.Module, tensors: Mapping[str, torch.Tensor]
+) -> tuple[HierarchicalTypeOutput, HierarchicalTypeOutput]:
+    primary = model.forward_hierarchical(
+        tensors["local"], tensors["global"], tensors["daylight"]
+    )
+    alternate = model.forward_hierarchical(
+        _shift_view(tensors["local"], 16),
+        _shift_view(tensors["global"], 4),
+        tensors["daylight"],
+    )
+    return primary, alternate
+
+
+def evaluate_hierarchical_type_role(
+    model: nn.Module,
+    loader: Iterable[Mapping[str, object]],
+    device: torch.device | str,
+    *,
+    decision_config: HierarchicalDecisionConfig | None = None,
+) -> tuple[dict[str, object], HierarchicalDecisionConfig]:
+    """Evaluate stable known decisions and return the used calibration."""
+    target_device = torch.device(device)
+    primary_batches: list[HierarchicalTypeOutput] = []
+    alternate_batches: list[HierarchicalTypeOutput] = []
+    targets: list[torch.Tensor] = []
+    source_paths: list[str] = []
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            tensors = _evaluation_tensors(batch, target_device)
+            primary, alternate = _hierarchical_outputs(model, tensors)
+            primary_batches.append(primary)
+            alternate_batches.append(alternate)
+            targets.append(tensors["type_label"].long())
+            paths = batch.get("source_path")
+            source_paths.extend(
+                [str(path) for path in paths]
+                if isinstance(paths, list)
+                else [f"piece-{len(source_paths) + row}" for row in range(len(targets[-1]))]
+            )
+    if not targets:
+        raise ValueError("evaluation loader produced no samples")
+
+    def combine(items: list[HierarchicalTypeOutput]) -> HierarchicalTypeOutput:
+        fields = tuple(HierarchicalTypeOutput.__dataclass_fields__)[:8]
+        return HierarchicalTypeOutput(
+            **{
+                name: torch.cat([getattr(item, name) for item in items])
+                for name in fields
+            }
+        )
+
+    primary = combine(primary_batches)
+    alternate = combine(alternate_batches)
+    labels = torch.cat(targets)
+    config = decision_config or calibrate_hierarchical_decision(
+        primary, alternate, labels
+    )
+    decision = decide_hierarchical_types(primary, alternate, config)
+    confusion = np.zeros((TYPE_COUNT, TYPE_COUNT), dtype=np.int64)
+    for truth, prediction in zip(
+        labels.cpu().tolist(), decision.final_type.cpu().tolist()
+    ):
+        confusion[int(truth), int(prediction)] += 1
+    metrics = _type_metrics(confusion)
+    false_to_ic = [
+        _ratio(confusion[index, 0], confusion[index].sum())
+        for index in range(1, TYPE_COUNT)
+    ]
+    known_recall = list(metrics["type_recall"])[1:]
+    known = labels > 0
+    consistency = primary.known_logits.argmax(dim=1).eq(
+        alternate.known_logits.argmax(dim=1)
+    )
+    source_predictions: dict[str, list[int]] = {}
+    for path, prediction in zip(
+        source_paths, decision.final_type.cpu().tolist()
+    ):
+        source_predictions.setdefault(path, []).append(int(prediction))
+    metrics.update(
+        {
+            "piece_count": int(len(labels)),
+            "source_count": len(source_predictions),
+            "known_macro_recall": float(np.mean(known_recall)),
+            "known_recall": known_recall,
+            "known_false_to_ic": false_to_ic,
+            "max_known_false_to_ic": max(false_to_ic),
+            "known_consistency": float(consistency[known].float().mean()),
+            "nbe_confusion_rate": _ratio(
+                confusion[2, 4] + confusion[4, 2],
+                confusion[2].sum() + confusion[4].sum(),
+            ),
+            "cg_confusion_rate": _ratio(
+                confusion[1, 3] + confusion[3, 1],
+                confusion[1].sum() + confusion[3].sum(),
+            ),
+            "decision_config": decision_config_dict(config),
+        }
+    )
+    return metrics, config
+
+
+def hierarchical_selection_score(metrics: Mapping[str, object]) -> float:
+    """Prioritize known recall while penalizing false IC rejection."""
+    return (
+        float(metrics["known_macro_recall"])
+        - 0.50 * float(metrics["max_known_false_to_ic"])
+        + 0.10 * float(metrics["type_macro_f1"])
+    )
 
 
 def _validate_output(output: ModelOutput, batch_size: int) -> None:
@@ -72,6 +522,12 @@ def evaluate_type_role(
     device: torch.device | str,
 ) -> dict[str, object]:
     """Evaluate the independent five-class role."""
+    if (
+        getattr(model, "architecture", None)
+        == HIERARCHICAL_TYPE_ARCHITECTURE
+    ):
+        metrics, _ = evaluate_hierarchical_type_role(model, loader, device)
+        return metrics
     target_device = torch.device(device)
     confusion = np.zeros((TYPE_COUNT, TYPE_COUNT), dtype=np.int64)
     model.eval()
@@ -112,6 +568,8 @@ def evaluate_distance_role(
         raise ValueError("type_index must be in 1..4")
     target_device = torch.device(device)
     errors: list[int] = []
+    expected_errors: list[float] = []
+    expected_biases: list[float] = []
     model.eval()
     with torch.no_grad():
         for batch in loader:
@@ -139,12 +597,24 @@ def evaluate_distance_role(
                     "distance logits must have shape [batch, 30]"
                 )
             predictions = logits.argmax(dim=1)
+            probabilities = logits.softmax(dim=1)
+            bin_indices = torch.arange(
+                DISTANCE_BIN_COUNT,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            expected_bins = probabilities @ bin_indices
             errors.extend(
                 torch.abs(predictions - targets).cpu().tolist()
             )
+            biases = expected_bins - targets.to(logits.dtype)
+            expected_biases.extend(biases.cpu().tolist())
+            expected_errors.extend(torch.abs(biases).cpu().tolist())
     if not errors:
         raise ValueError("evaluation loader produced no samples")
     values = np.asarray(errors, dtype=np.float64)
+    expected_values = np.asarray(expected_errors, dtype=np.float64)
+    expected_bias = np.asarray(expected_biases, dtype=np.float64)
     return {
         "piece_count": len(errors),
         "exact_accuracy": float(np.mean(values == 0)),
@@ -152,7 +622,113 @@ def evaluate_distance_role(
         "within_200": float(np.mean(values <= 2)),
         "mae_bins": float(values.mean()),
         "mae_km": float(values.mean() * 100.0),
+        "expected_within_100": float(np.mean(expected_values <= 1.0 + 1e-6)),
+        "expected_within_200": float(np.mean(expected_values <= 2.0 + 1e-6)),
+        "expected_mae_bins": float(expected_values.mean()),
+        "expected_mae_km": float(expected_values.mean() * 100.0),
+        "expected_rmse_km": float(
+            np.sqrt(np.mean(np.square(expected_values))) * 100.0
+        ),
+        "expected_bias_km": float(expected_bias.mean() * 100.0),
     }
+
+
+def evaluate_model_bundle(bundle: object, loader: Iterable[Mapping[str, object]],
+                          device: torch.device | str) -> dict[str, object]:
+    """Evaluate the five checkpoints with deployment-equivalent routing."""
+    from checkpoints import HIERARCHICAL_FIVE_CLASS_SCHEMA, forward_model_bundle
+
+    target_device = torch.device(device)
+    confusion = np.zeros((TYPE_COUNT, TYPE_COUNT), dtype=np.int64)
+    covered: list[bool] = []
+    argmax_errors, expected_errors = [], []
+    exact: list[bool] = []
+    type_checkpoint = bundle.type_checkpoint
+    models = (type_checkpoint.model,) + tuple(
+        item.model for item in bundle.distance_checkpoints)
+    for model in models:
+        model.eval()
+    with torch.inference_mode():
+        for batch in loader:
+            tensors = _evaluation_tensors(batch, target_device)
+            labels = tensors["type_label"].long()
+            distance_bins = tensors["distance_bin"].long()
+            if type_checkpoint.schema == HIERARCHICAL_FIVE_CLASS_SCHEMA:
+                config = type_checkpoint.metadata.get("decision_config")
+                if not isinstance(config, dict):
+                    raise ValueError("hierarchical bundle has no decision_config")
+                type_logits, predictions = infer_hierarchical_types(
+                    type_checkpoint.model, config, tensors["local"],
+                    tensors["global"], tensors["daylight"], None,
+                    torch.zeros(len(labels), dtype=torch.bool, device=target_device),
+                )
+                heads = [
+                    type_logits.new_zeros((len(labels), DISTANCE_BIN_COUNT))
+                    for _ in range(TYPE_COUNT - 1)]
+                for type_index, checkpoint in enumerate(
+                    bundle.distance_checkpoints, start=1):
+                    selected = predictions == type_index
+                    if torch.any(selected):
+                        heads[type_index - 1][selected] = checkpoint.model.forward_distance_type(
+                                tensors["local"][selected],
+                                tensors["global"][selected],
+                                tensors["daylight"][selected],
+                                expert_index=type_index - 1,
+                            )[0]
+            else:
+                type_logits, raw_heads = forward_model_bundle(
+                    bundle, tensors["local"], tensors["global"],
+                    tensors["daylight"])
+                predictions = type_logits.argmax(dim=1)
+                heads = list(raw_heads)
+            pairs = zip(labels.cpu().tolist(), predictions.cpu().tolist())
+            for row, (truth, prediction) in enumerate(pairs):
+                confusion[int(truth), int(prediction)] += 1
+                if truth == 0:
+                    continue
+                is_covered = prediction != 0
+                covered.append(is_covered)
+                if not is_covered:
+                    argmax_errors.append(float("inf"))
+                    expected_errors.append(float("inf"))
+                    exact.append(False)
+                    continue
+                probabilities = heads[prediction - 1][row].softmax(dim=0)
+                indices = torch.arange(DISTANCE_BIN_COUNT, device=target_device,
+                                       dtype=probabilities.dtype)
+                expected_bin = float((probabilities @ indices).item())
+                true_bin = int(distance_bins[row].item())
+                predicted_bin = int(probabilities.argmax())
+                argmax_errors.append(abs(predicted_bin - true_bin) * 100.0)
+                expected_errors.append(abs(expected_bin - true_bin) * 100.0)
+                exact.append(predicted_bin == true_bin)
+    if not int(confusion.sum()):
+        raise ValueError("evaluation loader produced no samples")
+    distance_values = {"argmax": np.asarray(argmax_errors, dtype=np.float64),
+                       "expected": np.asarray(expected_errors, dtype=np.float64)}
+    coverage = np.asarray(covered, dtype=bool)
+    metrics = _type_metrics(confusion)
+    metrics.update(
+        {
+            "piece_count": int(confusion.sum()),
+            "distance_count": len(argmax_errors),
+            "distance_prediction_count": int(coverage.sum()),
+            "distance_coverage": float(coverage.mean()),
+            "distance_exact_accuracy": float(np.mean(exact)),
+            "known_macro_recall": float(np.mean(metrics["type_recall"][1:])),
+            "max_known_false_to_ic": max(
+                _ratio(confusion[index, 0], confusion[index].sum())
+                for index in range(1, TYPE_COUNT)
+            ),
+        }
+    )
+    for name, values in distance_values.items():
+        prefix = f"distance_{name}"
+        metrics[f"{prefix}_mae_km"] = float(
+            values[coverage].mean()) if coverage.any() else 0.0
+        metrics[f"{prefix}_within_100"] = float(np.mean(values <= 100.0))
+        metrics[f"{prefix}_within_200"] = float(np.mean(values <= 200.0))
+    return metrics
 
 
 def evaluate_loader(

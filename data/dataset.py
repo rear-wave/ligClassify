@@ -60,12 +60,19 @@ class FiveClassDataset(Dataset):
     def __len__(self) -> int:
         return len(self.positions)
 
-    def _resolve(self, index: int | SampleRequest) -> tuple[int, int | None]:
+    def _resolve(
+        self, index: int | SampleRequest
+    ) -> tuple[int, tuple[int, int] | None]:
         if isinstance(index, SampleRequest):
             position = int(index.position)
             if position not in self._position_set:
                 raise IndexError("sample request is outside this dataset split")
-            return position, int(index.augmentation_seed)
+            seeds = tuple(int(seed) for seed in index.augmentation_seeds)
+            if len(seeds) != 2 or seeds[0] == seeds[1]:
+                raise ValueError(
+                    "sample request must contain two distinct seeds"
+                )
+            return position, (seeds[0], seeds[1])
         local_index = int(index)
         if local_index < 0:
             local_index += len(self.positions)
@@ -90,26 +97,45 @@ class FiveClassDataset(Dataset):
         )
 
         preprocessing_input = raw
+        alternate_input: np.ndarray | None = None
         if self.split == "train" and self.augmentation_config is not None:
             augmented_rows = [
-                row for row, (_, seed) in enumerate(resolved) if seed is not None
+                row for row, (_, seeds) in enumerate(resolved) if seeds is not None
             ]
             if augmented_rows:
                 preprocessing_input = raw.copy()
-                seeds = [int(resolved[row][1]) for row in augmented_rows]
+                alternate_input = raw.copy()
+                primary_seeds = [
+                    int(resolved[row][1][0]) for row in augmented_rows
+                ]
+                alternate_seeds = [
+                    int(resolved[row][1][1]) for row in augmented_rows
+                ]
                 preprocessing_input[augmented_rows] = augment_batch(
-                    raw[augmented_rows], seeds, self.augmentation_config
+                    raw[augmented_rows],
+                    primary_seeds,
+                    self.augmentation_config,
+                )
+                alternate_input[augmented_rows] = augment_batch(
+                    raw[augmented_rows],
+                    alternate_seeds,
+                    self.augmentation_config,
                 )
         local, global_view = preprocess_views(
             preprocessing_input, self.preprocess_config
         )
+        if alternate_input is None:
+            local_alt = global_alt = None
+        else:
+            local_alt, global_alt = preprocess_views(
+                alternate_input, self.preprocess_config
+            )
 
         items: list[dict[str, object]] = []
         for row, position in enumerate(positions):
             source = self.table.sources[int(self.table.source_index[position])]
             piece_index = int(self.table.piece_index[position])
-            items.append(
-                {
+            item: dict[str, object] = {
                     "local": torch.from_numpy(local[row].copy()).unsqueeze(0),
                     "global": torch.from_numpy(global_view[row].copy()).unsqueeze(0),
                     "daylight": torch.tensor(
@@ -125,7 +151,14 @@ class FiveClassDataset(Dataset):
                     "piece_index": piece_index,
                     "piece_key": self.table.piece_key(position),
                 }
-            )
+            if resolved[row][1] is not None and local_alt is not None:
+                item["local_alt"] = torch.from_numpy(
+                    local_alt[row].copy()
+                ).unsqueeze(0)
+                item["global_alt"] = torch.from_numpy(
+                    global_alt[row].copy()
+                ).unsqueeze(0)
+            items.append(item)
         return items
 
     def __getitem__(self, index: int | SampleRequest) -> dict[str, object]:
@@ -156,6 +189,21 @@ def collate_batch(batch: Sequence[dict[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {
         key: torch.stack([item[key] for item in batch]) for key in tensor_keys
     }
+    paired = [
+        "local_alt" in item and "global_alt" in item for item in batch
+    ]
+    malformed = [
+        ("local_alt" in item) != ("global_alt" in item) for item in batch
+    ]
+    if any(malformed) or (any(paired) and not all(paired)):
+        raise ValueError("paired views must be present for the complete batch")
+    if paired and all(paired):
+        result["local_alt"] = torch.stack(
+            [item["local_alt"] for item in batch]
+        )
+        result["global_alt"] = torch.stack(
+            [item["global_alt"] for item in batch]
+        )
     result["source_path"] = [str(item["source_path"]) for item in batch]
     result["piece_index"] = [int(item["piece_index"]) for item in batch]
     result["piece_key"] = [str(item["piece_key"]) for item in batch]

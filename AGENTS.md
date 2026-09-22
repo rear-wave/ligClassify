@@ -11,16 +11,25 @@ manifest,preprocess,dataset,sampling,split}.py`. CLI orchestration stays outside
 `test_sampling.py`, `test_models.py`, `test_checkpoints.py`, `test_training.py`,
 `test_classify.py`, and `test_audit.py`.
 
-The five type labels are `IC`, `NCG`, `NNBE`, `PCG`, and `PNBE`. In the strict
-cascade, one independent five-class checkpoint runs first, then one of four
-independently initialized class-specific distance checkpoints runs for `NCG`,
-`NNBE`, `PCG`, or `PNBE`. A validated `bundle.json` assigns checkpoints to
-roles; every role checkpoint retains the `five_class_v1` schema.
-Splits are deterministic at waveform-piece level, never file level. Training
-uses a fixed 60/10/10/10/10 type prior and random initialization. Full type
-training requires observed pieces from every class, including IC. Do not add
-warm starts, CV/OOF pipelines, open-set rejection, release gates, support maps,
-or four-class type-training code.
+The five type labels are `IC`, `NCG`, `NNBE`, `PCG`, and `PNBE`. The type stage
+is one hierarchical five-class checkpoint: a shared local/global encoder feeds
+an IC/known gate, a conditional `NCG`/`NNBE`/`PCG`/`PNBE` head, and known-class
+prototype similarities. IC remains an observed training class. A stable known
+match may override the IC gate; otherwise inference returns IC. Non-IC results
+route to one of four independently initialized class-specific distance
+checkpoints. A validated `bundle.json` assigns checkpoints to roles.
+
+Evaluation splits assign individual pieces deterministically while retaining
+type, daylight, and distance stratification. A source LIG file may contribute
+pieces to multiple partitions. Type batches use a
+20/20/20/20/20 prior and avoid repeated IC sampling within an epoch. Training
+starts from random initialization. Use supervised contrastive and augmentation
+consistency objectives for the four known classes, but do not force the
+heterogeneous IC class into one compact prototype. Candidate type models must
+report known-class recall, per-class false rejection to IC, augmentation
+consistency, and paired NBE/CG confusions on the piece-level test set. Do
+not add warm starts, CV/OOF pipelines, or a standalone four-class-only type
+classifier.
 
 ## Commands
 
@@ -45,5 +54,7 @@ waveforms, checkpoints, classifications, credentials, or machine-specific
 paths. Local training data belongs only under `../train_data/`; weights belong
 under ignored `weights/`. Never modify or delete `../train_data/` or external
 classification outputs. Preserve raw piece bytes during inference and waveform
-polarity during preprocessing. Inference supports only `five_class_v1` and the
-retained `legacy_five_class` checkpoint schemas.
+polarity during preprocessing. Inference supports the hierarchical five-class
+schema plus the retained `five_class_v1` and `legacy_five_class` schemas. New
+schema loading must be explicit; never silently reinterpret an older
+checkpoint.

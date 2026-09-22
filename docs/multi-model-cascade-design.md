@@ -27,7 +27,8 @@ weights/multi_model/
 └─ PNBE/model.pt
 ```
 
-Each model file retains the supported `five_class_v1` checkpoint schema.
+The type model uses the explicit `hierarchical_five_class_v2` schema; distance
+models retain the supported `five_class_v1` checkpoint schema.
 `bundle.json` assigns one checkpoint to each role and records labels,
 preprocessing settings, distance bins, and file hashes. Existing single-model
 inference remains supported.
@@ -38,13 +39,16 @@ inference remains supported.
 retraining only `type`, `NCG`, `NNBE`, `PCG`, or `PNBE`. Every role starts from
 random initialization.
 
-Splits remain deterministic and mutually exclusive at waveform-piece level.
-Type batches use the fixed 60/10/10/10/10 prior. Each distance model sees only
+Splits remain deterministic and mutually exclusive at waveform-piece level;
+source files may cross partitions. Every complete type batch uses the fixed
+20/20/20/20/20 prior. Each distance model sees only
 its assigned non-IC class and balances sampling across observed distance bins
-and daylight state. The type model stops on validation macro-F1. Distance
-models stop primarily on validation within-200-km accuracy, with MAE as a
-secondary tie-breaker. Training and test metrics are stored separately for
-each role.
+and daylight state. Type selection prioritizes known-class recall while
+penalizing false rejection to IC. Distance models stop primarily on validation
+within-200-km accuracy, with MAE as a secondary tie-breaker using
+probability-weighted expected distance. Training
+and test metrics are stored separately for each role, and `bundle_metrics.json`
+reports deployment-routed end-to-end results.
 
 ## Date-Range Inference
 

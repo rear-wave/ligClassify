@@ -7,7 +7,7 @@ from data.manifest import (
     build_piece_table,
     piece_key,
 )
-from tests.test_lig import make_piece, write_source
+from .test_lig import make_piece, write_source
 
 
 def test_manifest_expands_storage_files_to_stable_piece_rows(tmp_path):

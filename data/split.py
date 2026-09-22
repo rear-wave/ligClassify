@@ -19,6 +19,7 @@ VALIDATION = 1
 TEST = 2
 PARTITION_NAMES = ("train", "validation", "test")
 DEFAULT_RATIOS = (0.70, 0.15, 0.15)
+SPLIT_SCHEMA = "piece_stratified_split_v2"
 
 
 @dataclass(frozen=True)
@@ -39,18 +40,9 @@ def _rank(seed: int, key: str) -> bytes:
     return hashlib.sha256(payload).digest()
 
 
-def _partition_counts(size: int) -> tuple[int, int, int]:
-    if size < 3:
-        return size, 0, 0
-    validation = max(1, int(size * DEFAULT_RATIOS[1]))
-    test = max(1, int(size * DEFAULT_RATIOS[2]))
-    train = size - validation - test
-    if train < 1:
-        raise ValueError("stratum cannot populate training")
-    return train, validation, test
-
-
-def _stratum_key(table: PieceTable, position: int) -> tuple[int, bool, int]:
+def _stratum_key(
+    table: PieceTable, position: int
+) -> tuple[int, bool, int]:
     type_index = int(table.type_index[position])
     daylight = bool(table.daylight[position])
     distance_bin = -1 if type_index == 0 else int(table.distance_bin[position])
@@ -64,7 +56,7 @@ def _piece_keys(table: PieceTable) -> list[str]:
     return keys
 
 
-def _group_positions(
+def _piece_strata(
     table: PieceTable,
 ) -> dict[tuple[int, bool, int], list[int]]:
     strata: dict[tuple[int, bool, int], list[int]] = {}
@@ -73,57 +65,71 @@ def _group_positions(
     return strata
 
 
-def _expected_partition(
-    table: PieceTable, seed: int, keys: list[str]
-) -> np.ndarray:
-    partition = np.empty(len(table), dtype=np.uint8)
-    for positions in _group_positions(table).values():
-        ranked = sorted(
+def _partition_counts(piece_count: int) -> tuple[int, int, int]:
+    if piece_count < len(PARTITION_NAMES):
+        return piece_count, 0, 0
+    target = np.asarray(DEFAULT_RATIOS) * piece_count
+    counts = np.maximum(np.floor(target).astype(np.int64), 1)
+    while int(counts.sum()) < piece_count:
+        deficits = target - counts
+        counts[int(np.argmax(deficits))] += 1
+    while int(counts.sum()) > piece_count:
+        candidates = np.flatnonzero(counts > 1)
+        excess = counts[candidates] - target[candidates]
+        counts[int(candidates[int(np.argmax(excess))])] -= 1
+    return tuple(int(value) for value in counts)
+
+
+def _expected_partition(table: PieceTable, seed: int) -> np.ndarray:
+    keys = _piece_keys(table)
+    partition = np.full(len(table), TRAIN, dtype=np.uint8)
+    strata = _piece_strata(table)
+    for stratum in sorted(strata):
+        positions = strata[stratum]
+        ordered = sorted(
             positions,
-            key=lambda position: (_rank(seed, keys[position]), keys[position]),
+            key=lambda position: (
+                _rank(seed, keys[position]),
+                keys[position],
+            ),
         )
-        train_count, validation_count, _ = _partition_counts(len(ranked))
-        validation_end = train_count + validation_count
-        partition[ranked[:train_count]] = TRAIN
-        partition[ranked[train_count:validation_end]] = VALIDATION
-        partition[ranked[validation_end:]] = TEST
+        counts = _partition_counts(len(ordered))
+        offset = 0
+        for owner, count in enumerate(counts):
+            selected = ordered[offset : offset + count]
+            partition[selected] = owner
+            offset += count
     return partition
 
 
 def assign_piece_splits(table: PieceTable, seed: int) -> SplitAssignment:
-    """Assign pieces within each label stratum by stable seeded SHA-256 rank."""
+    """Assign pieces by stable ranking within label/daylight/distance strata."""
     normalized_seed = int(seed)
-    keys = _piece_keys(table)
     return SplitAssignment(
-        partition=_expected_partition(table, normalized_seed, keys),
+        partition=_expected_partition(table, normalized_seed),
         seed=normalized_seed,
     )
 
 
 def validate_piece_split(table: PieceTable, assignment: SplitAssignment) -> None:
-    """Validate complete ownership and its exact deterministic reconstruction."""
+    """Validate exhaustive piece ownership and deterministic reconstruction."""
     partition = np.asarray(assignment.partition)
     if partition.ndim != 1 or len(partition) != len(table):
         raise ValueError("missing ownership for one or more pieces")
     if not np.all(np.isin(partition, (TRAIN, VALIDATION, TEST))):
         raise ValueError("invalid partition ownership")
-
-    keys = _piece_keys(table)
-    for positions in _group_positions(table).values():
-        owned = partition[np.asarray(positions, dtype=np.int64)]
-        if len(positions) >= 3 and set(owned.tolist()) != {
-            TRAIN,
-            VALIDATION,
-            TEST,
-        }:
-            raise ValueError(
-                "evaluation stratum must populate every partition"
-            )
-        if len(positions) < 3 and np.any(owned != TRAIN):
-            raise ValueError("small stratum must remain train-only")
-
-    expected = _expected_partition(table, int(assignment.seed), keys)
-    if not np.array_equal(partition, expected):
+    _piece_keys(table)
+    for positions in _piece_strata(table).values():
+        owners = set(partition[np.asarray(positions)].tolist())
+        expected = (
+            {TRAIN}
+            if len(positions) < len(PARTITION_NAMES)
+            else {TRAIN, VALIDATION, TEST}
+        )
+        if owners != expected:
+            raise ValueError("piece stratum does not populate expected partitions")
+    expected_partition = _expected_partition(table, int(assignment.seed))
+    if not np.array_equal(partition, expected_partition):
         raise ValueError("piece ownership does not match seed")
 
 
@@ -146,40 +152,48 @@ def _stratum_name(key: tuple[int, bool, int]) -> str:
 def split_artifact(
     table: PieceTable, assignment: SplitAssignment
 ) -> dict[str, object]:
-    """Return compact JSON-safe hashes and per-stratum ownership counts."""
+    """Return compact hashes and piece-level ownership summaries."""
     validate_piece_split(table, assignment)
     keys = _piece_keys(table)
     partition = np.asarray(assignment.partition)
-
     partition_hashes: dict[str, str] = {}
-    counts: dict[str, int] = {}
+    piece_counts: dict[str, int] = {}
+    represented_source_counts: dict[str, int] = {}
     for partition_index, name in enumerate(PARTITION_NAMES):
         selected = np.flatnonzero(partition == partition_index)
         partition_hashes[name] = _hash_lines(
             [f"{keys[position]}\t{name}" for position in selected]
         )
-        counts[name] = int(len(selected))
+        piece_counts[name] = int(len(selected))
+        represented_source_counts[name] = int(
+            len(np.unique(table.source_index[selected]))
+        )
 
     strata: dict[str, dict[str, int]] = {}
-    grouped = _group_positions(table)
-    for key in sorted(grouped):
-        positions = np.asarray(grouped[key], dtype=np.int64)
+    for key, raw_positions in sorted(_piece_strata(table).items()):
+        positions = np.asarray(raw_positions, dtype=np.int64)
         owned = partition[positions]
-        strata[_stratum_name(key)] = {
+        counts = {
             name: int(np.count_nonzero(owned == partition_index))
             for partition_index, name in enumerate(PARTITION_NAMES)
         }
-        strata[_stratum_name(key)]["insufficient_for_evaluation"] = (
-            len(positions) if len(positions) < 3 else 0
+        counts["piece_support"] = int(len(positions))
+        counts["insufficient_pieces"] = (
+            int(len(positions))
+            if len(positions) < len(PARTITION_NAMES)
+            else 0
         )
+        strata[_stratum_name(key)] = counts
 
     return {
-        "schema": "piece_stratified_split_v1",
+        "schema": SPLIT_SCHEMA,
         "seed": int(assignment.seed),
         "ratios": list(DEFAULT_RATIOS),
         "manifest_hash": _hash_lines(keys),
         "partition_hashes": partition_hashes,
-        "counts": counts,
+        "counts": piece_counts,
+        "piece_counts": piece_counts,
+        "represented_source_counts": represented_source_counts,
         "strata": strata,
     }
 

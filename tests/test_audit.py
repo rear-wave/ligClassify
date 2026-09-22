@@ -1,32 +1,39 @@
 import json
 
 import pytest
+import torch
 
 import audit_data
-from audit_data import audit_dataset, audit_duplicate_waveforms
+from audit_data import (
+    audit_dataset,
+    audit_duplicate_waveforms,
+    summarize_type_constraints,
+)
 from data.manifest import TYPE_NAMES, build_piece_table
 from data.split import PARTITION_NAMES, assign_piece_splits
-from tests.test_lig import make_piece, write_source
+from evaluation import HierarchicalDecision
+from .test_lig import make_piece, write_source
 
 
 def _write_audit_corpus(root):
     for type_index, type_name in enumerate(TYPE_NAMES):
-        distance = "" if type_name == "IC" else f"/{type_index * 100}-{(type_index + 1) * 100}km"
-        source = root / type_name / "mixed"
-        if distance:
-            source = root / type_name / "mixed" / distance.removeprefix("/")
-        source.mkdir(parents=True)
-        write_source(
-            source / "source.lig",
-            [
-                make_piece(type_index * 10 + 1, hour=0),
-                make_piece(type_index * 10 + 2, hour=16),
-                make_piece(type_index * 10 + 3, hour=0),
-                make_piece(type_index * 10 + 4, hour=16),
-                make_piece(type_index * 10 + 5, hour=0),
-                make_piece(type_index * 10 + 6, hour=16),
-            ],
+        distance = (
+            ""
+            if type_name == "IC"
+            else f"/{type_index * 100}-{(type_index + 1) * 100}km"
         )
+        directory = root / type_name / "mixed"
+        if distance:
+            directory = directory / distance.removeprefix("/")
+        directory.mkdir(parents=True)
+        for file_index in range(3):
+            write_source(
+                directory / f"source_{file_index}.lig",
+                [
+                    make_piece(type_index * 10 + file_index * 2 + 1, hour=0),
+                    make_piece(type_index * 10 + file_index * 2 + 2, hour=16),
+                ],
+            )
 
 
 def test_audit_reports_piece_split_and_training_prior(tmp_path, monkeypatch):
@@ -39,8 +46,8 @@ def test_audit_reports_piece_split_and_training_prior(tmp_path, monkeypatch):
     monkeypatch.setattr(audit_data, "audit_duplicate_waveforms", fail_if_called)
     report = audit_dataset(root, seed=42)
 
-    assert report["split_schema"] == "piece_stratified_split_v1"
-    assert report["files"] == 5
+    assert report["split_schema"] == "piece_stratified_split_v2"
+    assert report["files"] == 15
     assert report["pieces"] == 30
     assert report["type_counts"] == {name: 6 for name in TYPE_NAMES}
     assert report["daylight_counts"] == {"day": 15, "night": 15}
@@ -54,24 +61,29 @@ def test_audit_reports_piece_split_and_training_prior(tmp_path, monkeypatch):
     assert report["split_counts"]["train"] > 0
     assert set(report["split_hashes"]) == set(PARTITION_NAMES)
     assert len(report["manifest_hash"]) == 64
-    assert report["small_strata"] == []
+    assert report["evaluation_limited_strata"] == []
     assert report["training_prior"] == {
-        "IC": 0.60,
-        "NCG": 0.10,
-        "NNBE": 0.10,
-        "PCG": 0.10,
-        "PNBE": 0.10,
+        "IC": 0.20,
+        "NCG": 0.20,
+        "NNBE": 0.20,
+        "PCG": 0.20,
+        "PNBE": 0.20,
     }
+    assert set(report["split_represented_source_counts"]) == set(
+        PARTITION_NAMES
+    )
     assert "duplicate_waveforms" not in report
 
 
 def test_duplicate_audit_rejects_identical_bytes_across_splits(tmp_path):
-    root = tmp_path / "train_data"
-    source = root / "NCG" / "day" / "0-100km" / "duplicate.lig"
-    source.parent.mkdir(parents=True)
+    directory = (
+        tmp_path / "train_data" / "NCG" / "day" / "0-100km"
+    )
+    directory.mkdir(parents=True)
     raw = make_piece(17, hour=8)
-    write_source(source, [raw, raw, raw, raw])
-    table, _ = build_piece_table(root)
+    for index in range(3):
+        write_source(directory / f"duplicate_{index}.lig", [raw])
+    table, _ = build_piece_table(tmp_path / "train_data")
     assignment = assign_piece_splits(table, seed=42)
 
     with pytest.raises(ValueError, match="duplicate waveform crosses partitions"):
@@ -103,8 +115,193 @@ def test_audit_cli_has_only_the_compact_contract():
         "output",
         "seed",
         "check_duplicates",
+        "type_checkpoint",
+        "decision_config",
+        "partition",
     }
     assert args.task_data == "../train_data"
     assert args.output is None
     assert args.seed == 42
     assert args.check_duplicates is False
+    assert args.type_checkpoint is None
+    assert args.decision_config is None
+    assert args.partition == "validation"
+
+
+def _constraint_decision():
+    targets = torch.tensor([1, 1, 1, 1, 1, 1, 1, 2, 0])
+    passes = {
+        name: torch.ones(len(targets), dtype=torch.bool)
+        for name in audit_data.CONSTRAINT_ORDER
+    }
+    for row, name in enumerate(audit_data.CONSTRAINT_ORDER, start=1):
+        passes[name][row] = False
+    passes["known_probability"][7] = False
+    passes["prototype_similarity"][7] = False
+    stable = torch.stack(list(passes.values())).all(dim=0)
+    candidate = torch.tensor([1, 1, 1, 1, 1, 1, 1, 2, 1])
+    decision = HierarchicalDecision(
+        final_type=torch.where(stable, candidate, torch.zeros_like(candidate)),
+        candidate_known_type=candidate,
+        ic_gate_probability=torch.zeros(len(targets)),
+        known_type_probability=torch.ones(len(targets)),
+        prototype_similarity=torch.ones(len(targets)),
+        local_prediction=candidate,
+        global_prediction=candidate,
+        consistency_score=torch.ones(len(targets)),
+        decision_reason=tuple("test" for _ in targets),
+        constraint_passes=passes,
+    )
+    return decision, targets
+
+
+def test_type_constraint_audit_separates_unique_and_overlapping_failures():
+    decision, targets = _constraint_decision()
+
+    report = summarize_type_constraints(decision, targets)
+    ncg = report["by_true_type"]["NCG"]
+    probability = ncg["scopes"]["all"]["constraints"]["known_probability"]
+    prototype = ncg["scopes"]["all"]["constraints"][
+        "prototype_similarity"
+    ]
+
+    assert report["piece_count"] == 9
+    assert report["accepted_as_known_count"] == 2
+    assert ncg["candidate_correct_count"] == 7
+    assert ncg["rejected_with_correct_candidate_count"] == 6
+    assert probability["failed_count"] == 1
+    assert probability["unique_failed_count"] == 1
+    assert prototype["failed_count"] == 1
+    assert prototype["unique_failed_count"] == 1
+    nnbe = report["by_true_type"]["NNBE"]
+    assert nnbe["failure_multiplicity"]["2"] == 1
+    assert nnbe["scopes"]["all"]["constraints"]["known_probability"][
+        "unique_failed_count"
+    ] == 0
+    assert report["candidate_confusion"][0][1] == 1
+    assert report["final_confusion"][0][1] == 1
+    json.dumps(report, allow_nan=False)
+
+
+def test_type_constraint_audit_rejects_divergent_masks():
+    decision, targets = _constraint_decision()
+    decision.constraint_passes["view_agreement"][0] = False
+
+    with pytest.raises(ValueError, match="diverge"):
+        summarize_type_constraints(decision, targets)
+
+
+def test_type_constraint_audit_forbids_tuning_on_test_partition():
+    with pytest.raises(ValueError, match="validation-only"):
+        audit_data.diagnose_type_checkpoint(
+            "unused",
+            "unused.pt",
+            partition="test",
+            decision_config_path="candidate.json",
+        )
+
+
+def test_research_streaming_imports_and_synthetic_guards(tmp_path, monkeypatch):
+    import importlib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    scripts = root / "research" / "streaming"
+    monkeypatch.syspath_prepend(str(scripts))
+    monkeypatch.chdir(tmp_path)
+    modules = {
+        path.stem: importlib.import_module(path.stem)
+        for path in sorted(scripts.glob("*.py"))
+    }
+    assert len(modules) == 8
+    assert modules["experiment"].OUT == root / "weights" / "streaming_research_v1"
+    assert modules["check_streaming"].OUT == modules["experiment"].OUT
+    modules["robust_calibration"].self_test()
+    modules["guarded_rescue"].self_test()
+    assert not list(tmp_path.iterdir())
+
+
+def _synthetic_distance_summary(label, errors, type_name):
+    from research.wwlln.compute_bin_errors import BinStats, bin_rows
+
+    stats = BinStats()
+    for error in errors:
+        stats.add(error, int(error / 100), label[:4], type_name)
+    rows = bin_rows([stats])
+    return {
+        "datasets": [{"label": label, "matched": len(errors)}],
+        "matched_total": len(errors),
+        "bins": rows,
+        "type_bins": {type_name: rows},
+    }
+
+
+def _run_distance_summary_script(name, arguments, monkeypatch):
+    from pathlib import Path
+    import runpy
+
+    script = Path(__file__).resolve().parents[1] / "research" / "wwlln" / name
+    monkeypatch.setattr("sys.argv", [str(script), *map(str, arguments)])
+    runpy.run_path(str(script), run_name="__main__")
+
+
+def test_research_distance_merge_and_replace_totals(tmp_path, monkeypatch):
+    base, extra, updated = [tmp_path / name for name in ("a.json", "b.json", "c.json")]
+    for path, payload in (
+        (base, _synthetic_distance_summary("2016_a", [-100, 100], "NCG")),
+        (extra, _synthetic_distance_summary("2017_b", [50], "NNBE")),
+        (updated, _synthetic_distance_summary("2017_b", [200], "NNBE")),
+    ):
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    merged = tmp_path / "new_output" / "merged.json"
+    _run_distance_summary_script("merge_bin_errors.py", [
+        "--base", base, "--extra", extra, "--output", merged,
+    ], monkeypatch)
+    payload = json.loads(merged.read_text(encoding="utf-8"))
+    row = payload["bins"][0]
+    assert payload["matched_total"] == row["matched_count"] == 3
+    assert row["mae_km"] == pytest.approx(250 / 3)
+    assert row["rmse_km"] ** 2 == pytest.approx(7500)
+    assert row["bias_km"] == pytest.approx(50 / 3)
+    assert row["exact_bin_accuracy"] == pytest.approx(1 / 3)
+    assert row["year_2016_count"] == row["NCG_count"] == 2
+    assert row["year_2017_count"] == row["NNBE_count"] == 1
+    assert row["median_abs_error_km"] is None
+    assert "type_bins" not in payload
+    assert merged.with_suffix(".csv").is_file()
+
+    replaced = tmp_path / "another_output" / "replaced.json"
+    _run_distance_summary_script("replace_bin_dataset.py", [
+        "--combined", merged, "--remove", extra, "--add", updated,
+        "--label", "2017_b", "--output", replaced,
+    ], monkeypatch)
+    payload = json.loads(replaced.read_text(encoding="utf-8"))
+    row = payload["bins"][0]
+    assert payload["matched_total"] == row["matched_count"] == 3
+    assert row["mae_km"] == pytest.approx(400 / 3)
+    assert row["rmse_km"] ** 2 == pytest.approx(20000)
+    assert row["bias_km"] == pytest.approx(200 / 3)
+    assert row["exact_bin_accuracy"] == 0
+    assert row["within_1_bin"] == pytest.approx(2 / 3)
+    assert "type_bins" not in payload
+    assert replaced.with_suffix(".csv").is_file()
+
+
+@pytest.mark.parametrize("operation", ["merge", "replace"])
+def test_research_distance_helpers_reject_unequal_bins(tmp_path, monkeypatch, operation):
+    base, short = tmp_path / "base.json", tmp_path / "short.json"
+    payload = _synthetic_distance_summary("2016_a", [100], "NCG")
+    base.write_text(json.dumps(payload), encoding="utf-8")
+    payload["bins"] = []
+    short.write_text(json.dumps(payload), encoding="utf-8")
+    output = tmp_path / "invalid.json"
+    if operation == "merge":
+        script = "merge_bin_errors.py"
+        arguments = ["--base", base, "--extra", short, "--output", output]
+    else:
+        script = "replace_bin_dataset.py"
+        arguments = ["--combined", base, "--remove", short, "--add", base,
+                     "--label", "2016_a", "--output", output]
+    with pytest.raises(ValueError, match="zip"):
+        _run_distance_summary_script(script, arguments, monkeypatch)
+    assert not output.exists()

@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from dataclasses import asdict
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -16,29 +17,93 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from checkpoints import save_model_bundle, save_model_checkpoint
+from checkpoints import (
+    load_model_bundle,
+    save_model_bundle,
+    save_model_checkpoint,
+)
 from data.dataset import FiveClassDataset, collate_batch
 from data.manifest import PieceTable, build_piece_table
 from data.preprocess import AugmentationConfig, PreprocessConfig
-from data.sampling import DistanceExpertSampler, FiveClassSampler
+from data.sampling import DistanceExpertSampler, FiveClassSampler, TYPE_PRIOR
 from data.split import (
     assign_piece_splits,
     split_artifact,
     validate_piece_split,
     write_split_json,
 )
-from evaluation import evaluate_distance_role, evaluate_type_role
+from evaluation import (
+    evaluate_distance_role,
+    evaluate_model_bundle,
+    evaluate_type_role,
+    hierarchical_selection_score,
+)
 from models import DISTANCE_NAMES, create_five_class_model
 from training import (
+    DistanceLossWeights,
     EarlyStoppingState,
+    HierarchicalLossWeights,
     load_last_state,
     save_last_state,
     train_role_epoch,
 )
 
 
-FIXED_IC_FRACTION = 0.60
 TRAINING_ROLES = ("type", *DISTANCE_NAMES)
+TYPE_LOSS_PROFILES = (
+    "baseline", "known_consistency_v1", "consistency_moderate_v1",
+    "anchor_moe_v1", "anchor_consistency_v2", "anchor_factorized_v3",
+)
+TYPE_ARCHITECTURES = ("hierarchical", "anchor_moe", "multiscale")
+
+
+def _type_loss_weights(profile: str) -> HierarchicalLossWeights:
+    """Return a named, checkpoint-recorded type-loss experiment."""
+    if profile == "baseline":
+        return HierarchicalLossWeights()
+    if profile == "known_consistency_v1":
+        return HierarchicalLossWeights(
+            known=1.25,
+            five_class=0.20,
+            branch=0.15,
+            contrastive=0.15,
+            consistency=0.25,
+            gate_consistency=0.15,
+            prototype_consistency=0.15,
+        )
+    if profile == "consistency_moderate_v1":
+        return HierarchicalLossWeights(
+            consistency=0.20,
+            gate_consistency=0.15,
+            prototype_consistency=0.15,
+        )
+    if profile == "anchor_moe_v1":
+        return HierarchicalLossWeights(anchor_orth=0.05, reliability=0.01)
+    if profile == "anchor_consistency_v2":
+        return HierarchicalLossWeights(
+            known=1.25, five_class=0.20, branch=0.15, contrastive=0.15,
+            consistency=0.25, gate_consistency=0.15,
+            prototype_consistency=0.15, anchor_orth=0.05, reliability=0.01,
+        )
+    if profile == "anchor_factorized_v3":
+        return HierarchicalLossWeights(
+            known=1.25, five_class=0.20, branch=0.15, contrastive=0.15,
+            consistency=0.25, gate_consistency=0.15,
+            prototype_consistency=0.15, anchor_orth=0.05, reliability=0.01,
+            family=0.10, polarity=0.10,
+        )
+    raise ValueError(f"unknown type loss profile: {profile}")
+
+
+def _augmentation_config(profile: str) -> AugmentationConfig:
+    """Select polarity-preserving source-domain augmentation bounds."""
+    if profile == "standard":
+        return AugmentationConfig()
+    if profile == "sensor_drift_v1":
+        return AugmentationConfig(max_shift=256, gain_min=0.75, gain_max=1.25,
+                                  drift_fraction=0.05, noise_fraction=0.05,
+                                  bandwidth_probability=0.35)
+    raise ValueError(f"unknown augmentation profile: {profile}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task_data", default=r"..\train_data")
     parser.add_argument("--output", default=r".\weights\multi_model")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=60)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--type_samples_per_epoch", type=int, default=120000)
     parser.add_argument(
@@ -55,13 +120,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--ic_fraction", type=float, default=FIXED_IC_FRACTION)
     parser.add_argument(
         "--stage", choices=("all", *TRAINING_ROLES), default="all"
     )
     parser.add_argument("--base_channels", type=int, default=64)
     parser.add_argument("--lr", type=float, default=0.0003)
     parser.add_argument("--weight_decay", type=float, default=0.0005)
+    parser.add_argument(
+        "--type_loss_profile", choices=TYPE_LOSS_PROFILES, default="baseline"
+    )
+    parser.add_argument(
+        "--type_architecture", choices=TYPE_ARCHITECTURES, default="hierarchical"
+    )
+    parser.add_argument("--anchor_known_fusion_weight", type=float, default=0.0)
+    parser.add_argument("--augmentation_profile", choices=("standard", "sensor_drift_v1"), default="standard")
+    parser.add_argument("--inference_view_shift", action="store_true",
+                        help="Train alternate type views with the same zero-padded 16/4 shifts used at inference.")
+    parser.add_argument("--defer_test", action="store_true", help="Save validation-selected weights without inspecting test labels.")
     parser.add_argument("--resume")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
@@ -84,10 +159,24 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num_workers must be a non-negative integer")
     if type(args.seed) is not int or args.seed < 0:
         raise ValueError("--seed must be a non-negative integer")
-    if float(args.ic_fraction) != FIXED_IC_FRACTION:
-        raise ValueError(
-            "--ic_fraction must be 0.60 for the fixed 60/10/10/10/10 prior"
-        )
+    if args.stage in ("all", "type") and args.batch_size % 5:
+        raise ValueError("--batch_size must be divisible by five for type training")
+    if args.stage not in ("all", "type") and args.type_loss_profile != "baseline":
+        raise ValueError("--type_loss_profile applies only to type training")
+    if args.stage not in ("all", "type") and args.type_architecture != "hierarchical":
+        raise ValueError("--type_architecture applies only to type training")
+    if args.inference_view_shift and args.stage not in ("all", "type"):
+        raise ValueError("--inference_view_shift applies only to type training")
+    anchor_profile = args.type_loss_profile in {
+        "anchor_moe_v1", "anchor_consistency_v2", "anchor_factorized_v3"
+    }
+    if (args.type_architecture == "anchor_moe") != anchor_profile:
+        raise ValueError("anchor_moe architecture requires an anchor loss profile")
+    fusion_weight = float(args.anchor_known_fusion_weight)
+    if not math.isfinite(fusion_weight) or fusion_weight < 0.0:
+        raise ValueError("--anchor_known_fusion_weight must be finite and non-negative")
+    if args.type_architecture != "anchor_moe" and fusion_weight:
+        raise ValueError("--anchor_known_fusion_weight requires anchor_moe")
     for field in ("lr", "weight_decay"):
         value = float(getattr(args, field))
         if not np.isfinite(value) or value < 0.0:
@@ -103,7 +192,11 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def _training_config(
-    args: argparse.Namespace, role: str | None = None
+    args: argparse.Namespace,
+    role: str | None = None,
+    *,
+    effective_samples_per_epoch: int | None = None,
+    preprocess_config: PreprocessConfig | None = None,
 ) -> dict[str, Any]:
     selected_role = role or str(args.stage)
     role_seed = (
@@ -116,21 +209,67 @@ def _training_config(
         if selected_role == "type"
         else args.distance_samples_per_epoch
     )
-    return {
-        "schema": "five_class_role_training_v1",
+    effective_samples = (
+        int(samples)
+        if effective_samples_per_epoch is None
+        else int(effective_samples_per_epoch)
+    )
+    config = {
+        "schema": "five_class_role_training_v3",
         "role": selected_role,
         "epochs": int(args.epochs),
         "batch_size": int(args.batch_size),
         "patience": int(args.patience),
-        "samples_per_epoch": int(samples),
+        "requested_samples_per_epoch": int(samples),
+        "samples_per_epoch": effective_samples,
         "num_workers": int(args.num_workers),
         "seed": int(role_seed),
-        "ic_fraction": float(args.ic_fraction),
+        "sampling_prior": list(TYPE_PRIOR) if selected_role == "type" else None,
         "base_channels": int(args.base_channels),
         "lr": float(args.lr),
         "weight_decay": float(args.weight_decay),
         "amp": not bool(args.no_amp),
+        "hierarchical_loss": (
+            asdict(_type_loss_weights(args.type_loss_profile))
+            if selected_role == "type"
+            else None
+        ),
+        "type_loss_profile": (
+            str(args.type_loss_profile) if selected_role == "type" else None
+        ),
+        "distance_loss": (
+            asdict(DistanceLossWeights())
+            if selected_role != "type"
+            else None
+        ),
+        "distance_training_views": (
+            "paired_augmentation_probability_average_v1"
+            if selected_role != "type" else None
+        ),
+        "selection_policy": (
+            "hierarchical_known_recall_v1"
+            if selected_role == "type"
+            else "argmax_exact_within_mae_v1"
+        ),
     }
+    if args.augmentation_profile != "standard":
+        config["augmentation_profile"] = args.augmentation_profile
+        config["augmentation_config"] = asdict(_augmentation_config(args.augmentation_profile))
+    if selected_role == "type" and args.inference_view_shift:
+        config["type_training_views"] = "raw_augmentation_plus_inference_shift_v1"
+    if selected_role == "type" and args.type_architecture != "hierarchical":
+        config["type_architecture"] = str(args.type_architecture)
+        if args.anchor_known_fusion_weight:
+            config["anchor_known_fusion_weight"] = float(args.anchor_known_fusion_weight)
+    if selected_role == "type" and not args.type_loss_profile.startswith("anchor_"):
+        config["hierarchical_loss"].pop("anchor_orth")
+        config["hierarchical_loss"].pop("reliability")
+    if selected_role == "type" and args.type_loss_profile != "anchor_factorized_v3":
+        config["hierarchical_loss"].pop("family")
+        config["hierarchical_loss"].pop("polarity")
+    if preprocess_config is not None:
+        config["preprocess_config"] = asdict(preprocess_config)
+    return config
 
 
 def _canonical_hash(value: Mapping[str, Any]) -> str:
@@ -225,8 +364,13 @@ def _evaluate_role(
 
 def _selection_score(role: str, metrics: Mapping[str, object]) -> float:
     if role == "type":
-        return float(metrics["type_macro_f1"])
-    return float(metrics["within_200"]) - 1e-3 * float(metrics["mae_bins"])
+        return hierarchical_selection_score(metrics)
+    return (
+        float(metrics["exact_accuracy"])
+        + 0.10 * float(metrics["within_100"])
+        + 0.02 * float(metrics["within_200"])
+        - 0.005 * float(metrics["mae_bins"])
+    )
 
 
 def _epoch_summary(
@@ -239,11 +383,13 @@ def _epoch_summary(
     if role == "type":
         validation_text = (
             f"val_acc={float(validation['type_accuracy']):.4f} "
-            f"val_f1={float(validation['type_macro_f1']):.4f}"
+            f"known_recall={float(validation['known_macro_recall']):.4f} "
+            f"false_ic={float(validation['max_known_false_to_ic']):.4f}"
         )
     else:
         validation_text = (
-            f"val_w200={float(validation['within_200']):.4f} "
+            f"val_exact={float(validation['exact_accuracy']):.4f} "
+            f"val_w100={float(validation['within_100']):.4f} "
             f"val_mae={float(validation['mae_km']):.0f}km"
         )
     return (
@@ -268,8 +414,27 @@ def _fit_role(
     role_seed = args.seed + TRAINING_ROLES.index(role)
     _seed_everything(role_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_five_class_model(args.base_channels).to(device)
-    model.set_training_role(role)
+    if role == "type":
+        if args.type_architecture == "anchor_moe":
+            from models import create_anchor_hierarchical_type_model
+
+            model = create_anchor_hierarchical_type_model(
+                base_channels=args.base_channels,
+                known_fusion_weight=args.anchor_known_fusion_weight,
+            ).to(device)
+        elif args.type_architecture == "multiscale":
+            from models import MultiScaleHierarchicalTypeNet
+
+            model = MultiScaleHierarchicalTypeNet(base_channels=args.base_channels).to(device)
+        else:
+            from models import create_hierarchical_type_model
+
+            model = create_hierarchical_type_model(
+                base_channels=args.base_channels
+            ).to(device)
+    else:
+        model = create_five_class_model(args.base_channels).to(device)
+        model.set_training_role(role)
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         parameters, lr=args.lr, weight_decay=args.weight_decay
@@ -280,8 +445,6 @@ def _fit_role(
     amp_enabled = device.type == "cuda" and not args.no_amp
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
     stopping = EarlyStoppingState()
-    config = _training_config(args, role)
-    config_hash = _canonical_hash(config)
     split_hash = _canonical_hash(artifact)
 
     with ExitStack() as stack:
@@ -299,19 +462,44 @@ def _fit_role(
                 split=split,
                 preprocess_config=preprocess_config,
                 augmentation_config=(
-                    AugmentationConfig() if split == "train" else None
+                    _augmentation_config(args.augmentation_profile) if split == "train" else None
                 ),
             )
             stack.callback(dataset.close)
             datasets[split] = dataset
         if role == "type":
+            type_counts = np.bincount(
+                table.type_index[
+                    _role_positions(
+                        table, split_positions["train"], role
+                    )
+                ],
+                minlength=5,
+            )
+            maximum_type_samples = 5 * int(type_counts.min())
+            effective_type_samples = min(
+                int(args.type_samples_per_epoch),
+                maximum_type_samples,
+            )
+            effective_type_samples -= effective_type_samples % 5
+            if effective_type_samples <= 0:
+                raise ValueError(
+                    "type training requires at least one piece per class"
+                )
+            if effective_type_samples < int(args.type_samples_per_epoch):
+                print(
+                    "type samples per epoch capped at "
+                    f"{effective_type_samples} "
+                    f"({effective_type_samples // 5} per class; "
+                    "no replacement)"
+                )
             sampler = FiveClassSampler(
                 table,
                 split_positions["train"],
-                num_samples=args.type_samples_per_epoch,
+                num_samples=effective_type_samples,
                 seed=role_seed,
-                balance_distance=False,
             )
+            effective_samples = effective_type_samples
         else:
             sampler = DistanceExpertSampler(
                 table,
@@ -320,6 +508,14 @@ def _fit_role(
                 num_samples=args.distance_samples_per_epoch,
                 seed=role_seed,
             )
+            effective_samples = int(args.distance_samples_per_epoch)
+        config = _training_config(
+            args,
+            role,
+            effective_samples_per_epoch=effective_samples,
+            preprocess_config=preprocess_config,
+        )
+        config_hash = _canonical_hash(config)
         loaders["train"] = _loader(
             datasets["train"],
             batch_size=args.batch_size,
@@ -360,6 +556,11 @@ def _fit_role(
                 role=role,
                 scaler=scaler,
                 amp=amp_enabled,
+                type_loss_weights=(
+                    _type_loss_weights(args.type_loss_profile)
+                    if role == "type" else None
+                ),
+                inference_view_shift=bool(role == "type" and args.inference_view_shift),
             )
             validation = _evaluate_role(
                 model, loaders["validation"], device, role
@@ -390,18 +591,80 @@ def _fit_role(
         if stopping.best_state is None:
             raise ValueError(f"{role} training selected no model")
         model.load_state_dict(stopping.best_state, strict=True)
+        decision_config = None
+        if role == "type":
+            from evaluation import (
+                decision_config_dict,
+                evaluate_hierarchical_type_role,
+            )
+
+            validation, calibrated_config = (
+                evaluate_hierarchical_type_role(
+                    model, loaders["validation"], device
+                )
+            )
+            test = None
+            if not args.defer_test:
+                test, _ = evaluate_hierarchical_type_role(
+                    model, loaders["test"], device, decision_config=calibrated_config,
+                )
+            decision_config = decision_config_dict(calibrated_config)
+        else:
+            validation = _evaluate_role(
+                model, loaders["validation"], device, role
+            )
+            test = None if args.defer_test else _evaluate_role(model, loaders["test"], device, role)
         save_model_checkpoint(
             role_output / "model.pt",
             model,
-            model_config={"base_channels": args.base_channels},
+            model_config={
+                "base_channels": args.base_channels,
+                **(
+                    {
+                        "embedding_dim": int(
+                            next(
+                                value
+                                for name, value in model.state_dict().items()
+                                if name.endswith("prototypes")
+                                and value.ndim == 3
+                            ).shape[-1]
+                        ),
+                        "prototypes_per_class": int(
+                            next(
+                                value
+                                for name, value in model.state_dict().items()
+                                if name.endswith("prototypes")
+                                and value.ndim == 3
+                            ).shape[-2]
+                        ),
+                        "prototype_logit_weight": float(
+                            model.prototype_logit_weight
+                        ),
+                        **(
+                            {
+                                "type_backbone": str(model.model_variant),
+                                "patch_length": int(model.patch_length),
+                                "patch_stride": int(model.patch_stride),
+                                "expert_count": int(model.expert_count),
+                                "expert_topk": int(model.expert_topk),
+                                "frequency_bands": int(model.frequency_bands),
+                                "use_reliability": bool(model.use_reliability),
+                                "known_fusion_weight": float(model.known_fusion_weight),
+                            }
+                            if args.type_architecture == "anchor_moe" else
+                            {"type_backbone": str(model.model_variant)}
+                            if args.type_architecture == "multiscale" else {}
+                        ),
+                    }
+                    if role == "type"
+                    else {}
+                ),
+            },
             preprocess_config=asdict(preprocess_config),
             split_hash=split_hash,
             training_config=config,
+            decision_config=decision_config,
         )
-        validation = _evaluate_role(
-            model, loaders["validation"], device, role
-        )
-        test = _evaluate_role(model, loaders["test"], device, role)
 
     metrics = {
         "schema": "five_class_role_metrics_v1",
@@ -445,7 +708,9 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         split: assignment.positions(split)
         for split in ("train", "validation", "test")
     }
-    preprocess_config = PreprocessConfig()
+    preprocess_config = PreprocessConfig(
+        local_center_mode="energy_envelope_v2"
+    )
     results: dict[str, Any] = {}
     for role in roles:
         results[role] = _fit_role(
@@ -466,7 +731,30 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             model_paths,
             preprocess_config=asdict(preprocess_config),
         )
-    return {"data": diagnostics, "roles": results}
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        bundle = load_model_bundle(output, device)
+        test_dataset = FiveClassDataset(
+            table,
+            split_positions["test"],
+            split="test",
+            preprocess_config=preprocess_config,
+        )
+        try:
+            bundle_metrics = evaluate_model_bundle(
+                bundle,
+                _loader(
+                    test_dataset,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                ),
+                device,
+            ) if not args.defer_test else None
+        finally:
+            test_dataset.close()
+        _atomic_write_json(output / "bundle_metrics.json", bundle_metrics)
+    else:
+        bundle_metrics = None
+    return {"data": diagnostics, "roles": results, "bundle": bundle_metrics}
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
