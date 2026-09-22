@@ -12,6 +12,10 @@ python audit_data.py --task_data ..\train_data
 python -m compileall -q .
 python -m pytest -q
 
+# Run a single test file or test
+python -m pytest -q tests/test_lig.py
+python -m pytest -q tests/test_lig.py -k <test_name>
+
 # Train all five roles (type + NCG/NNBE/PCG/PNBE distance)
 python -u train.py --task_data ..\train_data --output .\weights\multi_model --epochs 50 --patience 10 --batch_size 60 --num_workers 0
 
@@ -43,6 +47,16 @@ python fix_unknown_timestamps.py --root <year_dir>
 Dependencies: `numpy`, `scipy`, `torch`, `scikit-learn`, `tqdm`, `pytest`. No setup.py — install them directly.
 
 ## Architecture
+
+### Runtime module map
+
+- `models.py` — all network definitions (`HierarchicalTypeNet`, `FiveClassNet`, `LegacyMultiTaskResNet` and their encoders/matchers).
+- `training.py` — loss functions (`hierarchical_type_loss`, `distance_expert_loss`), the per-role epoch loop, early stopping, and resumable `last.pt` save/load state.
+- `evaluation.py` — `decide_hierarchical_types()`, `calibrate_hierarchical_decision()`, per-role evaluators, and selection scores for model comparison.
+- `checkpoints.py` — schema detection (`load_model_checkpoint()`), checkpoint saving, `bundle.json` load/save with SHA-256 validation.
+- `train.py` — CLI orchestration of the five-role training run; turns evaluation metrics into early-stopping decisions.
+
+Design rationale documents live in `docs/` (`model-design.md`, `multi-model-cascade-design.md`); `AGENTS.md` mirrors the constraints below for other tooling.
 
 ### Type classification: hierarchical IC-gate + known-class model
 
@@ -100,3 +114,4 @@ Three inference schemas detected by `load_model_checkpoint()`:
 - Inference must preserve raw piece bytes and waveform polarity.
 - Tests use synthetic temporary fixtures only (see `tests/conftest.py`).
 - No warm starts, CV/OOF pipelines, or standalone four-class-only type classifier.
+- Style: four-space indentation, `snake_case` functions/variables, `PascalCase` classes, type hints, short docstrings on public helpers.

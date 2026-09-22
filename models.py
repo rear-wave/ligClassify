@@ -22,6 +22,8 @@ CASCADE_ARCHITECTURE = "five_class_v1"
 MODEL_VARIANT = "type_then_prototype_distance_v1"
 HIERARCHICAL_TYPE_ARCHITECTURE = "hierarchical_five_class_v2"
 HIERARCHICAL_TYPE_VARIANT = "ic_gate_known_prototypes_v2"
+ANCHOR_TYPE_VARIANT = "anchor_patch_moe_v1"
+MULTISCALE_TYPE_VARIANT = "multiscale_temporal_v1"
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -36,9 +38,7 @@ class ResidualBlock(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
         super().__init__()
-        self.conv1 = nn.Conv1d(
-            in_channels, out_channels, 9, stride=stride, padding=4
-        )
+        self.conv1 = nn.Conv1d(in_channels, out_channels, 9, stride=stride, padding=4)
         self.gn1 = _group_norm(out_channels)
         self.conv2 = nn.Conv1d(out_channels, out_channels, 9, padding=4)
         self.gn2 = _group_norm(out_channels)
@@ -77,20 +77,13 @@ class LegacyMultiTaskResNet(nn.Module):
         self.gap = nn.AdaptiveAvgPool1d(1)
         feature_dim = base * 2
         self.type_head = nn.Linear(feature_dim, num_types)
-        self.d_heads = nn.ModuleList(
-            nn.Linear(feature_dim, num_dists)
-            for _ in range(DISTANCE_EXPERT_COUNT)
-        )
+        self.d_heads = nn.ModuleList([
+            nn.Linear(feature_dim, num_dists) for _ in range(DISTANCE_EXPERT_COUNT)])
 
     @staticmethod
-    def _layer(
-        in_channels: int, out_channels: int, count: int, stride: int
-    ) -> nn.Sequential:
+    def _layer(in_channels: int, out_channels: int, count: int, stride: int) -> nn.Sequential:
         blocks = [ResidualBlock(in_channels, out_channels, stride)]
-        blocks.extend(
-            ResidualBlock(out_channels, out_channels)
-            for _ in range(1, count)
-        )
+        blocks.extend(ResidualBlock(out_channels, out_channels) for _ in range(1, count))
         return nn.Sequential(*blocks)
 
     def _encode(self, values: torch.Tensor) -> torch.Tensor:
@@ -132,34 +125,13 @@ class WaveformBranch(nn.Module):
         encoded_dim = self.output_dim // 2
         width = max(8, min(32, encoded_dim // 4))
         self.network = nn.Sequential(
-            nn.Conv1d(
-                1,
-                width,
-                kernel_size=17,
-                stride=8,
-                padding=8,
-                bias=False,
-            ),
+            nn.Conv1d(1, width, kernel_size=17, stride=8, padding=8, bias=False),
             nn.GroupNorm(1, width),
             nn.GELU(),
-            nn.Conv1d(
-                width,
-                width * 2,
-                kernel_size=9,
-                stride=4,
-                padding=4,
-                bias=False,
-            ),
+            nn.Conv1d(width, width * 2, kernel_size=9, stride=4, padding=4, bias=False),
             nn.GroupNorm(1, width * 2),
             nn.GELU(),
-            nn.Conv1d(
-                width * 2,
-                encoded_dim,
-                kernel_size=7,
-                stride=2,
-                padding=3,
-                bias=False,
-            ),
+            nn.Conv1d(width * 2, encoded_dim, kernel_size=7, stride=2, padding=3, bias=False),
             nn.GroupNorm(1, encoded_dim),
             nn.GELU(),
         )
@@ -277,13 +249,8 @@ class KnownPrototypeMatcher(nn.Module):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.prototypes_per_class = prototypes_per_class
-        self.prototypes = nn.Parameter(
-            torch.empty(
-                DISTANCE_EXPERT_COUNT,
-                prototypes_per_class,
-                embedding_dim,
-            )
-        )
+        self.prototypes = nn.Parameter(torch.empty(
+            DISTANCE_EXPERT_COUNT, prototypes_per_class, embedding_dim))
         self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
         self.reset_parameters()
 
@@ -316,13 +283,8 @@ class PrototypeDistanceMatcher(nn.Module):
 
     def __init__(self, feature_dim: int):
         super().__init__()
-        self.prototypes = nn.Parameter(
-            torch.empty(
-                DISTANCE_EXPERT_COUNT,
-                DISTANCE_BIN_COUNT,
-                feature_dim,
-            )
-        )
+        self.prototypes = nn.Parameter(torch.empty(
+            DISTANCE_EXPERT_COUNT, DISTANCE_BIN_COUNT, feature_dim))
         self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
         self.reset_parameters()
 
@@ -376,6 +338,8 @@ class HierarchicalTypeOutput:
     local_known_logits: torch.Tensor
     global_known_logits: torch.Tensor
     embedding: torch.Tensor
+    anchor_orth_loss: torch.Tensor | None = None
+    reliability_loss: torch.Tensor | None = None
 
 
 class FiveClassNet(nn.Module):
@@ -404,10 +368,7 @@ class FiveClassNet(nn.Module):
     ) -> None:
         if local.ndim != 3 or tuple(local.shape[1:]) != (1, LOCAL_LENGTH):
             raise ValueError("local must have shape [batch, 1, 8000]")
-        if global_view.ndim != 3 or tuple(global_view.shape[1:]) != (
-            1,
-            GLOBAL_LENGTH,
-        ):
+        if global_view.ndim != 3 or tuple(global_view.shape[1:]) != (1, GLOBAL_LENGTH):
             raise ValueError("global_view must have shape [batch, 1, 2000]")
         if daylight.ndim != 2 or daylight.shape[1] != 1:
             raise ValueError("daylight must have shape [batch, 1]")
@@ -567,12 +528,8 @@ class HierarchicalTypeNet(nn.Module):
         feature_dim = self.encoder.output_dim
         self.gate_head = nn.Linear(feature_dim, 2)
         self.known_head = nn.Linear(feature_dim, DISTANCE_EXPERT_COUNT)
-        self.local_known_head = nn.Linear(
-            feature_dim, DISTANCE_EXPERT_COUNT
-        )
-        self.global_known_head = nn.Linear(
-            feature_dim, DISTANCE_EXPERT_COUNT
-        )
+        self.local_known_head = nn.Linear(feature_dim, DISTANCE_EXPERT_COUNT)
+        self.global_known_head = nn.Linear(feature_dim, DISTANCE_EXPERT_COUNT)
         self.embedding_head = nn.Sequential(
             nn.LayerNorm(feature_dim),
             nn.Linear(feature_dim, embedding_dim),
@@ -652,6 +609,274 @@ class HierarchicalTypeNet(nn.Module):
         return self.forward_hierarchical(local, global_view, daylight)
 
 
+class MultiScaleTemporalBlock(nn.Module):
+    """Mix nearby and distant pulse structure without quadratic attention."""
+
+    def __init__(self, width: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(1, width)
+        self.scales = nn.ModuleList([
+            nn.Conv1d(width, width, 7, padding=3 * dilation,
+                      dilation=dilation, groups=width, bias=False)
+            for dilation in (1, 4, 16)
+        ])
+        self.mix = nn.Sequential(
+            nn.Conv1d(3 * width, width, 1), nn.GELU(), nn.Dropout(0.1)
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        normalized = self.norm(values)
+        return values + self.mix(torch.cat([
+            scale(normalized) for scale in self.scales
+        ], dim=1))
+
+
+class MultiScaleWaveformBranch(nn.Module):
+    """Preserve pulse ordering with dilated convolution and attention pooling."""
+
+    def __init__(self, base: int):
+        super().__init__()
+        self.output_dim = base * 8
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, base, 17, stride=8, padding=8, bias=False),
+            nn.GroupNorm(1, base), nn.GELU(),
+            nn.Conv1d(base, base, 9, stride=2, padding=4, bias=False),
+            nn.GroupNorm(1, base), nn.GELU(),
+            MultiScaleTemporalBlock(base), MultiScaleTemporalBlock(base),
+        )
+        self.attention = nn.Conv1d(base, 1, 1)
+        self.projection = nn.Sequential(
+            nn.LayerNorm(2 * base), nn.Linear(2 * base, self.output_dim), nn.GELU()
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        features = self.stem(values if values.ndim == 3 else values.unsqueeze(1))
+        weights = self.attention(features).softmax(dim=-1)
+        pooled = torch.cat(((features * weights).sum(dim=-1),
+                            features.amax(dim=-1)), dim=1)
+        return self.projection(pooled)
+
+
+class MultiScaleHierarchicalTypeNet(HierarchicalTypeNet):
+    """Five-class gate and prototypes with a multi-scale temporal backbone."""
+
+    model_variant = MULTISCALE_TYPE_VARIANT
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.encoder.local_branch = MultiScaleWaveformBranch(self.base_channels)
+        self.encoder.global_branch = MultiScaleWaveformBranch(self.base_channels)
+
+
+class AnchorPatchEncoder(nn.Module):
+    """Encode temporal patches through diverse reliability-gated experts."""
+
+    def __init__(
+        self,
+        base_channels: int,
+        patch_length: int,
+        patch_stride: int,
+        expert_count: int,
+        expert_topk: int,
+        frequency_bands: int,
+        use_reliability: bool,
+    ):
+        super().__init__()
+        self.output_dim = base_channels * 2
+        self.patch_length, self.patch_stride = patch_length, patch_stride
+        self.expert_topk, self.frequency_bands = expert_topk, frequency_bands
+        self.use_reliability = use_reliability
+        dimension = self.output_dim
+        self.patch_embedding = nn.Conv1d(
+            1, dimension, patch_length, stride=patch_stride, bias=False
+        )
+        self.temporal_refine = nn.Sequential(
+            nn.LayerNorm(dimension), nn.Linear(dimension, dimension), nn.GELU()
+        )
+        self.spectral_projection = nn.Sequential(
+            nn.LayerNorm(frequency_bands), nn.Linear(frequency_bands, dimension)
+        )
+        self.context_projection = nn.Sequential(nn.Linear(1, dimension), nn.GELU())
+        self.global_branch = WaveformBranch(max(8, base_channels // 2))
+        self.global_projection = nn.Linear(self.global_branch.output_dim, dimension)
+        self.evidence_norm = nn.LayerNorm(dimension)
+        self.router = nn.Sequential(nn.LayerNorm(dimension), nn.Linear(dimension, expert_count))
+        self.experts = nn.ModuleList(
+            nn.Sequential(
+                nn.LayerNorm(dimension), nn.Linear(dimension, 2 * dimension),
+                nn.GELU(), nn.Linear(2 * dimension, dimension),
+            )
+            for _ in range(expert_count)
+        )
+        self.confidence_heads = nn.ModuleList(
+            nn.Sequential(nn.LayerNorm(dimension), nn.Linear(dimension, 1))
+            for _ in range(expert_count)
+        )
+        self.daylight_projection = nn.Linear(1, dimension, bias=False)
+        self.fusion = nn.Sequential(nn.LayerNorm(dimension), nn.Linear(dimension, dimension), nn.GELU())
+        self.temporal_gate, self.spectral_gate, self.context_gate = (nn.Parameter(torch.tensor(value)) for value in (-2.0, 0.0, -2.0))
+
+    def _frequency_view(self, local: torch.Tensor) -> torch.Tensor:
+        windows = local.unfold(2, self.patch_length, self.patch_stride).squeeze(1)
+        power = torch.fft.rfft(windows.float(), dim=-1).abs().square()
+        bands = torch.stack(
+            [torch.log1p(chunk.mean(dim=-1)) for chunk in torch.tensor_split(
+                power, self.frequency_bands, dim=-1
+            )],
+            dim=-1,
+        )
+        return self.spectral_projection(bands)
+
+    @staticmethod
+    def _anchor_orthogonality(
+        evidence: torch.Tensor, probabilities: torch.Tensor
+    ) -> torch.Tensor:
+        mass = probabilities.sum(dim=1).clamp_min(1e-6)
+        anchors = torch.einsum("bpk,bpd->bkd", probabilities, evidence) / mass.unsqueeze(-1)
+        normalized = F.normalize(anchors, dim=-1, eps=1e-6)
+        similarity = normalized @ normalized.transpose(1, 2)
+        count = similarity.shape[1]
+        mask = ~torch.eye(count, dtype=torch.bool, device=similarity.device)
+        return similarity[:, mask].square().mean()
+
+    def forward(self, local: torch.Tensor, global_view: torch.Tensor,
+                daylight: torch.Tensor) -> dict[str, torch.Tensor]:
+        tokens = self.patch_embedding(local).transpose(1, 2)
+        centroid = tokens.mean(dim=1, keepdim=True)
+        context = (tokens * centroid).sum(dim=-1, keepdim=True) / math.sqrt(
+            tokens.shape[-1]
+        )
+        global_features = self.global_projection(self.global_branch(global_view))
+        evidence = self.evidence_norm(
+            tokens
+            + self.temporal_gate.sigmoid() * self.temporal_refine(tokens)
+            + self.spectral_gate.sigmoid() * self._frequency_view(local)
+            + self.context_gate.sigmoid() * self.context_projection(context)
+            + global_features[:, None, :]
+        )
+        dense_routing = self.router(evidence).softmax(dim=-1)
+        values, indices = dense_routing.topk(self.expert_topk, dim=-1)
+        routing = torch.zeros_like(dense_routing).scatter(
+            -1, indices, values / values.sum(dim=-1, keepdim=True)
+        )
+        expert_features = torch.stack(
+            [evidence + expert(evidence) for expert in self.experts], dim=2
+        )
+        confidence = torch.stack(
+            [head(expert_features[:, :, index]).squeeze(-1) for index, head in enumerate(self.confidence_heads)],
+            dim=2,
+        )
+        effective = confidence.sigmoid() if self.use_reliability else torch.ones_like(confidence)
+        patch_strength = (routing * effective).sum(dim=2).clamp_min(1e-6)
+        patch_importance = patch_strength / patch_strength.sum(dim=1, keepdim=True)
+        mixed = (routing * effective).unsqueeze(-1) * expert_features
+        local_features = evidence.mean(dim=1)
+        fused = self.fusion(
+            (patch_importance.unsqueeze(-1) * mixed.sum(dim=2)).sum(dim=1)
+            + self.daylight_projection(daylight)
+        )
+        return {
+            "local": local_features, "global": global_features, "fused": fused,
+            "experts": expert_features, "routing": routing, "confidence": confidence.sigmoid(), "confidence_logits": confidence,
+            "importance": patch_importance,
+            "anchor_loss": self._anchor_orthogonality(evidence, dense_routing),
+        }
+
+
+class AnchorHierarchicalTypeNet(nn.Module):
+    """Hierarchical five-class classifier with AnchorMoE patch evidence."""
+
+    architecture = HIERARCHICAL_TYPE_ARCHITECTURE
+    model_variant = ANCHOR_TYPE_VARIANT
+
+    def __init__(
+        self,
+        base_channels: int = 64,
+        embedding_dim: int = 128,
+        prototypes_per_class: int = 4,
+        prototype_logit_weight: float = 0.25,
+        known_fusion_weight: float = 0.0,
+        patch_length: int = 256,
+        patch_stride: int = 128,
+        expert_count: int = 4,
+        expert_topk: int = 2,
+        frequency_bands: int = 4,
+        use_reliability: bool = True,
+    ):
+        super().__init__()
+        integer_values = (base_channels, embedding_dim, prototypes_per_class, patch_length, patch_stride, expert_count, expert_topk, frequency_bands)
+        if any(type(value) is not int or value <= 0 for value in integer_values):
+            raise ValueError("AnchorMoE dimensions must be positive integers")
+        if expert_topk > expert_count or patch_length > LOCAL_LENGTH:
+            raise ValueError("AnchorMoE patch or top-k configuration is invalid")
+        self.base_channels, self.embedding_dim = base_channels, embedding_dim
+        self.prototypes_per_class = prototypes_per_class
+        self.prototype_logit_weight, self.known_fusion_weight = float(prototype_logit_weight), float(known_fusion_weight)
+        self.patch_length, self.patch_stride = patch_length, patch_stride
+        self.expert_count, self.expert_topk = expert_count, expert_topk
+        self.frequency_bands = frequency_bands
+        self.use_reliability = bool(use_reliability)
+        self.encoder = AnchorPatchEncoder(
+            base_channels, patch_length, patch_stride, expert_count, expert_topk,
+            frequency_bands, self.use_reliability,
+        )
+        dimension = self.encoder.output_dim
+        self.gate_head = nn.Linear(dimension, 2)
+        self.known_head = nn.Linear(dimension, DISTANCE_EXPERT_COUNT)
+        self.local_known_head = nn.Linear(dimension, DISTANCE_EXPERT_COUNT)
+        self.global_known_head = nn.Linear(dimension, DISTANCE_EXPERT_COUNT)
+        self.embedding_head = nn.Sequential(nn.LayerNorm(dimension), nn.Linear(dimension, embedding_dim))
+        self.prototype_matcher = KnownPrototypeMatcher(embedding_dim, prototypes_per_class)
+
+    def forward_hierarchical(self, local: torch.Tensor, global_view: torch.Tensor,
+                             daylight: torch.Tensor) -> HierarchicalTypeOutput:
+        FiveClassNet._validate_inputs(local, global_view, daylight)
+        encoded = self.encoder(local, global_view, daylight)
+        expert_logits = self.known_head(encoded["experts"])
+        effective = encoded["confidence"] if self.use_reliability else torch.ones_like(
+            encoded["confidence"]
+        )
+        patch_logits = (
+            encoded["routing"] * effective
+        ).unsqueeze(-1) * expert_logits
+        additive_known = (
+            encoded["importance"].unsqueeze(-1) * patch_logits.sum(dim=2)
+        ).sum(dim=1)
+        embedding = F.normalize(self.embedding_head(encoded["fused"]), dim=1, eps=1e-6)
+        prototype_logits, prototype_evidence, prototype_scores = self.prototype_matcher(embedding)
+        branch_known = self.known_head(encoded["fused"]) + 0.5 * (self.local_known_head(encoded["local"]) + self.global_known_head(encoded["global"]))
+        known_logits = additive_known + self.known_fusion_weight * branch_known + self.prototype_logit_weight * prototype_evidence
+        gate_logits = self.gate_head(encoded["fused"])
+        gate_log = F.log_softmax(gate_logits, dim=1)
+        type_logits = torch.cat((gate_log[:, :1], gate_log[:, 1:] + F.log_softmax(
+            known_logits, dim=1
+        )), dim=1)
+        routing_only = (encoded["routing"].unsqueeze(-1) * expert_logits).sum(dim=2)
+        predicted = additive_known.detach().argmax(dim=1)
+        support = routing_only.gather(
+            2, predicted[:, None, None].expand(-1, routing_only.shape[1], 1)
+        ).squeeze(-1).abs()
+        target = (support / support.max(dim=1, keepdim=True).values.clamp_min(1e-6)).detach()
+        reliability = F.binary_cross_entropy_with_logits(
+            (encoded["routing"] * encoded["confidence_logits"]).sum(dim=2), target
+        )
+        return HierarchicalTypeOutput(
+            type_logits, gate_logits, known_logits, prototype_logits,
+            prototype_scores, self.local_known_head(encoded["local"]),
+            self.global_known_head(encoded["global"]), embedding,
+            encoded["anchor_loss"], reliability,
+        )
+
+    def forward_type(self, local: torch.Tensor, global_view: torch.Tensor,
+                     daylight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output = self.forward_hierarchical(local, global_view, daylight)
+        return output.type_logits, output.embedding
+
+    def forward(self, local: torch.Tensor, global_view: torch.Tensor,
+                daylight: torch.Tensor) -> HierarchicalTypeOutput:
+        return self.forward_hierarchical(local, global_view, daylight)
+
+
 def create_five_class_model(base_channels: int = 64) -> FiveClassNet:
     """Create a randomly initialized two-stage cascade."""
 
@@ -671,3 +896,9 @@ def create_hierarchical_type_model(
         prototypes_per_class=prototypes_per_class,
         prototype_logit_weight=prototype_logit_weight,
     )
+
+
+def create_anchor_hierarchical_type_model(**config) -> AnchorHierarchicalTypeNet:
+    """Create a randomly initialized AnchorMoE hierarchical type model."""
+
+    return AnchorHierarchicalTypeNet(**config)

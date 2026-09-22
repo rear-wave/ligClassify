@@ -1,0 +1,25 @@
+{
+  "schema": "hierarchical_decision_config_v1",
+  "decision_config": {
+    "known_probability_thresholds": [
+      0.30158019065856934,
+      0.3178836405277252,
+      0.32617321610450745,
+      0.9382439255714417
+    ],
+    "prototype_similarity_thresholds": [
+      0.1331154704093933,
+      0.760737419128418,
+      0.20387986302375793,
+      0.3067513406276703
+    ],
+    "max_ic_gate_probabilities": [
+      0.055320486426353455,
+      0.10227945446968079,
+      0.03504081442952156,
+      0.9910335540771484
+    ],
+    "max_js_divergence": 0.03,
+    "min_branch_votes": 1
+  }
+}

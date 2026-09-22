@@ -1,0 +1,25 @@
+LigClassify v3 CPU 便携版
+=========================
+
+1. 请复制整个 LigClassify_v3_CPU 文件夹，不要只复制 exe。
+2. 支持 Windows 10/11 64 位；无需安装 Python、CUDA 或 NVIDIA 驱动。
+3. 程序默认且推荐使用 CPU，无需填写 --device 参数。
+4. 默认内置 weights/multi_model、v3 分类策略，只输出 NNBE 和 PNBE。
+
+图形界面：
+双击 LigClassify_v3_CPU_GUI.exe，在窗口中选择目录和日期后开始分类。
+
+GZ_ 日期目录示例：
+LigClassify_v3_CPU.exe --input_root "F:/" --start_date 20240719 --end_date 20240728 --output_dir "E:\classified\2024.0719-2024.0728" --prefix "GZ_"
+
+ZH_ 日期目录示例：
+LigClassify_v3_CPU.exe --input_root "F:/" --start_date 20230720 --end_date 20230731 --output_dir "H:\classified\2023.0720-2023.0731" --prefix "ZH_"
+
+断点续跑：在原命令末尾添加 --resume
+跳过持续不可读文件：添加 --skip_io_errors（会造成对应文件缺失）
+查看全部参数：LigClassify_v3_CPU.exe --help
+测试内置权重及运行环境：LigClassify_v3_CPU.exe --self_test
+
+注意：
+- 整个 LigClassify_v3_CPU 文件夹必须保持完整，不能只复制 exe。
+- CPU 分类速度取决于处理器性能，通常明显慢于 GPU。

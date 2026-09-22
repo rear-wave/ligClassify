@@ -1,6 +1,16 @@
 train_data/
 weights/
+output/
+output/*_train_*.log
+output/*diagnostics*.json
+output/*calibration*report*.json
+output/*tuning_report*.json
+output/type_manual_review*/
+output/wwlln_distance_eval*/
 __pycache__/
 *.pyc
+.packaging_cpu_env/
+/build/
+/dist/
 .DS_Store
 nul

@@ -8,6 +8,7 @@ from models import (
     DISTANCE_BIN_COUNT,
     DISTANCE_EXPERT_COUNT,
     HIERARCHICAL_TYPE_ARCHITECTURE,
+    create_anchor_hierarchical_type_model,
     create_five_class_model,
     create_hierarchical_type_model,
 )
@@ -232,6 +233,74 @@ def test_hierarchical_type_model_returns_complete_probability_contract():
     type_logits, features = model.forward_type(*_inputs(batch_size=2))
     assert type_logits.shape == (2, 5)
     assert features.shape == (2, 32)
+
+
+def test_multiscale_model_preserves_probabilities_and_both_view_gradients():
+    from models import MultiScaleHierarchicalTypeNet
+
+    model = MultiScaleHierarchicalTypeNet(base_channels=8, embedding_dim=16)
+    local, global_view, daylight = _inputs(batch_size=2)
+    local.requires_grad_(True)
+    global_view.requires_grad_(True)
+    output = model(local, global_view, daylight)
+    assert output.type_logits.shape == (2, 5)
+    assert torch.allclose(output.type_logits.exp().sum(1), torch.ones(2), atol=1e-6)
+    (output.type_logits.square().mean() + output.prototype_logits.square().mean()).backward()
+    assert local.grad.abs().sum() > 0
+    assert global_view.grad.abs().sum() > 0
+    assert all(parameter.grad is not None for parameter in model.encoder.parameters())
+    model.eval()
+    together = model(local, global_view, daylight).type_logits
+    separate = torch.cat([model(local[i:i+1], global_view[i:i+1], daylight[i:i+1]).type_logits
+                          for i in range(2)])
+    assert torch.allclose(together, separate, atol=1e-5)
+
+
+def test_anchor_moe_type_model_returns_losses_and_sparse_routing():
+    model = create_anchor_hierarchical_type_model(
+        base_channels=8, embedding_dim=32, patch_length=256,
+        patch_stride=128, expert_count=4, expert_topk=2,
+    )
+    captured = {}
+    hook = model.encoder.register_forward_hook(
+        lambda _module, _inputs, output: captured.update(output)
+    )
+    try:
+        output = model(*_inputs(batch_size=2))
+    finally:
+        hook.remove()
+
+    assert output.type_logits.shape == (2, 5)
+    assert output.anchor_orth_loss.ndim == 0
+    assert output.reliability_loss.ndim == 0
+    assert torch.isfinite(output.anchor_orth_loss + output.reliability_loss)
+    assert torch.all((captured["routing"] > 0).sum(dim=2) == 2)
+    assert torch.allclose(captured["importance"].sum(dim=1), torch.ones(2))
+
+
+def test_anchor_moe_gradients_reach_waveform_and_experts():
+    model = create_anchor_hierarchical_type_model(base_channels=8, embedding_dim=16)
+    local, global_view, daylight = _inputs(batch_size=2)
+    local.requires_grad_(True)
+    output = model(local, global_view, daylight)
+    (output.type_logits.square().mean() + output.anchor_orth_loss
+     + output.reliability_loss).backward()
+
+    assert local.grad is not None and local.grad.abs().sum() > 0
+    assert model.encoder.patch_embedding.weight.grad.abs().sum() > 0
+    assert all(next(expert.parameters()).grad is not None
+               for expert in model.encoder.experts)
+
+
+def test_anchor_known_fusion_changes_only_known_decision_evidence():
+    model = create_anchor_hierarchical_type_model(base_channels=8)
+    inputs = _inputs(batch_size=2)
+    baseline = model(*inputs)
+    model.known_fusion_weight = 0.5
+    hybrid = model(*inputs)
+
+    assert not torch.allclose(hybrid.known_logits, baseline.known_logits)
+    assert torch.allclose(hybrid.gate_logits, baseline.gate_logits)
 
 
 def test_hierarchical_type_gradients_reach_both_scales_and_prototypes():

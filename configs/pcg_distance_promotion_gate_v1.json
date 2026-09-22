@@ -1,0 +1,26 @@
+﻿{
+    "note":  "Reveal candidate test only after validation gate passes; never retune from candidate test. Test promotion requires \u003e=1 percentage point exact gain because validation exact SE is about 0.85pp.",
+    "selection_formula":  "exact_accuracy + 0.10*within_100 + 0.02*within_200 - 0.005*mae_bins",
+    "schema":  "pcg_distance_promotion_gate_v1",
+    "baseline":  {
+                     "path":  "weights/multi_model/PCG",
+                     "test_piece_count":  3412,
+                     "split_hash":  "95bb8a408458a74e0b43c112e5c3a30b2caacbe04945be0d659e7cd8c070c2e5",
+                     "validation_piece_count":  3430
+                 },
+    "test_once":  {
+                      "minimum_score_gain_exclusive":  0,
+                      "maximum_within_200_drop":  0.005,
+                      "maximum_mae_km_increase":  2,
+                      "minimum_exact_gain":  0.01,
+                      "maximum_within_100_drop":  0.005
+                  },
+    "candidate":  "weights/distance_paired_v3/PCG",
+    "validation":  {
+                       "maximum_mae_km_increase":  2,
+                       "maximum_within_200_drop":  0.005,
+                       "maximum_within_100_drop":  0.005,
+                       "minimum_score_gain":  0.005,
+                       "minimum_exact_gain":  0.005
+                   }
+}

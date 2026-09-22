@@ -14,6 +14,9 @@ import train
 import training
 from checkpoints import load_model_checkpoint
 from evaluation import (
+    HierarchicalDecisionConfig,
+    calibrate_hierarchical_decision,
+    decide_hierarchical_types,
     evaluate_distance_role,
     evaluate_loader,
     evaluate_type_role,
@@ -26,11 +29,13 @@ from models import (
     create_hierarchical_type_model,
 )
 from training import (
+    DistanceLossWeights,
     EarlyStoppingState,
     HierarchicalLossWeights,
     distance_expert_loss,
     hierarchical_type_loss,
     load_last_state,
+    paired_distance_expert_loss,
     save_last_state,
     train_role_epoch,
 )
@@ -82,9 +87,167 @@ def test_training_defaults_match_five_class_contract():
     assert args.base_channels == 64
     assert args.lr == 0.0003
     assert args.weight_decay == 0.0005
+    assert args.type_loss_profile == "baseline"
+    assert args.type_architecture == "hierarchical"
+    assert args.anchor_known_fusion_weight == 0.0
     assert args.resume is None
     assert args.no_amp is False
     assert not hasattr(args, "init_model")
+
+
+def test_multiscale_drift_training_records_architecture_and_augmentation():
+    args = train.build_parser().parse_args([
+        "--stage", "type", "--type_architecture", "multiscale",
+        "--type_loss_profile", "known_consistency_v1",
+        "--augmentation_profile", "sensor_drift_v1", "--defer_test",
+    ])
+    train._validate_args(args)
+    config = train._training_config(args, "type")
+    assert config["type_architecture"] == "multiscale"
+    assert config["augmentation_config"]["bandwidth_probability"] == 0.35
+    assert args.defer_test
+
+
+def test_inference_view_shift_records_policy_and_preserves_default_hash():
+    default = train.build_parser().parse_args(["--stage", "type"])
+    aligned = train.build_parser().parse_args(["--stage", "type", "--inference_view_shift"])
+    train._validate_args(aligned)
+    assert "type_training_views" not in train._training_config(default, "type")
+    assert train._training_config(aligned, "type")["type_training_views"] == (
+        "raw_augmentation_plus_inference_shift_v1")
+    assert train.training_config_hash(default) != train.training_config_hash(aligned)
+    invalid = train.build_parser().parse_args(["--stage", "NNBE", "--inference_view_shift"])
+    with pytest.raises(ValueError, match="only to type"):
+        train._validate_args(invalid)
+
+
+def test_distance_training_config_records_behavioral_policies():
+    args = train.build_parser().parse_args(["--stage", "PCG"])
+
+    config = train._training_config(args, "PCG")
+
+    assert config["schema"] == "five_class_role_training_v3"
+    assert config["distance_training_views"] == (
+        "paired_augmentation_probability_average_v1"
+    )
+    assert config["selection_policy"] == "argmax_exact_within_mae_v1"
+    assert config["distance_loss"]["consistency"] == 0.10
+
+
+def test_type_loss_profile_records_all_experimental_weights():
+    args = train.build_parser().parse_args(
+        ["--stage", "type", "--type_loss_profile", "known_consistency_v1"]
+    )
+
+    config = train._training_config(args, "type")
+
+    assert config["type_loss_profile"] == "known_consistency_v1"
+    assert config["hierarchical_loss"] == {
+        "gate": 1.0,
+        "known": 1.25,
+        "five_class": 0.20,
+        "prototype": 0.25,
+        "branch": 0.15,
+        "contrastive": 0.15,
+        "consistency": 0.25,
+        "gate_consistency": 0.15,
+        "prototype_consistency": 0.15,
+        "ic_margin": 0.25,
+        "prototype_diversity": 0.02,
+        "label_smoothing": 0.05,
+        "temperature": 0.10,
+        "ic_similarity_margin": 0.25,
+        "prototype_diversity_margin": 0.20,
+    }
+
+
+def test_type_loss_profile_is_rejected_for_distance_only_training():
+    args = train.build_parser().parse_args(
+        ["--stage", "PCG", "--type_loss_profile", "known_consistency_v1"]
+    )
+
+    with pytest.raises(ValueError, match="applies only to type training"):
+        train._validate_args(args)
+
+
+def test_anchor_moe_profile_records_explicit_architecture_and_losses():
+    args = train.build_parser().parse_args(
+        [
+            "--stage", "type",
+            "--type_architecture", "anchor_moe",
+            "--type_loss_profile", "anchor_moe_v1",
+        ]
+    )
+
+    train._validate_args(args)
+    config = train._training_config(args, "type")
+
+    assert config["type_architecture"] == "anchor_moe"
+    assert config["hierarchical_loss"]["anchor_orth"] == 0.05
+    assert config["hierarchical_loss"]["reliability"] == 0.01
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--type_architecture", "anchor_moe"],
+        ["--type_loss_profile", "anchor_moe_v1"],
+    ],
+)
+def test_anchor_moe_architecture_and_loss_profile_must_be_paired(options):
+    args = train.build_parser().parse_args(["--stage", "type", *options])
+
+    with pytest.raises(ValueError, match="requires an anchor loss profile"):
+        train._validate_args(args)
+
+
+def test_anchor_consistency_profile_strengthens_view_objectives():
+    weights = train._type_loss_weights("anchor_consistency_v2")
+
+    assert weights.known == 1.25
+    assert weights.consistency == 0.25
+    assert weights.gate_consistency == 0.15
+    assert weights.prototype_consistency == 0.15
+    assert weights.anchor_orth == 0.05
+    assert weights.reliability == 0.01
+
+
+def test_anchor_factorized_profile_adds_known_family_objectives():
+    weights = train._type_loss_weights("anchor_factorized_v3")
+
+    assert weights.family == 0.10
+    assert weights.polarity == 0.10
+    assert weights.consistency == 0.25
+
+
+def test_anchor_fusion_weight_requires_anchor_architecture():
+    args = train.build_parser().parse_args(
+        ["--stage", "type", "--anchor_known_fusion_weight", "0.5"]
+    )
+
+    with pytest.raises(ValueError, match="requires anchor_moe"):
+        train._validate_args(args)
+
+
+def test_moderate_type_loss_profile_changes_only_consistency_weights():
+    args = train.build_parser().parse_args(
+        ["--stage", "type", "--type_loss_profile", "consistency_moderate_v1"]
+    )
+
+    baseline = train._training_config(
+        train.build_parser().parse_args(["--stage", "type"]), "type"
+    )["hierarchical_loss"]
+    candidate = train._training_config(args, "type")["hierarchical_loss"]
+
+    changed = {
+        name for name in baseline if baseline[name] != candidate[name]
+    }
+    assert changed == {
+        "consistency", "gate_consistency", "prototype_consistency"
+    }
+    assert candidate["consistency"] == 0.20
+    assert candidate["gate_consistency"] == 0.15
+    assert candidate["prototype_consistency"] == 0.15
 
 
 @pytest.mark.parametrize(
@@ -265,6 +428,13 @@ def _training_batch(type_labels, distance_bins):
     }
 
 
+def _paired_training_batch(type_labels, distance_bins):
+    batch = _training_batch(type_labels, distance_bins)
+    batch["local_alt"] = batch["local"].clone()
+    batch["global_alt"] = batch["global"].clone()
+    return batch
+
+
 def test_type_role_epoch_never_runs_distance_network():
     model = _TinyRoleModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -291,7 +461,7 @@ def test_distance_role_epoch_never_runs_type_network():
 
     metrics = train_role_epoch(
         model,
-        [_training_batch([1, 1], [3, 4])],
+        [_paired_training_batch([1, 1], [3, 4])],
         optimizer,
         "cpu",
         role="NCG",
@@ -299,7 +469,7 @@ def test_distance_role_epoch_never_runs_type_network():
     )
 
     assert model.type_calls == 0
-    assert model.distance_calls == 1
+    assert model.distance_calls == 2
     assert metrics["sample_count"] == 2
     assert model.type_weight.grad is None
     assert model.distance_weight.grad is not None
@@ -308,6 +478,76 @@ def test_distance_role_epoch_never_runs_type_network():
 def test_distance_expert_loss_rejects_invalid_shapes():
     with pytest.raises(ValueError, match="shape"):
         distance_expert_loss(torch.zeros(2, 29), torch.tensor([1, 2]))
+
+
+def test_paired_distance_loss_penalizes_view_disagreement():
+    targets = torch.tensor([2, 4])
+    primary = _logits_with_winners([2, 4], 30).requires_grad_()
+    matching = primary.detach().clone().requires_grad_()
+    disagreeing = _logits_with_winners([8, 10], 30).requires_grad_()
+    weights = DistanceLossWeights(
+        categorical=0.0, ordered=0.0, expected=0.0, consistency=1.0
+    )
+
+    matching_loss, matching_logits = paired_distance_expert_loss(
+        primary, matching, targets, weights
+    )
+    disagreeing_loss, _ = paired_distance_expert_loss(
+        primary, disagreeing, targets, weights
+    )
+    reverse_loss, _ = paired_distance_expert_loss(
+        disagreeing, primary, targets, weights
+    )
+
+    assert matching_loss.detach().item() == pytest.approx(0.0, abs=1e-7)
+    assert disagreeing_loss > 0
+    assert disagreeing_loss.detach().item() == pytest.approx(
+        reverse_loss.detach().item()
+    )
+    assert torch.equal(matching_logits.argmax(dim=1), targets)
+    disagreeing_loss.backward()
+    assert torch.isfinite(primary.grad).all()
+    assert torch.isfinite(disagreeing.grad).all()
+    assert torch.count_nonzero(primary.grad)
+    assert torch.count_nonzero(disagreeing.grad)
+
+
+def test_distance_role_requires_paired_training_views():
+    model = _TinyRoleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    with pytest.raises(ValueError, match="paired views"):
+        train_role_epoch(
+            model,
+            [_training_batch([1, 1], [3, 4])],
+            optimizer,
+            "cpu",
+            role="NCG",
+            amp=False,
+        )
+
+
+def test_distance_selection_score_uses_deployed_argmax_metrics():
+    better_argmax = {
+        "exact_accuracy": 0.70,
+        "within_100": 0.80,
+        "within_200": 0.90,
+        "mae_bins": 0.7,
+        "expected_within_200": 0.50,
+        "expected_mae_bins": 2.0,
+    }
+    better_expected = {
+        "exact_accuracy": 0.60,
+        "within_100": 0.99,
+        "within_200": 0.99,
+        "mae_bins": 0.3,
+        "expected_within_200": 0.99,
+        "expected_mae_bins": 0.1,
+    }
+
+    assert train._selection_score("PCG", better_argmax) > train._selection_score(
+        "PCG", better_expected
+    )
 
 
 def _hierarchical_output(
@@ -333,6 +573,127 @@ def _hierarchical_output(
         global_known_logits=known_logits,
         embedding=embedding,
     )
+
+
+def test_hierarchical_decision_masks_exactly_define_acceptance():
+    primary = _hierarchical_output(
+        torch.tensor([[8.0, 0.0, 0.0, 0.0], [8.0, 0.0, 0.0, 0.0]]),
+        torch.eye(2, 4),
+    )
+    alternate = replace(
+        primary,
+        known_logits=torch.tensor(
+            [[8.0, 0.0, 0.0, 0.0], [0.0, 8.0, 0.0, 0.0]]
+        ),
+    )
+    config = HierarchicalDecisionConfig(
+        known_probability_thresholds=(0.25,) * 4,
+        prototype_similarity_thresholds=(-1.0,) * 4,
+        max_js_divergences=(1.0,) * 4,
+        min_branch_votes=0,
+        max_ic_gate_probabilities=(1.0,) * 4,
+    )
+
+    decision = decide_hierarchical_types(primary, alternate, config)
+    expected_stable = torch.stack(
+        list(decision.constraint_passes.values())
+    ).all(dim=0)
+
+    assert decision.constraint_passes["view_agreement"].tolist() == [True, False]
+    assert torch.equal(decision.final_type.ne(0), expected_stable)
+    assert decision.final_type.tolist() == [1, 0]
+
+
+def test_hierarchical_decision_uses_candidate_specific_js_limits():
+    primary = _hierarchical_output(
+        torch.tensor([[8.0, 0.0, 0.0, 0.0], [0.0, 8.0, 0.0, 0.0]]),
+        torch.eye(2, 4),
+    )
+    alternate = replace(
+        primary,
+        known_logits=torch.tensor(
+            [[4.0, 0.0, 0.0, 0.0], [0.0, 4.0, 0.0, 0.0]]
+        ),
+        local_known_logits=torch.tensor(
+            [[4.0, 0.0, 0.0, 0.0], [0.0, 4.0, 0.0, 0.0]]
+        ),
+        global_known_logits=torch.tensor(
+            [[4.0, 0.0, 0.0, 0.0], [0.0, 4.0, 0.0, 0.0]]
+        ),
+    )
+    config = HierarchicalDecisionConfig(
+        known_probability_thresholds=(0.25,) * 4,
+        prototype_similarity_thresholds=(-1.0,) * 4,
+        max_js_divergences=(0.0, 1.0, 1.0, 1.0),
+        min_branch_votes=1,
+        max_ic_gate_probabilities=(1.0,) * 4,
+    )
+
+    decision = decide_hierarchical_types(primary, alternate, config)
+
+    assert decision.constraint_passes["js_divergence"].tolist() == [False, True]
+    assert decision.final_type.tolist() == [0, 2]
+
+
+def test_calibration_returns_class_specific_js_limits_without_fixed_ic_prior():
+    targets = torch.tensor([0, 1, 1, 2, 2, 3, 3, 4, 4])
+    winners = torch.tensor([1, 0, 0, 1, 1, 2, 2, 3, 3])
+    primary_logits = torch.full((len(targets), 4), -3.0)
+    alternate_logits = torch.full((len(targets), 4), -3.0)
+    primary_logits[torch.arange(len(targets)), winners] = 8.0
+    alternate_logits[torch.arange(len(targets)), winners] = torch.tensor(
+        [7.5, 7.0, 6.5, 6.0, 5.5, 5.0, 4.5, 4.0, 3.5]
+    )
+    primary = _hierarchical_output(primary_logits, torch.eye(len(targets)))
+    alternate = _hierarchical_output(alternate_logits, torch.eye(len(targets)))
+
+    config = calibrate_hierarchical_decision(
+        primary,
+        alternate,
+        targets,
+        minimum_precision=0.5,
+        minimum_nbe_precision=0.5,
+        maximum_ic_false_positive_rate=1.0 - 1e-6,
+        maximum_cg_to_nbe_rate=1.0 - 1e-6,
+    )
+
+    assert len(config.max_js_divergences) == 4
+    assert len(set(config.max_js_divergences)) > 1
+
+
+def test_calibration_tie_break_keeps_upper_bounds_least_restrictive():
+    targets = torch.tensor([0, 1, 1, 2, 2, 3, 3, 4, 4])
+    winners = torch.tensor([0, 0, 0, 1, 1, 2, 2, 3, 3])
+    known_logits = torch.zeros(len(targets), 4)
+    known_logits[torch.arange(len(targets)), winners] = torch.tensor(
+        [2.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0]
+    )
+    primary = _hierarchical_output(known_logits, torch.eye(len(targets)))
+    gate_probability = torch.tensor(
+        [0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    )
+    gate_logits = torch.stack(
+        (gate_probability.log(), (1.0 - gate_probability).log()), dim=1
+    )
+    primary = replace(primary, gate_logits=gate_logits)
+
+    config = calibrate_hierarchical_decision(
+        primary,
+        primary,
+        targets,
+        minimum_precision=1.0,
+        minimum_nbe_precision=1.0,
+        maximum_ic_false_positive_rate=0.0,
+        maximum_cg_to_nbe_rate=1.0 - 1e-6,
+    )
+
+    # Several gate limits produce the same perfect calibration decisions.  The
+    # tie-break must not collapse to the strictest observed value (0.1), which
+    # is brittle under deployment shift.
+    assert config.max_ic_gate_probabilities[0] > 0.7
+    assert decide_hierarchical_types(primary, primary, config).final_type.tolist() == [
+        0, 1, 1, 2, 2, 3, 3, 4, 4,
+    ]
 
 
 class _CaptureHierarchicalInferenceModel(nn.Module):
@@ -510,6 +871,43 @@ def test_hierarchical_loss_is_finite_for_sparse_batch_composition(targets):
     assert all(torch.isfinite(value) for value in losses.values())
 
 
+def test_anchor_auxiliary_losses_are_weighted_only_when_present():
+    targets = torch.tensor([0, 1, 2, 3, 4])
+    base = _hierarchical_output(torch.randn(5, 4), torch.randn(5, 8))
+    anchor = replace(
+        base,
+        anchor_orth_loss=torch.tensor(2.0),
+        reliability_loss=torch.tensor(3.0),
+    )
+    weights = replace(
+        HierarchicalLossWeights(), anchor_orth=0.05, reliability=0.01
+    )
+
+    baseline = hierarchical_type_loss(base, base, targets, weights=weights)
+    candidate = hierarchical_type_loss(anchor, anchor, targets, weights=weights)
+
+    assert "anchor_orth" not in baseline
+    assert "reliability" not in baseline
+    assert candidate["anchor_orth"].item() == pytest.approx(2.0)
+    assert candidate["reliability"].item() == pytest.approx(3.0)
+    assert candidate["total"].item() == pytest.approx(
+        baseline["total"].item() + 0.13
+    )
+
+
+def test_factorized_known_losses_are_finite_and_differentiable():
+    targets = torch.tensor([0, 1, 2, 3, 4])
+    known_logits = torch.randn(5, 4, requires_grad=True)
+    output = _hierarchical_output(known_logits, torch.randn(5, 8))
+    weights = replace(HierarchicalLossWeights(), family=0.10, polarity=0.10)
+
+    losses = hierarchical_type_loss(output, output, targets, weights=weights)
+    losses["total"].backward()
+
+    assert torch.isfinite(losses["family"] + losses["polarity"])
+    assert known_logits.grad is not None and known_logits.grad.abs().sum() > 0
+
+
 def test_hierarchical_loss_gradients_reach_all_type_components():
     model = create_hierarchical_type_model(
         base_channels=8,
@@ -579,6 +977,42 @@ def test_type_role_epoch_uses_both_hierarchical_views():
     assert metrics["sample_count"] == 5
     assert "known_accuracy" in metrics
     assert "known_to_ic_rate" in metrics
+
+
+@pytest.mark.parametrize("aligned", [False, True])
+def test_type_training_view_shift_matches_inference_without_mutating_batch(aligned):
+    from evaluation import _shift_tensor_view
+
+    class RecordingModel(_TinyHierarchicalModel):
+        def __init__(self):
+            super().__init__()
+            self.inputs = []
+
+        def forward_hierarchical(self, local, global_view, daylight):
+            self.inputs.append((local.detach().clone(), global_view.detach().clone()))
+            return super().forward_hierarchical(local, global_view, daylight)
+
+    model = RecordingModel()
+    batch = _paired_training_batch([0, 1, 2, 3, 4], [-1, 1, 2, 3, 4])
+    for key, length in (("local", 64), ("global", 16)):
+        batch[key] = torch.arange(5 * length, dtype=torch.float32).reshape(5, 1, length)
+        batch[key + "_alt"] = -batch[key].clone()
+    before = {k: v.clone() for k, v in batch.items()}
+    train_role_epoch(model, [batch], torch.optim.SGD(model.parameters(), lr=0.01),
+                     "cpu", role="type", amp=False, inference_view_shift=aligned)
+    for index, (key, shift) in enumerate((("local", 16), ("global", 4))):
+        assert torch.equal(model.inputs[0][index], before[key])
+        expected = _shift_tensor_view(before[key + "_alt"], shift) if aligned else before[key + "_alt"]
+        assert torch.equal(model.inputs[1][index], expected)
+    assert all(torch.equal(batch[k], v) for k, v in before.items())
+    assert model.weight.grad is not None and torch.isfinite(model.weight.grad)
+
+
+def test_inference_view_shift_rejects_nonhierarchical_or_distance_training():
+    for model, role in ((_TinyRoleModel(), "type"), (_TinyHierarchicalModel(), "NNBE")):
+        with pytest.raises(ValueError, match="requires hierarchical type"):
+            train_role_epoch(model, [], torch.optim.SGD(model.parameters(), lr=0.01),
+                             "cpu", role=role, inference_view_shift=True)
 
 
 class _StaticRoleEvaluationModel(nn.Module):

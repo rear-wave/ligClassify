@@ -19,6 +19,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from checkpoints import TRAINING_STATE_SCHEMA
+from evaluation import _shift_tensor_view
 from models import DISTANCE_BIN_COUNT, DISTANCE_NAMES, HIERARCHICAL_TYPE_ARCHITECTURE, HierarchicalTypeOutput
 
 
@@ -29,6 +30,7 @@ class DistanceLossWeights:
     categorical: float = 1.0
     ordered: float = 0.20
     expected: float = 0.05
+    consistency: float = 0.10
 
 
 def _move_training_batch(
@@ -84,6 +86,24 @@ def distance_expert_loss(
     )
 
 
+def paired_distance_expert_loss(
+    primary: torch.Tensor,
+    alternate: torch.Tensor,
+    targets: torch.Tensor,
+    weights: DistanceLossWeights = DistanceLossWeights(),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Train both augmented views and return probability-averaged logits."""
+    supervised = 0.5 * (
+        distance_expert_loss(primary, targets, weights)
+        + distance_expert_loss(alternate, targets, weights)
+    )
+    consistency = _symmetric_consistency(primary, alternate)
+    fused = torch.logaddexp(
+        primary.log_softmax(dim=1), alternate.log_softmax(dim=1)
+    ) - math.log(2.0)
+    return supervised + weights.consistency * consistency, fused
+
+
 @dataclass(frozen=True)
 class HierarchicalLossWeights:
     """Weights for gate, known-class, metric, and consistency objectives."""
@@ -99,6 +119,10 @@ class HierarchicalLossWeights:
     prototype_consistency: float = 0.10
     ic_margin: float = 0.25
     prototype_diversity: float = 0.02
+    anchor_orth: float = 0.0
+    reliability: float = 0.0
+    family: float = 0.0
+    polarity: float = 0.0
     label_smoothing: float = 0.05
     temperature: float = 0.10
     ic_similarity_margin: float = 0.25
@@ -234,8 +258,16 @@ def hierarchical_type_loss(
         branch = 0.5 * (local + average_ce(
             primary.global_known_logits, alternate.global_known_logits
         ))
+        def grouped_ce(groups: tuple[tuple[int, ...], ...], labels: torch.Tensor) -> torch.Tensor:
+            def group_logits(logits: torch.Tensor) -> torch.Tensor:
+                selected = logits[known_mask]
+                return torch.stack(tuple(torch.logsumexp(selected[:, group], dim=1) for group in groups), dim=1)
+            return 0.5 * (F.cross_entropy(group_logits(primary.known_logits), labels)
+                          + F.cross_entropy(group_logits(alternate.known_logits), labels))
+        family = grouped_ce(((0, 2), (1, 3)), known_targets % 2)
+        polarity = grouped_ce(((0, 1), (2, 3)), known_targets // 2)
     else:
-        known = prototype = branch = zero
+        known = prototype = branch = family = polarity = zero
     contrastive = _supervised_contrastive_loss(
         primary.embedding,
         alternate.embedding,
@@ -277,6 +309,18 @@ def hierarchical_type_loss(
         "ic_margin": ic_margin,
         "prototype_diversity": prototype_diversity,
     }
+    if primary.anchor_orth_loss is not None:
+        components["anchor_orth"] = 0.5 * (
+            primary.anchor_orth_loss + alternate.anchor_orth_loss
+        )
+    if primary.reliability_loss is not None:
+        components["reliability"] = 0.5 * (
+            primary.reliability_loss + alternate.reliability_loss
+        )
+    if weights.family:
+        components["family"] = family
+    if weights.polarity:
+        components["polarity"] = polarity
     total = sum(
         components[name] * float(getattr(weights, name))
         for name in components
@@ -293,10 +337,15 @@ def train_role_epoch(
     role: str,
     scaler: torch.amp.GradScaler | None = None,
     amp: bool = True,
+    type_loss_weights: HierarchicalLossWeights | None = None,
+    inference_view_shift: bool = False,
 ) -> dict[str, float | int | str]:
     """Train exactly one independent type or distance role for one epoch."""
     if role != "type" and role not in DISTANCE_NAMES:
         raise ValueError(f"unknown training role: {role}")
+    if inference_view_shift and (role != "type" or
+            getattr(model, "architecture", None) != HIERARCHICAL_TYPE_ARCHITECTURE):
+        raise ValueError("inference_view_shift requires hierarchical type training")
     target_device = torch.device(device)
     amp_enabled = bool(amp and target_device.type == "cuda")
     if scaler is None:
@@ -332,15 +381,22 @@ def train_role_epoch(
                     primary = model.forward_hierarchical(
                         batch["local"], batch["global"], batch["daylight"]
                     )
+                    local_alt, global_alt = batch["local_alt"], batch["global_alt"]
+                    if inference_view_shift:
+                        local_alt = _shift_tensor_view(local_alt, 16)
+                        global_alt = _shift_tensor_view(global_alt, 4)
                     alternate = model.forward_hierarchical(
-                        batch["local_alt"],
-                        batch["global_alt"],
+                        local_alt,
+                        global_alt,
                         batch["daylight"],
                     )
                     loss_parts = hierarchical_type_loss(
                         primary,
                         alternate,
                         targets,
+                        weights=(
+                            type_loss_weights or HierarchicalLossWeights()
+                        ),
                         prototype_vectors=(
                             getattr(
                                 getattr(model, "prototype_matcher", None),
@@ -366,13 +422,23 @@ def train_role_epoch(
                         f"type index {expected_type}"
                     )
                 targets = batch["distance_bin"].long()
-                logits, _ = model.forward_distance_type(
+                if "local_alt" not in batch or "global_alt" not in batch:
+                    raise ValueError("distance training requires paired views")
+                primary_logits, _ = model.forward_distance_type(
                     batch["local"],
                     batch["global"],
                     batch["daylight"],
                     expert_index=expert_index,
                 )
-                loss = distance_expert_loss(logits, targets)
+                alternate_logits, _ = model.forward_distance_type(
+                    batch["local_alt"],
+                    batch["global_alt"],
+                    batch["daylight"],
+                    expert_index=expert_index,
+                )
+                loss, logits = paired_distance_expert_loss(
+                    primary_logits, alternate_logits, targets
+                )
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()

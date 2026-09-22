@@ -1,0 +1,23 @@
+{
+  "schema": "type_loss_promotion_gate_v1",
+  "candidate_profile": "consistency_moderate_v1",
+  "selection_partition": "validation",
+  "baseline": "weights/multi_model/type/model.pt",
+  "requirements": {
+    "known_macro_recall_gain_min": 0.01,
+    "pnbe_recall_gain_min": 0.01,
+    "nnbe_recall_drop_max": 0.002,
+    "pcg_recall_drop_max": 0.002,
+    "ncg_recall_drop_max": 0.002,
+    "known_precision_min_each": 0.99,
+    "ic_to_known_rate_max": 0.015,
+    "known_interclass_error_rate_max": 0.002,
+    "known_consistency_drop_max": 0.002
+  },
+  "test_policy": {
+    "inspect_only_after_validation_passes": true,
+    "do_not_retune_from_test": true,
+    "require_same_split_hash": true,
+    "require_same_preprocess_and_model_config": true
+  }
+}
