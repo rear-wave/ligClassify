@@ -1,0 +1,11 @@
+{
+  "wwlln_dir": "./output/wwlln_input",
+  "datasets": [
+    {
+      "label": "2021_period_a",
+      "prediction_root": "./output/classified/period_a",
+      "lig_base": "./output/classified/period_a",
+      "row_source": "output_file"
+    }
+  ]
+}

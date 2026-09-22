@@ -199,3 +199,109 @@ def test_type_constraint_audit_forbids_tuning_on_test_partition():
             partition="test",
             decision_config_path="candidate.json",
         )
+
+
+def test_research_streaming_imports_and_synthetic_guards(tmp_path, monkeypatch):
+    import importlib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    scripts = root / "research" / "streaming"
+    monkeypatch.syspath_prepend(str(scripts))
+    monkeypatch.chdir(tmp_path)
+    modules = {
+        path.stem: importlib.import_module(path.stem)
+        for path in sorted(scripts.glob("*.py"))
+    }
+    assert len(modules) == 8
+    assert modules["experiment"].OUT == root / "weights" / "streaming_research_v1"
+    assert modules["check_streaming"].OUT == modules["experiment"].OUT
+    modules["robust_calibration"].self_test()
+    modules["guarded_rescue"].self_test()
+    assert not list(tmp_path.iterdir())
+
+
+def _synthetic_distance_summary(label, errors, type_name):
+    from research.wwlln.compute_bin_errors import BinStats, bin_rows
+
+    stats = BinStats()
+    for error in errors:
+        stats.add(error, int(error / 100), label[:4], type_name)
+    rows = bin_rows([stats])
+    return {
+        "datasets": [{"label": label, "matched": len(errors)}],
+        "matched_total": len(errors),
+        "bins": rows,
+        "type_bins": {type_name: rows},
+    }
+
+
+def _run_distance_summary_script(name, arguments, monkeypatch):
+    from pathlib import Path
+    import runpy
+
+    script = Path(__file__).resolve().parents[1] / "research" / "wwlln" / name
+    monkeypatch.setattr("sys.argv", [str(script), *map(str, arguments)])
+    runpy.run_path(str(script), run_name="__main__")
+
+
+def test_research_distance_merge_and_replace_totals(tmp_path, monkeypatch):
+    base, extra, updated = [tmp_path / name for name in ("a.json", "b.json", "c.json")]
+    for path, payload in (
+        (base, _synthetic_distance_summary("2016_a", [-100, 100], "NCG")),
+        (extra, _synthetic_distance_summary("2017_b", [50], "NNBE")),
+        (updated, _synthetic_distance_summary("2017_b", [200], "NNBE")),
+    ):
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    merged = tmp_path / "new_output" / "merged.json"
+    _run_distance_summary_script("merge_bin_errors.py", [
+        "--base", base, "--extra", extra, "--output", merged,
+    ], monkeypatch)
+    payload = json.loads(merged.read_text(encoding="utf-8"))
+    row = payload["bins"][0]
+    assert payload["matched_total"] == row["matched_count"] == 3
+    assert row["mae_km"] == pytest.approx(250 / 3)
+    assert row["rmse_km"] ** 2 == pytest.approx(7500)
+    assert row["bias_km"] == pytest.approx(50 / 3)
+    assert row["exact_bin_accuracy"] == pytest.approx(1 / 3)
+    assert row["year_2016_count"] == row["NCG_count"] == 2
+    assert row["year_2017_count"] == row["NNBE_count"] == 1
+    assert row["median_abs_error_km"] is None
+    assert "type_bins" not in payload
+    assert merged.with_suffix(".csv").is_file()
+
+    replaced = tmp_path / "another_output" / "replaced.json"
+    _run_distance_summary_script("replace_bin_dataset.py", [
+        "--combined", merged, "--remove", extra, "--add", updated,
+        "--label", "2017_b", "--output", replaced,
+    ], monkeypatch)
+    payload = json.loads(replaced.read_text(encoding="utf-8"))
+    row = payload["bins"][0]
+    assert payload["matched_total"] == row["matched_count"] == 3
+    assert row["mae_km"] == pytest.approx(400 / 3)
+    assert row["rmse_km"] ** 2 == pytest.approx(20000)
+    assert row["bias_km"] == pytest.approx(200 / 3)
+    assert row["exact_bin_accuracy"] == 0
+    assert row["within_1_bin"] == pytest.approx(2 / 3)
+    assert "type_bins" not in payload
+    assert replaced.with_suffix(".csv").is_file()
+
+
+@pytest.mark.parametrize("operation", ["merge", "replace"])
+def test_research_distance_helpers_reject_unequal_bins(tmp_path, monkeypatch, operation):
+    base, short = tmp_path / "base.json", tmp_path / "short.json"
+    payload = _synthetic_distance_summary("2016_a", [100], "NCG")
+    base.write_text(json.dumps(payload), encoding="utf-8")
+    payload["bins"] = []
+    short.write_text(json.dumps(payload), encoding="utf-8")
+    output = tmp_path / "invalid.json"
+    if operation == "merge":
+        script = "merge_bin_errors.py"
+        arguments = ["--base", base, "--extra", short, "--output", output]
+    else:
+        script = "replace_bin_dataset.py"
+        arguments = ["--combined", base, "--remove", short, "--add", base,
+                     "--label", "2016_a", "--output", output]
+    with pytest.raises(ValueError, match="zip"):
+        _run_distance_summary_script(script, arguments, monkeypatch)
+    assert not output.exists()

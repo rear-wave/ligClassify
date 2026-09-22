@@ -131,6 +131,9 @@ predictions matched batched predictions.
 
 ## Reproducibility and remaining work
 
+The experiment source and execution order are versioned under
+[`research/streaming/`](../research/README.md).
+
 Ignored local artifacts are under `weights/streaming_research_v1/`:
 
 - `constraint_diagnosis.json`: network candidates versus individual constraints.

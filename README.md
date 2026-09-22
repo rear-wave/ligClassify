@@ -3,6 +3,10 @@
 `ligClassify` classifies binary LIG waveform pieces as `IC`, `NCG`, `NNBE`,
 `PCG`, or `PNBE`, then estimates distance for the four non-IC types.
 
+Research experiment, calibration and WWLLN distance-bin evaluation scripts are
+documented in [research/README.md](research/README.md). Their generated data and
+weights remain outside version control.
+
 ## Data layout
 
 Each `.lig` container may contain at most 512 independent pieces. Keep training
